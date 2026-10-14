@@ -24,8 +24,9 @@ app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, profile_extractor, retention
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py
-app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.kb.ingest)
+app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
 app/db        SQLAlchemy models, repositories, session
+migrations/   Alembic (async env); URL comes from DATABASE_URL via Settings, not alembic.ini
 tests/unit    bulk of tests, fakes instead of mocks where possible
 tests/integration  only what Postgres decides: pgvector/tsvector queries, cascades, migrations, SSE e2e
 
@@ -55,6 +56,10 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 
 ## Workflow for the agent
+- Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
+  - Work branches → PR into `develop`, **squash** merge.
+  - Release: PR `develop` → `main`, **merge commit** (never squash), so main keeps develop's history.
+  - `main` deploys to prod; `develop` will deploy to staging (later).
 - One checklist item per branch/PR (items 1.1–1.12 in the plan doc).
 - Before coding: restate the item, list files to touch, list tests to add. Wait for "go" if the
   change touches DB schema, auth or the LLM layer.
