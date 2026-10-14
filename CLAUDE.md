@@ -24,7 +24,7 @@ app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, profile_extractor, retention
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py
-app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.kb.ingest)
+app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
 app/db        SQLAlchemy models, repositories, session
 migrations/   Alembic (async env); URL comes from DATABASE_URL via Settings, not alembic.ini
 tests/unit    bulk of tests, fakes instead of mocks where possible
