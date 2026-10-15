@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
     auth0_domain: str | None = None
     auth0_audience: str | None = None
+    # Version of the consent texts shipped by the frontend; see docs/consents/README.md.
+    consent_version: str = "2026-10-v1"
 
     @model_validator(mode="after")
     def _require_auth0_in_prod(self) -> Self:

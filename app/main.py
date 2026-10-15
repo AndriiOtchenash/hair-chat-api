@@ -3,10 +3,16 @@ from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
 
-from app.api import health, me
+from app.api import consents, health, me
+from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
 from app.core.security import current_user, get_token_verifier
 from app.db.session import get_engine
+
+# Token required (current_user).
+PROTECTED_ROUTERS: tuple[APIRouter, ...] = (me.router, consents.router)
+# Token + all consents for the current CONSENT_VERSION (CLAUDE.md rule 7): chat goes here.
+CONSENTED_ROUTERS: tuple[APIRouter, ...] = ()
 
 
 @asynccontextmanager
@@ -26,10 +32,16 @@ def create_app() -> FastAPI:
     # tests/unit/test_route_protection.py fails if anything else answers without a token.
     app.include_router(health.router)
 
-    # Closed by default: every business router goes here. current_user is cached per request,
-    # so endpoints that also take CurrentUser do not validate the token twice.
+    # Closed by default: every business router goes into one of the tuples above.
+    # Dependencies are cached per request, so endpoints that also take CurrentUser do not
+    # validate the token twice. Levels nest: consented routes get current_user from protected.
+    consented = APIRouter(dependencies=[Depends(require_consents)])
+    for router in CONSENTED_ROUTERS:
+        consented.include_router(router)
     protected = APIRouter(dependencies=[Depends(current_user)])
-    protected.include_router(me.router)
+    for router in PROTECTED_ROUTERS:
+        protected.include_router(router)
+    protected.include_router(consented)
     app.include_router(protected)
     return app
 
