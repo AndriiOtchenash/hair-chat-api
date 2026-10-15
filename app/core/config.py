@@ -1,7 +1,8 @@
 from enum import StrEnum
 from functools import lru_cache
+from typing import Self
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,15 @@ class Settings(BaseSettings):
     llm_chain: str = "gemini-free,mistral-experiment"
     gemini_api_key: SecretStr | None = None
     mistral_api_key: SecretStr | None = None
+    # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
+    auth0_domain: str | None = None
+    auth0_audience: str | None = None
+
+    @model_validator(mode="after")
+    def _require_auth0_in_prod(self) -> Self:
+        if self.env is Env.PROD and not (self.auth0_domain and self.auth0_audience):
+            raise ValueError("AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV=prod")
+        return self
 
     @property
     def llm_chain_list(self) -> list[str]:
