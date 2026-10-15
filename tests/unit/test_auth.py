@@ -8,29 +8,13 @@ from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient, Response
 
 from app.core.security import get_token_verifier, get_user_repository, require_role
-from app.db.base import new_id
-from app.db.models import Locale, User, UserRole
+from app.db.models import UserRole
 from app.main import create_app
 from tests.auth_fakes import AUDIENCE, FakeAuth0, SigningKey, bearer, mint
+from tests.fakes import FakeUserRepository
 
 KEY = SigningKey("key-1")
 ROTATED_KEY = SigningKey("key-2")
-
-
-class FakeUserRepository:
-    def __init__(self) -> None:
-        self.by_sub: dict[str, User] = {}
-
-    async def get_or_create_by_auth_sub(self, auth_sub: str) -> User:
-        if auth_sub not in self.by_sub:
-            self.by_sub[auth_sub] = User(
-                id=new_id(),
-                auth_sub=auth_sub,
-                role=UserRole.USER,
-                locale=Locale.EN,
-                created_at=datetime.now(UTC),
-            )
-        return self.by_sub[auth_sub]
 
 
 class FakeClock:

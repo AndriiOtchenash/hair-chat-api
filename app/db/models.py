@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Enum, ForeignKey, Index, Text, UniqueConstraint, func
+from sqlalchemy import Enum, ForeignKey, Index, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -67,7 +67,18 @@ class User(UUIDPkMixin, TimestampMixin, Base):
 
 class Consent(UUIDPkMixin, TimestampMixin, Base):
     __tablename__ = "consents"
-    __table_args__ = (Index("ix_consents_user_id_type", "user_id", "type"),)
+    __table_args__ = (
+        # At most one active (non-revoked) row per user/type/version: makes grant idempotent via
+        # ON CONFLICT DO NOTHING, while revoked rows stay as history.
+        Index(
+            "ix_consents_user_id_type_version_active",
+            "user_id",
+            "type",
+            "version",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     type: Mapped[ConsentType] = mapped_column(_pg_enum(ConsentType, "consent_type"))

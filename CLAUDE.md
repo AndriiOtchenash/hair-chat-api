@@ -40,15 +40,19 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `alembic check` runs in the integration tests to keep models and migrations in sync.
 
 ## Auth conventions
-- Closed by default: business routers are included into the `protected` APIRouter in
-  app/main.py (`dependencies=[Depends(current_user)]`). Public allowlist: /health, /docs, /redoc,
-  /openapi.json. tests/unit/test_route_protection.py walks all routes and fails if anything
-  else answers without a token — extend its allowlist only on purpose.
+- Closed by default, two levels in app/main.py: add a business router to `PROTECTED_ROUTERS`
+  (token: current_user) or `CONSENTED_ROUTERS` (token + all consents: require_consents; every
+  chat endpoint goes here, rule 7). Public allowlist: /health, /docs, /redoc, /openapi.json.
+  tests/unit/test_route_protection.py walks all routes: 401 without a token outside the
+  allowlist, 403 consent_required on consented routes — extend its allowlist only on purpose.
 - Use `CurrentUser` in an endpoint to get the user (cached per request, token checked once) and
   `Depends(require_role(...))` for roles.
 - Auth codes: 401 not_authenticated / invalid_token (with WWW-Authenticate), 403
   user_token_required / account_deleted / forbidden, 503 auth_unavailable (JWKS down) /
   auth_not_configured (no AUTH0_* in dev).
+- Consents: valid = not revoked and `version == CONSENT_VERSION` (docs/consents/README.md).
+  403 `consent_required` lists the missing types; POST /consents with another version is 400
+  `consent_version_mismatch`. Revoking sets `revoked_at` and never deletes rows.
 - Tests never hit Auth0: use tests/auth_fakes.py (own RSA keys, JWKS via httpx.MockTransport) and
   override `get_token_verifier` / `get_user_repository`.
 
