@@ -13,11 +13,12 @@ from typing import Annotated, Any
 
 import httpx
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.errors import api_error
 from app.db.models import User, UserRole
 from app.db.repositories.users import SqlUserRepository, UserRepository
 from app.db.session import get_session
@@ -176,12 +177,6 @@ def get_user_repository(
     return SqlUserRepository(session)
 
 
-def _error(
-    status_code: int, code: str, message: str, headers: dict[str, str] | None = None
-) -> HTTPException:
-    return HTTPException(status_code, detail={"code": code, "message": message}, headers=headers)
-
-
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -191,9 +186,9 @@ async def current_user(
     users: Annotated[UserRepository, Depends(get_user_repository)],
 ) -> User:
     if verifier is None:
-        raise _error(503, "auth_not_configured", "Authentication is not configured")
+        raise api_error(503, "auth_not_configured", "Authentication is not configured")
     if credentials is None:
-        raise _error(
+        raise api_error(
             status.HTTP_401_UNAUTHORIZED,
             "not_authenticated",
             "Bearer token required",
@@ -203,7 +198,7 @@ async def current_user(
         token = await verifier.verify(credentials.credentials)
     except InvalidTokenError as exc:
         logger.info("auth: token rejected: %s", exc)
-        raise _error(
+        raise api_error(
             status.HTTP_401_UNAUTHORIZED,
             "invalid_token",
             "Invalid or expired token",
@@ -211,14 +206,14 @@ async def current_user(
         ) from exc
     except JWKSUnavailableError as exc:
         # Not 401: the token may be fine, and a 401 would make the client log the user out.
-        raise _error(503, "auth_unavailable", "Authentication temporarily unavailable") from exc
+        raise api_error(503, "auth_unavailable", "Authentication temporarily unavailable") from exc
     if token.is_client_credentials:
-        raise _error(
+        raise api_error(
             status.HTTP_403_FORBIDDEN, "user_token_required", "A user access token is required"
         )
     user = await users.get_or_create_by_auth_sub(token.sub)
     if user.deleted_at is not None:
-        raise _error(status.HTTP_403_FORBIDDEN, "account_deleted", "Account has been deleted")
+        raise api_error(status.HTTP_403_FORBIDDEN, "account_deleted", "Account has been deleted")
     return user
 
 
@@ -231,7 +226,7 @@ def require_role(*roles: UserRole) -> Callable[[User], Awaitable[User]]:
 
     async def dependency(user: CurrentUser) -> User:
         if user.role not in allowed:
-            raise _error(status.HTTP_403_FORBIDDEN, "forbidden", "Insufficient role")
+            raise api_error(status.HTTP_403_FORBIDDEN, "forbidden", "Insufficient role")
         return user
 
     return dependency

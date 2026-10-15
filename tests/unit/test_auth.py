@@ -76,7 +76,7 @@ async def client(
 
 def assert_error(response: Response, status: int, code: str) -> None:
     assert response.status_code == status, response.text
-    assert response.json()["detail"]["code"] == code
+    assert response.json()["code"] == code
 
 
 def assert_unauthorized(response: Response) -> None:

@@ -40,13 +40,24 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `alembic check` runs in the integration tests to keep models and migrations in sync.
 
 ## Auth conventions
-- Protect endpoints with `CurrentUser` / `Depends(require_role(...))` from app/core/security.py;
-  there is no global filter, so an endpoint without the dependency is public.
-- Error body: `{"detail": {"code": "...", "message": "..."}}`. Codes: 401 not_authenticated /
-  invalid_token (with WWW-Authenticate), 403 user_token_required / account_deleted / forbidden,
-  503 auth_unavailable (JWKS down) / auth_not_configured (no AUTH0_* in dev).
+- Closed by default: business routers are included into the `protected` APIRouter in
+  app/main.py (`dependencies=[Depends(current_user)]`). Public allowlist: /health, /docs, /redoc,
+  /openapi.json. tests/unit/test_route_protection.py walks all routes and fails if anything
+  else answers without a token — extend its allowlist only on purpose.
+- Use `CurrentUser` in an endpoint to get the user (cached per request, token checked once) and
+  `Depends(require_role(...))` for roles.
+- Auth codes: 401 not_authenticated / invalid_token (with WWW-Authenticate), 403
+  user_token_required / account_deleted / forbidden, 503 auth_unavailable (JWKS down) /
+  auth_not_configured (no AUTH0_* in dev).
 - Tests never hit Auth0: use tests/auth_fakes.py (own RSA keys, JWKS via httpx.MockTransport) and
   override `get_token_verifier` / `get_user_repository`.
+
+## Error format (REST and SSE)
+- Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
+  `detail` wrapper. Raise `api_error(status, code, message)`; a plain HTTPException gets a code
+  from its status (404 -> not_found). Validation -> 422 `validation_error` with a short
+  "loc: reason" summary that never echoes input values.
+- The SSE `error` event carries the same ErrorBody as its data.
 
 ## Non-negotiable rules
 1. No test calls a real LLM, embedding or moderation API. Use FakeLLMProvider with scripted scenarios
@@ -88,4 +99,4 @@ uv run uvicorn app.main:app --reload
 event: token    data: {"text": "..."}
 event: restart  data: {"reason": "..."}    # provider failed mid-stream; client clears partial answer
 event: done     data: {"message_id": "...", "provider": "...", "model": "..."}
-event: error    data: {"code": "...", "message": "..."}
+event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as REST errors
