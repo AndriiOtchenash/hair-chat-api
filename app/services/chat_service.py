@@ -17,7 +17,7 @@ from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
 from app.llm.resilient import ResilientLLM
-from app.services.context_builder import ContextBuilder
+from app.services.context_builder import Context, ContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,9 @@ class Reply:
         self.conversation_id = conversation_id
         self.user_message_id = user_message_id
         self._events: AsyncGenerator[ChatEvent] | None = None
+        # Set with ChatDone: the context left messages out, so the caller should run the
+        # summarizer once the answer is delivered (never when the reply failed).
+        self.summary_due = False
 
     def events(self) -> AsyncIterator[ChatEvent]:
         """Token* (Restart Token*)* then ChatDone, or ChatError. Never raises for LLM failures.
@@ -114,11 +117,12 @@ class Reply:
         service = self._service
         try:
             context = await service.context_builder.build(
-                self.user_id, self.conversation_id, service.llm.max_context_tokens
+                self.user_id, self.conversation_id, service.budget_tokens
             )
             answer: list[str] = []
+            stream = service.llm.stream(context.messages, service.max_answer_tokens)
             # aclosing: leaving `async for` early does not close the inner generator by itself.
-            async with aclosing(service.llm.stream(context, service.max_answer_tokens)) as events:
+            async with aclosing(stream) as events:
                 async for event in events:
                     match event:
                         case Token(text=text):
@@ -128,7 +132,9 @@ class Reply:
                             answer.clear()
                             yield event
                         case Done():
-                            yield await self._save(event, "".join(answer))
+                            done = await self._save(event, "".join(answer), context)
+                            self.summary_due = context.needs_summary
+                            yield done
         except AllProvidersDown:
             logger.warning(
                 "chat reply failed: conversation=%s code=llm_unavailable", self.conversation_id
@@ -150,7 +156,7 @@ class Reply:
             )
             yield ChatError("internal_error", "Something went wrong, please try again")
 
-    async def _save(self, done: Done, answer: str) -> ChatDone:
+    async def _save(self, done: Done, answer: str, context: Context) -> ChatDone:
         message = await self._service.repo.add_assistant_message(
             self.user_id,
             self.conversation_id,
@@ -162,12 +168,14 @@ class Reply:
             llm_call_ids=done.call_ids,
         )
         logger.info(
-            "chat reply saved: conversation=%s message=%s provider=%s model=%s "
-            "tokens_in=%s tokens_out=%s truncated=%s",
+            "chat reply saved: conversation=%s message=%s provider=%s model=%s prompt=%s "
+            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s",
             self.conversation_id,
             message.id,
             done.provider,
             done.model,
+            context.prompt_version,
+            context.tokens,
             done.tokens_in,
             done.tokens_out,
             done.truncated,
@@ -209,6 +217,7 @@ class ChatService:
         locks: ConversationLocks,
         *,
         max_answer_tokens: int,
+        budget_tokens: int,
     ) -> None:
         self.conversations = conversations
         self.repo = conversations.repo
@@ -216,6 +225,8 @@ class ChatService:
         self.context_builder = context_builder
         self.locks = locks
         self.max_answer_tokens = max_answer_tokens
+        # Input tokens per reply: app.services.tokens.context_budget.
+        self.budget_tokens = budget_tokens
 
     @asynccontextmanager
     async def reply(

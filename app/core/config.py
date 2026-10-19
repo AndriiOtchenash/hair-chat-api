@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     llm_read_timeout_s: float = 30.0
     # Answer length cap per chat reply; reasoning tokens of thinking models count against it too.
     chat_max_answer_tokens: int = 2048
+    # Input tokens per chat call, far below the models' windows for cost and latency; the
+    # effective budget is min(this, chain window - chat_max_answer_tokens).
+    context_budget_tokens: int = 6000
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     mistral_api_key: SecretStr | None = None

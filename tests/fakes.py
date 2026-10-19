@@ -1,7 +1,8 @@
 """In-memory stand-ins for the repositories, for unit tests that should not need Postgres."""
 
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 
 from app.db.base import new_id
@@ -16,7 +17,11 @@ from app.db.models import (
     UserRole,
 )
 from app.db.pagination import Cursor, Page
-from app.db.repositories.conversations import TITLE_MAX_CHARS
+from app.db.repositories.conversations import (
+    TITLE_MAX_CHARS,
+    ConversationRepository,
+    ConversationRepositoryFactory,
+)
 
 
 class FakeUserRepository:
@@ -90,7 +95,13 @@ class FakeConversationRepository:
     async def create(self, user_id: uuid.UUID) -> Conversation:
         now = self._tick()
         conversation = Conversation(
-            id=new_id(), user_id=user_id, title=None, created_at=now, last_message_at=now
+            id=new_id(),
+            user_id=user_id,
+            title=None,
+            summary=None,
+            summary_upto_message_id=None,
+            created_at=now,
+            last_message_at=now,
         )
         self.conversations[conversation.id] = conversation
         return conversation
@@ -114,10 +125,45 @@ class FakeConversationRepository:
         rows = [m for m in reversed(self.of(conversation_id)) if m.user_id == user_id]
         return Page(rows[:limit], None)
 
-    async def recent_messages(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, limit: int
+    async def history(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        *,
+        after: uuid.UUID | None,
+        limit: int,
+        newest_first: bool,
     ) -> list[Message]:
-        return [m for m in self.of(conversation_id) if m.user_id == user_id][-limit:]
+        rows = [m for m in self.of(conversation_id) if m.user_id == user_id]
+        boundary = next((i for i, m in enumerate(rows) if m.id == after), None)
+        if boundary is not None:
+            rows = rows[boundary + 1 :]
+        return list(reversed(rows))[:limit] if newest_first else rows[:limit]
+
+    async def save_summary(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        summary: str,
+        *,
+        upto_message_id: uuid.UUID,
+        expected_upto: uuid.UUID | None,
+    ) -> bool:
+        conversation = self._owned(user_id, conversation_id)
+        if conversation is None or conversation.summary_upto_message_id != expected_upto:
+            return False
+        conversation.summary = summary
+        conversation.summary_upto_message_id = upto_message_id
+        return True
+
+    def repositories(self) -> ConversationRepositoryFactory:
+        """Factory as the summarizer takes it, always handing out this repository."""
+
+        @asynccontextmanager
+        async def open_repository() -> AsyncIterator[ConversationRepository]:
+            yield self
+
+        return open_repository
 
     async def add_user_message(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str

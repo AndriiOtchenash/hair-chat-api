@@ -51,3 +51,25 @@ async def test_error_is_printed_and_dialog_goes_on() -> None:
 
     assert "[error llm_unavailable:" in out
     assert out.endswith("back\n— gemini:flash\n\n")
+
+
+class RecordingSummarizer:
+    def __init__(self) -> None:
+        self.runs: list[uuid.UUID] = []
+
+    async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
+        self.runs.append(conversation_id)
+
+
+async def test_summarizer_runs_after_an_answer_whose_context_overflowed() -> None:
+    world = World(budget=1200)
+    summarizer = RecordingSummarizer()
+    conversation_id = await world.conversation()
+    out = io.StringIO()
+
+    await converse(
+        world.chat, USER, conversation_id, lines("short", *["x" * 400] * 3), out, summarizer
+    )
+
+    # The 4th answer is the first whose context had to leave messages out.
+    assert summarizer.runs == [conversation_id]

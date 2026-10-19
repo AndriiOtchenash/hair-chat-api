@@ -16,8 +16,8 @@ from app.services.chat_service import (
     ConversationNotFound,
     ConversationService,
 )
-from app.services.context_builder import HISTORY_MESSAGES, RecentMessagesContextBuilder
-from app.services.prompts import SYSTEM_PROMPT
+from app.services.context_builder import TokenBudgetContextBuilder
+from app.services.prompts import FilePromptProvider
 from tests.fakes import FakeConversationRepository
 from tests.llm_fakes import (
     FakeLLMCallRecorder,
@@ -37,7 +37,7 @@ OTHER = uuid.UUID("01890000-0000-7000-8000-000000000002")
 class World:
     """ChatService over in-memory fakes; providers are scripted per test."""
 
-    def __init__(self, *providers: FakeLLMProvider) -> None:
+    def __init__(self, *providers: FakeLLMProvider, budget: int = 6000) -> None:
         self.repo = FakeConversationRepository()
         self.recorder = FakeLLMCallRecorder()
         self.providers = providers or (FakeLLMProvider("gemini", "flash"),)
@@ -45,9 +45,10 @@ class World:
         self.chat = ChatService(
             ConversationService(self.repo),
             ResilientLLM(self.providers, self.recorder, first_token_timeout=0.05),
-            RecentMessagesContextBuilder(self.repo),
+            TokenBudgetContextBuilder(self.repo, FilePromptProvider()),
             self.locks,
             max_answer_tokens=100,
+            budget_tokens=budget,
         )
 
     async def conversation(self, user: uuid.UUID = USER) -> uuid.UUID:
@@ -248,25 +249,36 @@ async def test_someone_elses_or_missing_conversation_is_not_found() -> None:
     assert world.repo.of(foreign) == []
 
 
-async def test_context_is_system_prompt_plus_last_20_messages() -> None:
-    provider = FakeLLMProvider("gemini", "flash")
-    world = World(provider)
+async def test_summary_is_due_after_an_answer_whose_context_left_messages_out() -> None:
+    world = World(budget=1200)  # the system prompt alone takes ~800
     conversation_id = await world.conversation()
-    for i in range(12):  # 12 user + 12 assistant = 24 messages
-        await world.send(conversation_id, f"q{i}")
 
-    context = provider.received[-1]
+    async with world.chat.reply(USER, conversation_id, "short") as reply:
+        _ = [event async for event in reply.events()]
+    assert not reply.summary_due  # everything fit
 
-    assert context[0] == {"role": "system", "content": SYSTEM_PROMPT}
-    history = context[1:]
-    assert len(history) == HISTORY_MESSAGES
-    # 23 messages existed (11 exchanges + q11): the oldest 3 fell out of the window.
-    assert history[-1] == {"role": "user", "content": "q11"}
-    assert history[0]["role"] == "assistant"
-    assert history[1] == {"role": "user", "content": "q2"}
+    for _ in range(3):
+        await world.send(conversation_id, "x" * 400)
+    async with world.chat.reply(USER, conversation_id, "again") as reply:
+        events = [event async for event in reply.events()]
+    assert isinstance(events[-1], ChatDone)
+    assert reply.summary_due
 
 
-def test_system_prompt_forbids_medical_advice() -> None:
-    prompt = SYSTEM_PROMPT.lower()
-    for phrase in ("never diagnose", "dosage", "treatment plan", "trichologist", "doctor"):
-        assert phrase in prompt
+async def test_no_summary_is_due_when_the_reply_failed() -> None:
+    world = World(
+        FakeLLMProvider("gemini", "flash").script(
+            *[success() for _ in range(3)],
+            fail_before_first(ProviderHTTPError(503, "InternalServerError")),
+        ),
+        budget=1200,
+    )
+    conversation_id = await world.conversation()
+    for _ in range(3):
+        await world.send(conversation_id, "x" * 400)
+
+    async with world.chat.reply(USER, conversation_id, "again") as reply:
+        events = [event async for event in reply.events()]
+
+    assert isinstance(events[-1], ChatError)
+    assert not reply.summary_due

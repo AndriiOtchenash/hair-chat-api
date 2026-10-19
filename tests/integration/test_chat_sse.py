@@ -19,13 +19,15 @@ from sqlalchemy import select
 from app.core.chat import get_conversation_locks, get_llm
 from app.core.config import get_settings
 from app.core.security import get_token_verifier
-from app.db.models import ConsentType, LLMCall, Message, MessageRole
+from app.db.models import ConsentType, Conversation, LLMCall, Message, MessageRole
+from app.db.repositories.conversations import SqlConversationRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
 from app.main import create_app
 from app.services.chat_service import ConversationLocks
+from app.services.tokens import message_tokens
 from tests.auth_fakes import FakeAuth0, SigningKey, bearer, mint
 from tests.llm_fakes import (
     FakeLLMProvider,
@@ -373,3 +375,57 @@ async def test_idle_stream_sends_heartbeat_comments(
 
     assert [(e.event, e.data["text"]) for e in events] == [("comment", "ping")] * 2
     await wait_until_free(live, conversation_id)
+
+
+async def summary_of(conversation_id: str) -> tuple[str | None, uuid.UUID | None]:
+    async with get_sessionmaker()() as session:
+        conversation = await session.get(Conversation, uuid.UUID(conversation_id))
+        assert conversation is not None
+        return conversation.summary, conversation.summary_upto_message_id
+
+
+async def test_long_conversation_is_summarized_after_the_answer_and_fits_the_budget(
+    live: Live,
+) -> None:
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    async with get_sessionmaker()() as session:
+        conversation = await session.get(Conversation, uuid.UUID(conversation_id))
+        assert conversation is not None
+        repo = SqlConversationRepository(session)
+        for i in range(20):  # 40 messages of ~270 tokens: ~10.8K, well over 6000
+            await repo.add_user_message(conversation.user_id, conversation.id, f"q{i:02d} " * 200)
+            await repo.add_assistant_message(
+                conversation.user_id,
+                conversation.id,
+                f"a{i:02d} " * 200,
+                provider="gemini",
+                model="flash",
+                tokens_in=None,
+                tokens_out=None,
+                llm_call_ids=(),
+            )
+    live.backup.script(success("SUMMARY: oily roots, washes daily."))  # the chain's last link
+
+    events = await send(live, headers, conversation_id, "And what about dry ends?")
+    assert events[-1].event == "done"
+    for _ in range(200):  # the background task runs after the stream has ended
+        summary, upto = await summary_of(conversation_id)
+        if summary is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert summary == "SUMMARY: oily roots, washes daily."
+    folded = await stored(conversation_id)
+    upto_index = next(i for i, m in enumerate(folded) if m.id == upto)
+    assert folded[0].content in live.backup.received[0][1]["content"]
+
+    await send(live, headers, conversation_id, "Thanks!")
+
+    context = live.primary.received[-1]
+    assert (
+        sum(message_tokens(m["content"]) for m in context) <= get_settings().context_budget_tokens
+    )
+    assert "SUMMARY: oily roots, washes daily." in context[0]["content"]
+    sent = [m["content"] for m in context[1:]]
+    assert all(m.content not in sent for m in folded[: upto_index + 1])
+    assert sent[-1] == "Thanks!"
