@@ -1,9 +1,10 @@
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Protocol
 
 from sqlalchemy import exists, func, insert, select, tuple_, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import Conversation, LLMCall, Message, MessageRole
 from app.db.pagination import Cursor, Page
@@ -30,10 +31,32 @@ class ConversationRepository(Protocol):
         """Newest first; the cursor leads to older messages."""
         ...
 
-    async def recent_messages(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, limit: int
+    async def history(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        *,
+        after: uuid.UUID | None,
+        limit: int,
+        newest_first: bool,
     ) -> list[Message]:
-        """The last `limit` messages in chronological order."""
+        """Messages after message `after` (all if None), at most `limit`.
+
+        newest_first: the newest `limit` of them, newest first; otherwise the oldest, oldest first.
+        """
+        ...
+
+    async def save_summary(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        summary: str,
+        *,
+        upto_message_id: uuid.UUID,
+        expected_upto: uuid.UUID | None,
+    ) -> bool:
+        """Stores the summary of every message up to `upto_message_id`, only if the summary
+        still ends at `expected_upto` (a concurrent summarizer wins otherwise). True if saved."""
         ...
 
     async def add_user_message(
@@ -111,16 +134,58 @@ class SqlConversationRepository:
         )
         return _page(rows, limit, lambda m: Cursor(m.created_at, m.id))
 
-    async def recent_messages(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, limit: int
+    async def history(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        *,
+        after: uuid.UUID | None,
+        limit: int,
+        newest_first: bool,
     ) -> list[Message]:
-        rows = await self._session.scalars(
-            select(Message)
-            .where(Message.conversation_id == conversation_id, Message.user_id == user_id)
-            .order_by(Message.created_at.desc(), Message.id.desc())
-            .limit(limit)
+        query = select(Message).where(
+            Message.conversation_id == conversation_id, Message.user_id == user_id
         )
-        return list(reversed(list(rows)))
+        if after is not None:
+            boundary = (
+                await self._session.execute(
+                    select(Message.created_at, Message.id).where(
+                        Message.id == after, Message.user_id == user_id
+                    )
+                )
+            ).one_or_none()
+            if boundary is not None:
+                query = query.where(
+                    tuple_(Message.created_at, Message.id) > (boundary.created_at, boundary.id)
+                )
+        order = (
+            (Message.created_at.desc(), Message.id.desc())
+            if newest_first
+            else (Message.created_at, Message.id)
+        )
+        return list(await self._session.scalars(query.order_by(*order).limit(limit)))
+
+    async def save_summary(
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        summary: str,
+        *,
+        upto_message_id: uuid.UUID,
+        expected_upto: uuid.UUID | None,
+    ) -> bool:
+        saved = await self._session.scalar(
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.user_id == user_id,
+                Conversation.summary_upto_message_id.is_not_distinct_from(expected_upto),
+            )
+            .values(summary=summary, summary_upto_message_id=upto_message_id)
+            .returning(Conversation.id)
+        )
+        await self._session.commit()
+        return saved is not None
 
     async def add_user_message(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
@@ -198,6 +263,21 @@ class SqlConversationRepository:
             .values(last_message_at=func.now())
         )
         return message
+
+
+# Opens a repository on its own session: for work that outlives the request (background tasks).
+ConversationRepositoryFactory = Callable[[], AbstractAsyncContextManager[ConversationRepository]]
+
+
+def sql_conversation_repositories(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> ConversationRepositoryFactory:
+    @asynccontextmanager
+    async def open_repository() -> AsyncIterator[ConversationRepository]:
+        async with sessionmaker() as session:
+            yield SqlConversationRepository(session)
+
+    return open_repository
 
 
 def _page[T](rows: list[T], limit: int, cursor_of: Callable[[T], Cursor]) -> Page[T]:

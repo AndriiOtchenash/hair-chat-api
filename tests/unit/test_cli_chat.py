@@ -5,8 +5,9 @@ from collections.abc import AsyncIterator
 from app.cli.chat import converse
 from app.db.models import MessageRole
 from app.llm.base import ProviderHTTPError, StreamBroken
+from tests.fakes import StaticPrompt
 from tests.llm_fakes import FakeLLMProvider, fail_before_first, fail_mid_stream, success, truncated
-from tests.unit.test_chat_service import USER, World
+from tests.unit.test_chat_service import MESSAGE, TIGHT_BUDGET, USER, World
 
 
 async def lines(*items: str) -> AsyncIterator[str]:
@@ -51,3 +52,23 @@ async def test_error_is_printed_and_dialog_goes_on() -> None:
 
     assert "[error llm_unavailable:" in out
     assert out.endswith("back\n— gemini:flash\n\n")
+
+
+class RecordingSummarizer:
+    def __init__(self) -> None:
+        self.runs: list[uuid.UUID] = []
+
+    async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
+        self.runs.append(conversation_id)
+
+
+async def test_summarizer_runs_after_an_answer_whose_context_overflowed() -> None:
+    world = World(budget=TIGHT_BUDGET, prompts=StaticPrompt())
+    summarizer = RecordingSummarizer()
+    conversation_id = await world.conversation()
+    out = io.StringIO()
+
+    await converse(world.chat, USER, conversation_id, lines(MESSAGE, MESSAGE), out, summarizer)
+
+    # The first answer had everything in context; the second had to leave messages out.
+    assert summarizer.runs == [conversation_id]

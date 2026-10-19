@@ -4,11 +4,11 @@ from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
-from app.core.chat import get_chat_service, get_conversation_service
+from app.core.chat import get_chat_service, get_conversation_service, get_summarizer
 from app.core.errors import api_error
 from app.core.security import CurrentUser
 from app.db.models import MessageRole
@@ -24,6 +24,7 @@ from app.services.chat_service import (
     ConversationService,
     Reply,
 )
+from app.services.summarizer import SummaryRunner
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -176,10 +177,15 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
 )
 async def send_message(
     reply: Annotated[Reply, Depends(start_reply)],
+    background: BackgroundTasks,
+    summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
 ) -> AsyncIterable[ServerSentEvent]:
     """Streams the answer: token* (restart token*)* then done, or error (CLAUDE.md SSE contract).
 
     FastAPI adds a `: ping` comment every 15 s while idle and the no-buffering headers.
+    Background tasks run after the stream ends, and not at all if the client disconnects.
     """
     async for event in reply.events():
         yield _sse(event)
+    if reply.summary_due:
+        background.add_task(summarizer.run, reply.user_id, reply.conversation_id)

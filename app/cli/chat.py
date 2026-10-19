@@ -17,7 +17,10 @@ from typing import TextIO
 from app.core.config import Env, get_settings
 from app.db.models import ConsentType
 from app.db.repositories.consents import SqlConsentRepository
-from app.db.repositories.conversations import SqlConversationRepository
+from app.db.repositories.conversations import (
+    SqlConversationRepository,
+    sql_conversation_repositories,
+)
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.repositories.users import SqlUserRepository
 from app.db.session import get_engine, get_sessionmaker
@@ -31,7 +34,10 @@ from app.services.chat_service import (
     ConversationNotFound,
     ConversationService,
 )
-from app.services.context_builder import RecentMessagesContextBuilder
+from app.services.context_builder import TokenBudgetContextBuilder
+from app.services.prompts import FilePromptProvider
+from app.services.summarizer import Summarizer, SummaryRunner
+from app.services.tokens import context_budget
 
 DEV_AUTH_SUB = "dev|local"
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -43,6 +49,7 @@ async def converse(
     conversation_id: uuid.UUID,
     lines: AsyncIterator[str],
     out: TextIO,
+    summarizer: SummaryRunner | None = None,
 ) -> None:
     async for raw in lines:
         content = raw.strip()
@@ -63,6 +70,9 @@ async def converse(
                         out.write(f"\n— {event.provider}:{event.model}{flag}\n\n")
                     case ChatError(code=code, message=message):
                         out.write(f"\n[error {code}: {message}]\n\n")
+        # Inline instead of a background task: the next prompt waits until it is done.
+        if summarizer is not None and reply.summary_due:
+            await summarizer.run(user_id, conversation_id)
 
 
 async def _stdin_lines(prompt: str) -> AsyncIterator[str]:
@@ -80,6 +90,9 @@ async def _main(conversation: uuid.UUID | None) -> int:
         return 2
     try:
         llm = build_llm(settings, SqlLLMCallRecorder(get_sessionmaker()))
+        budget = context_budget(
+            settings.context_budget_tokens, llm.max_context_tokens, settings.chat_max_answer_tokens
+        )
     except ValueError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
@@ -98,12 +111,19 @@ async def _main(conversation: uuid.UUID | None) -> int:
             chat = ChatService(
                 conversations,
                 llm,
-                RecentMessagesContextBuilder(repo),
+                TokenBudgetContextBuilder(repo, FilePromptProvider()),
                 ConversationLocks(),
                 max_answer_tokens=settings.chat_max_answer_tokens,
+                budget_tokens=budget,
+            )
+            summarizer = Summarizer(
+                sql_conversation_repositories(get_sessionmaker()),
+                llm.providers[-1],
+                SqlLLMCallRecorder(get_sessionmaker()),
+                budget_tokens=budget,
             )
             print(f"conversation {conversation} as {DEV_AUTH_SUB}; /exit to quit", file=sys.stderr)
-            await converse(chat, user.id, conversation, _stdin_lines("> "), sys.stdout)
+            await converse(chat, user.id, conversation, _stdin_lines("> "), sys.stdout, summarizer)
     except ConversationNotFound:
         print(f"conversation {conversation} not found for {DEV_AUTH_SUB}", file=sys.stderr)
         return 1

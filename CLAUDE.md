@@ -26,7 +26,7 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 ## Layout
 app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
-app/services  chat_service, context_builder, profile_extractor, retention
+app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor, retention
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py
 app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
 app/db        SQLAlchemy models, repositories, session
@@ -59,6 +59,18 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `consent_version_mismatch`. Revoking sets `revoked_at` and never deletes rows.
 - Tests never hit Auth0: use tests/auth_fakes.py (own RSA keys, JWKS via httpx.MockTransport) and
   override `get_token_verifier` / `get_user_repository`.
+
+## Context and prompts
+- Context per reply = TokenBudgetContextBuilder: one system message (prompt + `<profile>`,
+  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions"),
+  then as many recent messages as fit, then the new message. The prompt is never cut.
+- Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
+  `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).
+- Messages that do not fit are folded into `conversations.summary` after the answer (background
+  task; inline in the CLI) by the chain's last link; best effort, never breaks the chat.
+- Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
+  `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
+  (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
 
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no

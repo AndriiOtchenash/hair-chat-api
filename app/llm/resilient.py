@@ -64,7 +64,12 @@ class Cooldown:
         if count >= self._threshold:
             self._until[key] = self._clock() + self._seconds
             self._failures.pop(key, None)
-            logger.warning("llm link in cooldown: link=%s seconds=%.0f", key, self._seconds)
+            logger.warning(
+                "llm link entering cooldown: link=%s after_failures=%d seconds=%.0f",
+                key,
+                count,
+                self._seconds,
+            )
         else:
             self._failures[key] = count
 
@@ -167,7 +172,6 @@ class ResilientLLM:
                     )
                     raise LLMRequestError(provider.name, provider.model, err.code) from err
 
-                self._cooldown.failure(key)
                 log = logger.error if err.misconfigured else logger.warning
                 log(
                     "llm attempt failed: link=%s code=%s streamed=%s latency_ms=%d",
@@ -176,6 +180,8 @@ class ResilientLLM:
                     streamed,
                     latency_ms,
                 )
+                # After the failure is logged: the cooldown it may start follows it in the log.
+                self._cooldown.failure(key)
                 has_next = any(
                     not self._cooldown.is_cooling(link_key(p.name, p.model))
                     for p in self._providers[index + 1 :]
