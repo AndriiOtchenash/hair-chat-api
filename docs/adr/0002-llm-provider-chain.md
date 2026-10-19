@@ -29,7 +29,7 @@ link can take over with the same full context. Each SDK per provider would multi
 
 ## Consequences
 - Adding a provider = registry entry + key in Settings, if it speaks the OpenAI protocol.
-- openai SDK v3 runs on `httpx2`, which we import directly (it is a transitive dependency for now).
+- openai SDK v3 runs on `httpx2`, which we import directly and declare as an explicit dependency.
 - Each worker learns about a failing link separately (no shared cooldown state); acceptable
   without Redis (CLAUDE.md: no Celery/Redis).
 - Free-tier Gemini may use prompts for training: prod must use a paid-tier key.
