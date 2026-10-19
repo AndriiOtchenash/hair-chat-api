@@ -22,6 +22,17 @@ from app.db.repositories.conversations import (
     ConversationRepository,
     ConversationRepositoryFactory,
 )
+from app.services.prompts import SystemPrompt
+
+
+class StaticPrompt:
+    """PromptProvider with a short fixed prompt: budget tests must not depend on the real one."""
+
+    def __init__(self, text: str = "You are a hair-care assistant.", version: str = "test_v9"):
+        self.prompt = SystemPrompt(text, version)
+
+    async def get_active(self) -> SystemPrompt:
+        return self.prompt
 
 
 class FakeUserRepository:

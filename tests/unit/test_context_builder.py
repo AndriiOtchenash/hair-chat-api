@@ -2,23 +2,14 @@ import uuid
 
 from app.db.models import Conversation, Message
 from app.services.context_builder import Context, TokenBudgetContextBuilder, wrap_data
-from app.services.prompts import SystemPrompt
 from app.services.tokens import message_tokens
-from tests.fakes import FakeConversationRepository
+from tests.fakes import FakeConversationRepository, StaticPrompt
 
 USER = uuid.UUID("01890000-0000-7000-8000-000000000001")
 OTHER = uuid.UUID("01890000-0000-7000-8000-000000000002")
 PROMPT = "You are a hair-care assistant."
 # ~592 tokens each: two of them do not fit a 1000-token budget, one does.
 MEDIUM = "m" * 1800
-
-
-class StaticPrompt:
-    def __init__(self, text: str = PROMPT, version: str = "test_v9") -> None:
-        self.prompt = SystemPrompt(text, version)
-
-    async def get_active(self) -> SystemPrompt:
-        return self.prompt
 
 
 class StaticProfile:

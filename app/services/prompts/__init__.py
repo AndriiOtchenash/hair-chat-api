@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from typing import Protocol
 
-PROMPT_VERSION = "system_v1"
+PROMPT_VERSION = "system_v2"
 SUMMARY_PROMPT_VERSION = "summary_v1"
 
 

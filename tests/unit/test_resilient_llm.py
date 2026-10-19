@@ -309,6 +309,33 @@ async def test_cooldown_after_three_consecutive_failures() -> None:
     assert events[-1] == Done("gemini", "flash")
 
 
+async def test_cooldown_log_reads_failure_then_entering_then_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("INFO", logger="app.llm.resilient")
+    primary = FakeLLMProvider("gemini", "flash").script(
+        *[fail_before_first(ProviderHTTPError(503, "InternalServerError"))] * 3
+    )
+    llm = make_llm(primary, FakeLLMProvider("groq", "oss"))
+
+    for _ in range(4):
+        await collect(llm)
+
+    primary_lines = [
+        r.getMessage().split(":")[0]
+        for r in caplog.records
+        if "link=gemini:flash" in r.getMessage()
+    ]
+    assert primary_lines == [
+        "llm attempt failed",
+        "llm attempt failed",
+        "llm attempt failed",
+        "llm link entering cooldown",
+        "llm link skipped (cooldown)",
+    ]
+    assert primary.calls == 3  # no attempt while cooling
+
+
 async def test_success_resets_consecutive_failures() -> None:
     error = fail_before_first(ProviderTimeout())
     primary = FakeLLMProvider("gemini", "flash").script(

@@ -17,8 +17,8 @@ from app.services.chat_service import (
     ConversationService,
 )
 from app.services.context_builder import TokenBudgetContextBuilder
-from app.services.prompts import FilePromptProvider
-from tests.fakes import FakeConversationRepository
+from app.services.prompts import FilePromptProvider, PromptProvider
+from tests.fakes import FakeConversationRepository, StaticPrompt
 from tests.llm_fakes import (
     FakeLLMCallRecorder,
     FakeLLMProvider,
@@ -37,7 +37,12 @@ OTHER = uuid.UUID("01890000-0000-7000-8000-000000000002")
 class World:
     """ChatService over in-memory fakes; providers are scripted per test."""
 
-    def __init__(self, *providers: FakeLLMProvider, budget: int = 6000) -> None:
+    def __init__(
+        self,
+        *providers: FakeLLMProvider,
+        budget: int = 6000,
+        prompts: PromptProvider | None = None,
+    ) -> None:
         self.repo = FakeConversationRepository()
         self.recorder = FakeLLMCallRecorder()
         self.providers = providers or (FakeLLMProvider("gemini", "flash"),)
@@ -45,7 +50,7 @@ class World:
         self.chat = ChatService(
             ConversationService(self.repo),
             ResilientLLM(self.providers, self.recorder, first_token_timeout=0.05),
-            TokenBudgetContextBuilder(self.repo, FilePromptProvider()),
+            TokenBudgetContextBuilder(self.repo, prompts or FilePromptProvider()),
             self.locks,
             max_answer_tokens=100,
             budget_tokens=budget,
@@ -249,17 +254,20 @@ async def test_someone_elses_or_missing_conversation_is_not_found() -> None:
     assert world.repo.of(foreign) == []
 
 
+# With StaticPrompt (14 tokens) a 35-char message costs 16: 30 fits the prompt and one message.
+TIGHT_BUDGET = 30
+MESSAGE = "x" * 35
+
+
 async def test_summary_is_due_after_an_answer_whose_context_left_messages_out() -> None:
-    world = World(budget=1200)  # the system prompt alone takes ~800
+    world = World(budget=TIGHT_BUDGET, prompts=StaticPrompt())
     conversation_id = await world.conversation()
 
-    async with world.chat.reply(USER, conversation_id, "short") as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
         _ = [event async for event in reply.events()]
     assert not reply.summary_due  # everything fit
 
-    for _ in range(3):
-        await world.send(conversation_id, "x" * 400)
-    async with world.chat.reply(USER, conversation_id, "again") as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
         events = [event async for event in reply.events()]
     assert isinstance(events[-1], ChatDone)
     assert reply.summary_due
@@ -268,16 +276,15 @@ async def test_summary_is_due_after_an_answer_whose_context_left_messages_out() 
 async def test_no_summary_is_due_when_the_reply_failed() -> None:
     world = World(
         FakeLLMProvider("gemini", "flash").script(
-            *[success() for _ in range(3)],
-            fail_before_first(ProviderHTTPError(503, "InternalServerError")),
+            success(), fail_before_first(ProviderHTTPError(503, "InternalServerError"))
         ),
-        budget=1200,
+        budget=TIGHT_BUDGET,
+        prompts=StaticPrompt(),
     )
     conversation_id = await world.conversation()
-    for _ in range(3):
-        await world.send(conversation_id, "x" * 400)
+    await world.send(conversation_id, MESSAGE)
 
-    async with world.chat.reply(USER, conversation_id, "again") as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
         events = [event async for event in reply.events()]
 
     assert isinstance(events[-1], ChatError)

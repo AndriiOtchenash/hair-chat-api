@@ -5,8 +5,9 @@ from collections.abc import AsyncIterator
 from app.cli.chat import converse
 from app.db.models import MessageRole
 from app.llm.base import ProviderHTTPError, StreamBroken
+from tests.fakes import StaticPrompt
 from tests.llm_fakes import FakeLLMProvider, fail_before_first, fail_mid_stream, success, truncated
-from tests.unit.test_chat_service import USER, World
+from tests.unit.test_chat_service import MESSAGE, TIGHT_BUDGET, USER, World
 
 
 async def lines(*items: str) -> AsyncIterator[str]:
@@ -62,14 +63,12 @@ class RecordingSummarizer:
 
 
 async def test_summarizer_runs_after_an_answer_whose_context_overflowed() -> None:
-    world = World(budget=1200)
+    world = World(budget=TIGHT_BUDGET, prompts=StaticPrompt())
     summarizer = RecordingSummarizer()
     conversation_id = await world.conversation()
     out = io.StringIO()
 
-    await converse(
-        world.chat, USER, conversation_id, lines("short", *["x" * 400] * 3), out, summarizer
-    )
+    await converse(world.chat, USER, conversation_id, lines(MESSAGE, MESSAGE), out, summarizer)
 
-    # The 4th answer is the first whose context had to leave messages out.
+    # The first answer had everything in context; the second had to leave messages out.
     assert summarizer.runs == [conversation_id]
