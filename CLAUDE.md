@@ -27,7 +27,7 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor, retention
-app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py
+app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py (Moderator)
 app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
 app/db        SQLAlchemy models, repositories, session
 migrations/   Alembic (async env); URL comes from DATABASE_URL via Settings, not alembic.ini
@@ -71,6 +71,16 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
   `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
+
+## Moderation (ADR 0004)
+- Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
+  3 s timeout, no retries) in `ChatService.reply` after the 404/409 checks, before it is saved.
+- Flagged `self-harm*` -> 422 `message_blocked_self_harm`; other flagged -> 422 `message_blocked`.
+  A blocked message is never saved; log only the code and categories (no text, no user_id).
+- Fail-open: moderation down (timeout, 429, 5xx, network; 4xx too but logged as error) ->
+  the message goes through. `messages.moderation` = `{provider, model, flagged: false}`,
+  `{status: "unavailable"}` or `{status: "disabled"}` (no key, dev only). Never store scores.
+- Tests use FakeModerator (tests/llm_fakes.py); prod refuses to start without OPENAI_API_KEY.
 
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
@@ -126,8 +136,9 @@ event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as RE
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
 - error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
   internal_error. The user's message is kept in every case.
-- 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422 come as
-  normal HTTP responses before the stream starts (checked in the `start_reply` dependency).
+- 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422
+  validation_error / message_blocked / message_blocked_self_harm come as normal HTTP responses
+  before the stream starts (checked in the `start_reply` dependency).
 - Only a complete answer is saved (on done); a client disconnect cancels the generation and
   saves nothing. One generation per conversation, in-memory per process (ADR 0003).
 - Test SSE against a live uvicorn (tests/integration/test_chat_sse.py): httpx's ASGITransport

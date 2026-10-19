@@ -1,7 +1,7 @@
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Protocol
+from typing import Any, Protocol
 
 from sqlalchemy import exists, func, insert, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -60,9 +60,17 @@ class ConversationRepository(Protocol):
         ...
 
     async def add_user_message(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        content: str,
+        *,
+        moderation: dict[str, Any] | None = None,
     ) -> Message:
-        """Saves the message; the first message of a conversation also sets its title."""
+        """Saves the message; the first message of a conversation also sets its title.
+
+        moderation: the check's outcome for messages.moderation (never scores or text).
+        """
         ...
 
     async def add_assistant_message(
@@ -188,7 +196,12 @@ class SqlConversationRepository:
         return saved is not None
 
     async def add_user_message(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        content: str,
+        *,
+        moderation: dict[str, Any] | None = None,
     ) -> Message:
         has_messages = exists().where(Message.conversation_id == conversation_id)
         await self._session.execute(
@@ -201,7 +214,9 @@ class SqlConversationRepository:
             )
             .values(title=content[:TITLE_MAX_CHARS])
         )
-        message = await self._insert_message(user_id, conversation_id, MessageRole.USER, content)
+        message = await self._insert_message(
+            user_id, conversation_id, MessageRole.USER, content, moderation=moderation
+        )
         await self._session.commit()
         return message
 
@@ -243,7 +258,7 @@ class SqlConversationRepository:
         conversation_id: uuid.UUID,
         role: MessageRole,
         content: str,
-        **fields: str | int | None,
+        **fields: str | int | dict[str, Any] | None,
     ) -> Message:
         message: Message | None = await self._session.scalar(
             insert(Message)

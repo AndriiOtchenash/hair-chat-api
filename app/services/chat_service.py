@@ -1,9 +1,10 @@
 """Chat use cases: conversations, messages and one streamed reply per user message.
 
-A reply is two steps so HTTP can answer 404/409 before the stream starts:
-`async with service.reply(...)` checks the conversation, takes its generation slot and saves the
-user message; `reply.events()` then streams the answer. Only a complete answer (Done) is saved:
-a client that disconnects cancels the stream and leaves no partial assistant message behind.
+A reply is two steps so HTTP can answer 404/409/422 before the stream starts:
+`async with service.reply(...)` checks the conversation, takes its generation slot, moderates
+and saves the user message; `reply.events()` then streams the answer. Only a complete answer
+(Done) is saved: a client that disconnects cancels the stream and leaves no partial assistant
+message behind.
 """
 
 import logging
@@ -11,11 +12,13 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from app.db.models import Conversation, Message
 from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
+from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
 from app.services.context_builder import Context, ContextBuilder
 
@@ -28,6 +31,21 @@ class ConversationNotFound(Exception):
 
 class ConversationBusy(Exception):
     """An answer is already being generated in this conversation."""
+
+
+class MessageBlocked(Exception):
+    """Moderation flagged the message; it is not saved. `code` is the API error code."""
+
+    def __init__(self, code: str, categories: tuple[str, ...]) -> None:
+        super().__init__(code)
+        self.code = code
+        self.categories = categories
+
+
+BLOCKED_SELF_HARM = "message_blocked_self_harm"
+BLOCKED = "message_blocked"
+# self-harm, self-harm/intent, self-harm/instructions: the client shows help lines instead.
+SELF_HARM_PREFIX = "self-harm"
 
 
 class ConversationLocks:
@@ -215,6 +233,7 @@ class ChatService:
         llm: ResilientLLM,
         context_builder: ContextBuilder,
         locks: ConversationLocks,
+        moderator: Moderator,
         *,
         max_answer_tokens: int,
         budget_tokens: int,
@@ -224,6 +243,7 @@ class ChatService:
         self.llm = llm
         self.context_builder = context_builder
         self.locks = locks
+        self.moderator = moderator
         self.max_answer_tokens = max_answer_tokens
         # Input tokens per reply: app.services.tokens.context_budget.
         self.budget_tokens = budget_tokens
@@ -232,15 +252,40 @@ class ChatService:
     async def reply(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
     ) -> AsyncIterator[Reply]:
-        """Raises ConversationNotFound / ConversationBusy before anything is saved.
+        """Raises ConversationNotFound / ConversationBusy / MessageBlocked before anything is saved.
 
         The slot is held until the block exits, i.e. until the stream ends or is cancelled.
+        Moderation runs after the slot is taken, so a busy conversation costs no moderation call.
         """
         await self.conversations.require(user_id, conversation_id)
         with self.locks.hold(conversation_id):
-            message = await self.repo.add_user_message(user_id, conversation_id, content)
+            moderation = await self._moderate(content)
+            message = await self.repo.add_user_message(
+                user_id, conversation_id, content, moderation=moderation
+            )
             reply = Reply(self, user_id, conversation_id, message.id)
             try:
                 yield reply
             finally:
                 await reply.aclose()
+
+    async def _moderate(self, content: str) -> dict[str, Any]:
+        """Raises MessageBlocked; otherwise returns what to store in messages.moderation.
+
+        Fail-open (ADR 0004): if moderation is down the message goes through, marked
+        "unavailable". Logs carry codes and categories only: no text, no user id (rule 6).
+        """
+        if not self.moderator.enabled:
+            return {"status": "disabled"}
+        try:
+            result = await self.moderator.check(content)
+        except ModerationUnavailable as exc:
+            log = logger.error if exc.misconfigured else logger.warning
+            log("moderation unavailable, message let through: code=%s", exc.code)
+            return {"status": "unavailable"}
+        if result.flagged:
+            self_harm = any(c.startswith(SELF_HARM_PREFIX) for c in result.categories)
+            code = BLOCKED_SELF_HARM if self_harm else BLOCKED
+            logger.info("message blocked: code=%s categories=%s", code, ",".join(result.categories))
+            raise MessageBlocked(code, result.categories)
+        return {"provider": result.provider, "model": result.model, "flagged": False}

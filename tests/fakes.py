@@ -4,6 +4,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from app.db.base import new_id
 from app.db.models import (
@@ -177,13 +178,18 @@ class FakeConversationRepository:
         return open_repository
 
     async def add_user_message(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        content: str,
+        *,
+        moderation: dict[str, Any] | None = None,
     ) -> Message:
         conversation = self._owned(user_id, conversation_id)
         assert conversation is not None
         if conversation.title is None and not self.of(conversation_id):
             conversation.title = content[:TITLE_MAX_CHARS]
-        return self._add(conversation, MessageRole.USER, content)
+        return self._add(conversation, MessageRole.USER, content, moderation=moderation)
 
     async def add_assistant_message(
         self,
@@ -217,7 +223,7 @@ class FakeConversationRepository:
         conversation: Conversation,
         role: MessageRole,
         content: str,
-        **fields: str | int | None,
+        **fields: str | int | dict[str, Any] | None,
     ) -> Message:
         now = self._tick()
         message = Message(

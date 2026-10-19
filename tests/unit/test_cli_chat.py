@@ -6,7 +6,15 @@ from app.cli.chat import converse
 from app.db.models import MessageRole
 from app.llm.base import ProviderHTTPError, StreamBroken
 from tests.fakes import StaticPrompt
-from tests.llm_fakes import FakeLLMProvider, fail_before_first, fail_mid_stream, success, truncated
+from tests.llm_fakes import (
+    FakeLLMProvider,
+    FakeModerator,
+    fail_before_first,
+    fail_mid_stream,
+    flag,
+    success,
+    truncated,
+)
 from tests.unit.test_chat_service import MESSAGE, TIGHT_BUDGET, USER, World
 
 
@@ -52,6 +60,25 @@ async def test_error_is_printed_and_dialog_goes_on() -> None:
 
     assert "[error llm_unavailable:" in out
     assert out.endswith("back\n— gemini:flash\n\n")
+
+
+async def test_blocked_message_is_explained_and_dialog_goes_on() -> None:
+    world = World(
+        FakeLLMProvider("gemini", "flash").script(success("fine")),
+        moderator=FakeModerator(flag("self-harm/intent"), flag("harassment")),
+    )
+
+    conversation_id, out = await run(world, "one", "two", "three")
+
+    assert out == (
+        "[message_blocked_self_harm: self-harm/intent] Message not sent: it looks like you may be "
+        "going through a hard time. The app shows help line numbers in the user's language "
+        "here.\n\n"
+        "[message_blocked: harassment] Message not sent: moderation flagged it as breaking the "
+        "usage rules.\n\n"
+        "fine\n— gemini:flash\n\n"
+    )
+    assert [m.content for m in world.repo.of(conversation_id)] == ["three", "fine"]
 
 
 class RecordingSummarizer:

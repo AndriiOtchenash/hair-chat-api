@@ -15,6 +15,8 @@ from app.db.models import MessageRole
 from app.db.pagination import Cursor, InvalidCursor
 from app.llm.base import Restart, Token
 from app.services.chat_service import (
+    BLOCKED,
+    BLOCKED_SELF_HARM,
     ChatDone,
     ChatError,
     ChatEvent,
@@ -22,6 +24,7 @@ from app.services.chat_service import (
     ConversationBusy,
     ConversationNotFound,
     ConversationService,
+    MessageBlocked,
     Reply,
 )
 from app.services.summarizer import SummaryRunner
@@ -83,6 +86,14 @@ def _cursor(value: str | None) -> Cursor | None:
         raise api_error(422, "validation_error", "query.cursor: invalid cursor") from None
 
 
+# The client shows its own localized text (help lines for self-harm); these are fallbacks.
+BLOCKED_MESSAGES = {
+    BLOCKED_SELF_HARM: "This message was not sent. If you are going through a hard time, "
+    "please reach out to someone you trust or a local help line.",
+    BLOCKED: "This message was not sent because it breaks the usage rules",
+}
+
+
 def _not_found() -> Exception:
     return api_error(status.HTTP_404_NOT_FOUND, "not_found", "Conversation not found")
 
@@ -127,7 +138,7 @@ async def list_messages(
 async def start_reply(
     conversation_id: uuid.UUID, body: SendMessageRequest, user: CurrentUser, chat: Chat
 ) -> AsyncIterator[Reply]:
-    """Runs before the response starts, so 404/409 are real HTTP statuses, not SSE events.
+    """Runs before the response starts, so 404/409/422 are real HTTP statuses, not SSE events.
 
     Its teardown runs after the stream ends or the client disconnects: that frees the slot.
     """
@@ -141,6 +152,10 @@ async def start_reply(
             status.HTTP_409_CONFLICT,
             "conversation_busy",
             "An answer is already being generated in this conversation",
+        ) from None
+    except MessageBlocked as exc:
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, exc.code, BLOCKED_MESSAGES[exc.code]
         ) from None
 
 
@@ -173,6 +188,10 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
     responses={
         404: {"description": "Missing or someone else's conversation"},
         409: {"description": "conversation_busy: an answer is already streaming"},
+        422: {
+            "description": "message_blocked_self_harm / message_blocked (moderation; the "
+            "message is not saved) or validation_error"
+        },
     },
 )
 async def send_message(

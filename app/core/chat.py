@@ -16,6 +16,7 @@ from app.db.repositories.conversations import (
 )
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.session import get_session, get_sessionmaker
+from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
 from app.llm.registry import build_llm
 from app.llm.resilient import ResilientLLM
 from app.services.chat_service import ChatService, ConversationLocks, ConversationService
@@ -50,10 +51,28 @@ def get_llm() -> ResilientLLM:
         ) from exc
 
 
+def build_moderator(settings: Settings) -> Moderator:
+    if settings.openai_api_key is None:  # dev only: Settings refuses prod without the key
+        return NoopModerator()
+    return OpenAIModerator(
+        api_key=settings.openai_api_key.get_secret_value(),
+        timeout=settings.moderation_timeout_s,
+    )
+
+
+@lru_cache
+def get_moderator() -> Moderator:
+    # One client per process: its HTTP connection pool is shared by requests.
+    return build_moderator(get_settings())
+
+
 async def close_llm() -> None:
     if _llm.cache_info().currsize:
         await _llm().aclose()
         _llm.cache_clear()
+    if get_moderator.cache_info().currsize:
+        await get_moderator().aclose()
+        get_moderator.cache_clear()
 
 
 @lru_cache
@@ -111,6 +130,7 @@ def get_chat_service(
     budget: Budget,
     prompts: Annotated[PromptProvider, Depends(get_prompt_provider)],
     locks: Annotated[ConversationLocks, Depends(get_conversation_locks)],
+    moderator: Annotated[Moderator, Depends(get_moderator)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ChatService:
     return ChatService(
@@ -118,6 +138,7 @@ def get_chat_service(
         llm,
         TokenBudgetContextBuilder(repo, prompts),
         locks,
+        moderator,
         max_answer_tokens=settings.chat_max_answer_tokens,
         budget_tokens=budget,
     )
