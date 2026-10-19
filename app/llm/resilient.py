@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Sequence
+import uuid
+from collections.abc import AsyncGenerator, Callable, Sequence
 
 from app.db.models import LLMCallStatus
 from app.db.repositories.llm_calls import LLMCallRecord, LLMCallRecorder
@@ -17,6 +18,7 @@ from app.llm.base import (
     ProviderError,
     ProviderTimeout,
     Restart,
+    StreamEnd,
     Token,
     link_key,
 )
@@ -108,7 +110,7 @@ class ResilientLLM:
 
     async def stream(
         self, messages: Sequence[ChatMessage], max_tokens: int
-    ) -> AsyncIterator[LLMEvent]:
+    ) -> AsyncGenerator[LLMEvent]:
         """Full answer from the first link that manages it.
 
         Raises LLMRequestError (our request is bad, no fallback) or AllProvidersDown.
@@ -116,6 +118,7 @@ class ResilientLLM:
         starts, so the client drops the partial answer and receives a complete one.
         """
         attempts: list[tuple[str, str]] = []
+        call_ids: list[uuid.UUID] = []
         fallback_from: str | None = None
         partial_reason: str | None = None  # set while a partial answer is out at the client
 
@@ -132,6 +135,7 @@ class ResilientLLM:
             started = self._clock()
             tokens = provider.stream(messages, max_tokens)
             streamed = False
+            end = StreamEnd()
             try:
                 try:
                     async with asyncio.timeout(self._first_token_timeout):
@@ -140,10 +144,15 @@ class ResilientLLM:
                     raise ProviderTimeout("first_token_timeout") from None
                 except StopAsyncIteration:
                     raise EmptyResponse() from None
+                if isinstance(first, StreamEnd):
+                    raise EmptyResponse()
                 streamed = True
                 yield Token(first, provider.name, provider.model)
-                async for text in tokens:
-                    yield Token(text, provider.name, provider.model)
+                async for item in tokens:
+                    if isinstance(item, StreamEnd):
+                        end = item
+                    else:
+                        yield Token(item, provider.name, provider.model)
             except ProviderError as err:
                 latency_ms = self._elapsed_ms(started)
                 if not err.retryable:
@@ -154,7 +163,7 @@ class ResilientLLM:
                         latency_ms,
                     )
                     await self._record(
-                        provider, latency_ms, LLMCallStatus.ERROR, err, fallback_from
+                        provider, latency_ms, LLMCallStatus.ERROR, err, fallback_from, call_ids
                     )
                     raise LLMRequestError(provider.name, provider.model, err.code) from err
 
@@ -172,7 +181,7 @@ class ResilientLLM:
                     for p in self._providers[index + 1 :]
                 )
                 status = LLMCallStatus.FALLBACK if has_next else LLMCallStatus.ERROR
-                await self._record(provider, latency_ms, status, err, fallback_from)
+                await self._record(provider, latency_ms, status, err, fallback_from, call_ids)
                 attempts.append((key, err.code))
                 fallback_from = key
                 if streamed:
@@ -186,8 +195,17 @@ class ResilientLLM:
             latency_ms = self._elapsed_ms(started)
             self._cooldown.success(key)
             logger.info("llm answered: link=%s latency_ms=%d", key, latency_ms)
-            await self._record(provider, latency_ms, LLMCallStatus.OK, None, fallback_from)
-            yield Done(provider.name, provider.model)
+            await self._record(
+                provider, latency_ms, LLMCallStatus.OK, None, fallback_from, call_ids
+            )
+            yield Done(
+                provider.name,
+                provider.model,
+                truncated=end.finish_reason == "length",
+                tokens_in=end.tokens_in,
+                tokens_out=end.tokens_out,
+                call_ids=tuple(call_ids),
+            )
             return
 
         raise AllProvidersDown(attempts)
@@ -202,6 +220,7 @@ class ResilientLLM:
         status: LLMCallStatus,
         err: ProviderError | None,
         fallback_from: str | None,
+        call_ids: list[uuid.UUID],
     ) -> None:
         call = LLMCallRecord(
             provider=provider.name,
@@ -211,6 +230,7 @@ class ResilientLLM:
             error=err.code if err else None,
             fallback_from=fallback_from,
         )
+        call_ids.append(call.id)
         try:
             await self._recorder.record(call)
         except Exception as exc:  # recorders are best effort; the answer matters more

@@ -14,6 +14,7 @@ from app.llm.base import (
     ProviderHTTPError,
     ProviderTimeout,
     StreamBroken,
+    StreamEnd,
 )
 from app.llm.openai_compatible import OpenAICompatibleProvider
 
@@ -26,15 +27,31 @@ MESSAGES: list[ChatMessage] = [
 Handler = Callable[[httpx2.Request], httpx2.Response]
 
 
-def sse_chunk(content: str | None, **delta_extra: str) -> bytes:
+def sse_chunk(
+    content: str | None,
+    *,
+    finish_reason: str | None = None,
+    usage: tuple[int, int] | None = None,
+    no_choices: bool = False,
+    **delta_extra: str,
+) -> bytes:
     delta: dict[str, str | None] = {"content": content, **delta_extra}
-    body = {
+    body: dict[str, object] = {
         "id": "c1",
         "object": "chat.completion.chunk",
         "created": 0,
         "model": "m",
-        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+        "choices": []
+        if no_choices
+        else [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    if usage is not None:
+        prompt, completion = usage
+        body["usage"] = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
     return f"data: {json.dumps(body)}\n\n".encode()
 
 
@@ -74,8 +91,8 @@ def provider(handler: Handler) -> OpenAICompatibleProvider:
     )
 
 
-async def collect(p: OpenAICompatibleProvider) -> list[str]:
-    return [text async for text in p.stream(MESSAGES, max_tokens=50)]
+async def collect(p: OpenAICompatibleProvider) -> list[str | StreamEnd]:
+    return [item async for item in p.stream(MESSAGES, max_tokens=50)]
 
 
 async def test_streams_content_deltas_and_sends_openai_request() -> None:
@@ -91,7 +108,7 @@ async def test_streams_content_deltas_and_sends_openai_request() -> None:
             DONE,
         )
 
-    assert await collect(provider(handler)) == ["Hel", "lo"]
+    assert await collect(provider(handler)) == ["Hel", "lo", StreamEnd()]
 
     [request] = seen
     assert request.method == "POST"
@@ -100,9 +117,30 @@ async def test_streams_content_deltas_and_sends_openai_request() -> None:
     body = json.loads(request.content)
     assert body["model"] == "openai/gpt-oss-120b"
     assert body["stream"] is True
+    assert body["stream_options"] == {"include_usage": True}
     assert body["max_tokens"] == 50
     assert body["reasoning_effort"] == "low"
     assert body["messages"] == MESSAGES
+
+
+async def test_stream_end_carries_finish_reason_and_last_usage() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return sse_response(
+            # Gemini style: running usage total on content chunks...
+            sse_chunk("one ", usage=(9, 2)),
+            sse_chunk("two", finish_reason="length", usage=(9, 16)),
+            # ...Groq/OpenAI style: a final usage-only chunk with no choices.
+            sse_chunk(None, no_choices=True, usage=(9, 20)),
+            DONE,
+        )
+
+    items = await collect(provider(handler))
+
+    assert items == [
+        "one ",
+        "two",
+        StreamEnd(finish_reason="length", tokens_in=9, tokens_out=20),
+    ]
 
 
 async def test_no_reasoning_effort_is_not_sent() -> None:

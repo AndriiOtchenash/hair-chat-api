@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     llm_first_token_timeout_s: float = 20.0
     # Max silence between chunks once streaming; longer counts as a broken stream.
     llm_read_timeout_s: float = 30.0
+    # Answer length cap per chat reply; reasoning tokens of thinking models count against it too.
+    chat_max_answer_tokens: int = 2048
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     mistral_api_key: SecretStr | None = None

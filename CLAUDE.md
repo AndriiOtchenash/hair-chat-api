@@ -92,6 +92,7 @@ uv run pytest tests/integration        # needs Docker
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
+uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local via ChatService
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
@@ -107,5 +108,15 @@ uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain c
 ## SSE contract (POST /conversations/{id}/messages)
 event: token    data: {"text": "..."}
 event: restart  data: {"reason": "..."}    # provider failed mid-stream; client clears partial answer
-event: done     data: {"message_id": "...", "provider": "...", "model": "..."}
+event: done     data: {"message_id": "...", "provider": "...", "model": "...", "truncated": false}
 event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as REST errors
+: ping                                     # keep-alive comment every 15 s while idle (FastAPI)
+- truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
+- error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
+  internal_error. The user's message is kept in every case.
+- 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422 come as
+  normal HTTP responses before the stream starts (checked in the `start_reply` dependency).
+- Only a complete answer is saved (on done); a client disconnect cancels the generation and
+  saves nothing. One generation per conversation, in-memory per process (ADR 0003).
+- Test SSE against a live uvicorn (tests/integration/test_chat_sse.py): httpx's ASGITransport
+  buffers the whole response.
