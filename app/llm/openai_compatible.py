@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import httpx2
 import openai
+from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.shared import ReasoningEffort
 
@@ -20,6 +21,7 @@ from app.llm.base import (
     ProviderHTTPError,
     ProviderTimeout,
     StreamBroken,
+    StreamEnd,
 )
 
 
@@ -66,27 +68,46 @@ class OpenAICompatibleProvider:
     async def aclose(self) -> None:
         await self._client.close()
 
-    async def stream(self, messages: Sequence[ChatMessage], max_tokens: int) -> AsyncIterator[str]:
+    async def stream(
+        self, messages: Sequence[ChatMessage], max_tokens: int
+    ) -> AsyncIterator[str | StreamEnd]:
         extra: dict[str, Any] = {}
         if self._reasoning_effort is not None:
             extra["reasoning_effort"] = self._reasoning_effort
         started = False
+        finish_reason: str | None = None
+        usage: CompletionUsage | None = None
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
                 messages=cast(list[ChatCompletionMessageParam], list(messages)),
                 max_tokens=max_tokens,
                 stream=True,
+                # Usage arrives in the stream (Gemini repeats a running total on every chunk,
+                # Groq sends it once at the end): the last one seen wins.
+                stream_options={"include_usage": True},
                 **extra,
             )
             try:
                 async for chunk in response:
+                    if chunk.usage is not None:
+                        usage = chunk.usage
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    if choice.finish_reason is not None:
+                        finish_reason = choice.finish_reason
                     # Reasoning models may send thinking in other delta fields; only content counts.
-                    if chunk.choices and (text := chunk.choices[0].delta.content):
+                    if text := choice.delta.content:
                         started = True
                         yield text
             finally:
                 await response.close()
+            yield StreamEnd(
+                finish_reason=finish_reason,
+                tokens_in=usage.prompt_tokens if usage else None,
+                tokens_out=usage.completion_tokens if usage else None,
+            )
         except openai.APIStatusError as exc:
             raise ProviderHTTPError(
                 exc.status_code, type(exc).__name__, invalid_api_key=_is_invalid_api_key(exc)

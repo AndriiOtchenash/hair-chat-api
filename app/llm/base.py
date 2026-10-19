@@ -4,6 +4,7 @@ ResilientLLM depends only on what is defined here, never on the openai SDK, so f
 implement the same Protocol and raise the same errors as real providers.
 """
 
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypedDict
@@ -26,8 +27,10 @@ class LLMProvider(Protocol):
     @property
     def max_context_tokens(self) -> int: ...
 
-    def stream(self, messages: Sequence[ChatMessage], max_tokens: int) -> AsyncIterator[str]:
-        """Yields text deltas; raises ProviderError on failure."""
+    def stream(
+        self, messages: Sequence[ChatMessage], max_tokens: int
+    ) -> AsyncIterator["str | StreamEnd"]:
+        """Yields text deltas, optionally a final StreamEnd; raises ProviderError on failure."""
         ...
 
 
@@ -106,6 +109,15 @@ class AllProvidersDown(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class StreamEnd:
+    """Optional last item of a provider stream: why it stopped and the token usage, if known."""
+
+    finish_reason: str | None = None
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Token:
     text: str
     provider: str
@@ -123,6 +135,12 @@ class Restart:
 class Done:
     provider: str
     model: str
+    # finish_reason == "length": the answer hit max_tokens and is cut off.
+    truncated: bool = False
+    tokens_in: int | None = None
+    tokens_out: int | None = None
+    # llm_calls ids of every attempt of this generation, to link them to the saved message.
+    call_ids: tuple[uuid.UUID, ...] = ()
 
 
 LLMEvent = Token | Restart | Done

@@ -1,5 +1,5 @@
 from collections.abc import Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -15,6 +15,7 @@ from app.llm.base import (
     ProviderTimeout,
     Restart,
     StreamBroken,
+    StreamEnd,
     Token,
 )
 from app.llm.resilient import COOLDOWN_SECONDS, ResilientLLM
@@ -27,6 +28,7 @@ from tests.llm_fakes import (
     fail_mid_stream,
     hang,
     success,
+    truncated,
 )
 
 MESSAGES: list[ChatMessage] = [{"role": "user", "content": "secret question about my scalp"}]
@@ -55,7 +57,11 @@ def make_llm(
 
 
 async def collect(llm: ResilientLLM, messages: Sequence[ChatMessage] = MESSAGES) -> list[LLMEvent]:
-    return [event async for event in llm.stream(messages, max_tokens=100)]
+    """Events with Done.call_ids blanked (random ids); test_done_carries_call_ids checks them."""
+    return [
+        replace(event, call_ids=()) if isinstance(event, Done) else event
+        async for event in llm.stream(messages, max_tokens=100)
+    ]
 
 
 def text_of(events: list[LLMEvent]) -> str:
@@ -87,6 +93,45 @@ async def test_success_streams_tokens_then_done(recorder: FakeLLMCallRecorder) -
     assert [(c.provider, c.model, c.status, c.error) for c in recorder.calls] == [
         ("gemini", "flash", LLMCallStatus.OK, None)
     ]
+
+
+async def test_done_carries_call_ids_of_every_attempt(recorder: FakeLLMCallRecorder) -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(fail_before_first(ProviderTimeout()))
+    backup = FakeLLMProvider("groq", "oss").script(success("answer"))
+
+    events = [e async for e in make_llm(primary, backup, recorder=recorder).stream(MESSAGES, 100)]
+
+    done = events[-1]
+    assert isinstance(done, Done)
+    assert done.call_ids == tuple(c.id for c in recorder.calls)
+    assert len(set(done.call_ids)) == 2
+
+
+async def test_done_reports_truncation_and_usage_of_answering_link() -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(truncated("cut"))
+
+    events = await collect(make_llm(primary))
+
+    assert events[-1] == Done("gemini", "flash", truncated=True, tokens_in=10, tokens_out=20)
+
+
+async def test_not_truncated_when_finish_reason_is_stop() -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(
+        success("all", end=StreamEnd(finish_reason="stop"))
+    )
+
+    events = await collect(make_llm(primary))
+
+    assert events[-1] == Done("gemini", "flash", truncated=False)
+
+
+async def test_stream_end_without_any_token_is_empty_response() -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(Scenario(end=StreamEnd("stop")))
+    backup = FakeLLMProvider("groq", "oss").script(success("text"))
+    recorder = FakeLLMCallRecorder()
+
+    assert text_of(await collect(make_llm(primary, backup, recorder=recorder))) == "text"
+    assert recorder.calls[0].error == "empty_response"
 
 
 @pytest.mark.parametrize(

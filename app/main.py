@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
 
-from app.api import consents, health, me
+from app.api import consents, conversations, health, me
+from app.core.chat import close_llm
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
 from app.core.security import current_user, get_token_verifier
@@ -12,12 +13,13 @@ from app.db.session import get_engine
 # Token required (current_user).
 PROTECTED_ROUTERS: tuple[APIRouter, ...] = (me.router, consents.router)
 # Token + all consents for the current CONSENT_VERSION (CLAUDE.md rule 7): chat goes here.
-CONSENTED_ROUTERS: tuple[APIRouter, ...] = ()
+CONSENTED_ROUTERS: tuple[APIRouter, ...] = (conversations.router,)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
+    await close_llm()
     await get_engine().dispose()
     if (verifier := get_token_verifier()) is not None:
         await verifier.aclose()
