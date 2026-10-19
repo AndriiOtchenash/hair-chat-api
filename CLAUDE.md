@@ -27,7 +27,7 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor, retention
-app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py
+app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py (Moderator)
 app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
 app/db        SQLAlchemy models, repositories, session
 migrations/   Alembic (async env); URL comes from DATABASE_URL via Settings, not alembic.ini
@@ -62,7 +62,9 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 
 ## Context and prompts
 - Context per reply = TokenBudgetContextBuilder: one system message (prompt + `<profile>`,
-  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions"),
+  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions";
+  our tags inside any data or message turn are defused by `defuse_tags`, so text can never open
+  or close a block such as `<moderation_signal>`),
   then as many recent messages as fit, then the new message. The prompt is never cut.
 - Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
   `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).
@@ -71,6 +73,24 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
   `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
+
+## Moderation (ADR 0004)
+- Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
+  3 s timeout, no retries) in `ChatService.reply` after the 404/409 checks, before it is saved.
+- Policy = `app.services.moderation_policy.decide` (shared with the eval script):
+  self-harm* -> soft (saved, answered; `<moderation_signal>` block after the system prompt,
+  SSE `safety_notice` before the first token; wins over other categories);
+  violence(/graphic) -> block only at score >= MODERATION_VIOLENCE_THRESHOLD (0.9);
+  any other flagged -> block = 422 `message_blocked`, never saved; else allow.
+- Log only the action and categories (no text, no scores, no user_id).
+- Fail-open: moderation down (timeout, 429, 5xx, network; 4xx too but logged as error) ->
+  the message goes through. `messages.moderation` = `{provider, model, flagged, action,
+  categories?}`, `{status: "unavailable"}` or `{status: "disabled"}` (no key, dev only).
+  Never store scores.
+- Tests use FakeModerator (tests/llm_fakes.py); prod refuses to start without OPENAI_API_KEY.
+- Policy or threshold change -> re-run the eval (real API, our phrases only, not in CI):
+  `uv run python -m scripts.moderation_eval` over tests/moderation_eval/phrases.yaml.
+  Accepted misses carry `known_gap: "<reason>"` (ADR 0004 Known gaps); only new ones exit 1.
 
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
@@ -105,6 +125,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
 uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local via ChatService
+uv run python -m scripts.moderation_eval            # moderation eval set, real API, not in CI
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
@@ -118,6 +139,7 @@ uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local
 - Record decisions that are hard to reverse as ADRs in docs/adr/NNNN-title.md.
 
 ## SSE contract (POST /conversations/{id}/messages)
+event: safety_notice data: {"kind": "self_harm"}  # optional, first; client shows help lines
 event: token    data: {"text": "..."}
 event: restart  data: {"reason": "..."}    # provider failed mid-stream; client clears partial answer
 event: done     data: {"message_id": "...", "provider": "...", "model": "...", "truncated": false}
@@ -126,8 +148,11 @@ event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as RE
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
 - error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
   internal_error. The user's message is kept in every case.
-- 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422 come as
-  normal HTTP responses before the stream starts (checked in the `start_reply` dependency).
+- safety_notice comes at most once, before any token/restart/done/error, when moderation
+  marked the message soft (ADR 0004).
+- 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422
+  validation_error / message_blocked come as normal HTTP responses before the stream starts
+  (checked in the `start_reply` dependency).
 - Only a complete answer is saved (on done); a client disconnect cancels the generation and
   saves nothing. One generation per conversation, in-memory per process (ADR 0003).
 - Test SSE against a live uvicorn (tests/integration/test_chat_sse.py): httpx's ASGITransport

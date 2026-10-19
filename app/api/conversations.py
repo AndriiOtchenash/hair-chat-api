@@ -22,7 +22,9 @@ from app.services.chat_service import (
     ConversationBusy,
     ConversationNotFound,
     ConversationService,
+    MessageBlocked,
     Reply,
+    SafetyNotice,
 )
 from app.services.summarizer import SummaryRunner
 
@@ -127,7 +129,7 @@ async def list_messages(
 async def start_reply(
     conversation_id: uuid.UUID, body: SendMessageRequest, user: CurrentUser, chat: Chat
 ) -> AsyncIterator[Reply]:
-    """Runs before the response starts, so 404/409 are real HTTP statuses, not SSE events.
+    """Runs before the response starts, so 404/409/422 are real HTTP statuses, not SSE events.
 
     Its teardown runs after the stream ends or the client disconnects: that frees the slot.
     """
@@ -142,11 +144,19 @@ async def start_reply(
             "conversation_busy",
             "An answer is already being generated in this conversation",
         ) from None
+    except MessageBlocked:
+        raise api_error(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "message_blocked",
+            "This message was not sent because it breaks the usage rules",
+        ) from None
 
 
 def _sse(event: ChatEvent) -> ServerSentEvent:
     data: dict[str, Any]
     match event:
+        case SafetyNotice(kind=kind):
+            name, data = "safety_notice", {"kind": kind}
         case Token(text=text):
             name, data = "token", {"text": text}
         case Restart(reason=reason):
@@ -173,6 +183,10 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
     responses={
         404: {"description": "Missing or someone else's conversation"},
         409: {"description": "conversation_busy: an answer is already streaming"},
+        422: {
+            "description": "message_blocked (moderation; the message is not saved) or "
+            "validation_error"
+        },
     },
 )
 async def send_message(
@@ -180,7 +194,9 @@ async def send_message(
     background: BackgroundTasks,
     summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
 ) -> AsyncIterable[ServerSentEvent]:
-    """Streams the answer: token* (restart token*)* then done, or error (CLAUDE.md SSE contract).
+    """Streams the answer: safety_notice? token* (restart token*)* then done, or error.
+
+    See the SSE contract in CLAUDE.md.
 
     FastAPI adds a `: ping` comment every 15 s while idle and the no-buffering headers.
     Background tasks run after the stream ends, and not at all if the client disconnects.

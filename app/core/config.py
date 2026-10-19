@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     mistral_api_key: SecretStr | None = None
+    # Input moderation (OpenAI omni-moderation); without it messages go unchecked: dev only.
+    openai_api_key: SecretStr | None = None
+    # Whole moderation call; on timeout the message goes through unchecked (ADR 0004).
+    moderation_timeout_s: float = 3.0
+    # violence / violence/graphic block only at this score (or with harassment/threatening):
+    # burns and bleeding scalps are hair-care topics, not violence (ADR 0004).
+    moderation_violence_threshold: float = 0.9
     # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
     auth0_domain: str | None = None
     auth0_audience: str | None = None
@@ -44,6 +51,12 @@ class Settings(BaseSettings):
     def _require_auth0_in_prod(self) -> Self:
         if self.env is Env.PROD and not (self.auth0_domain and self.auth0_audience):
             raise ValueError("AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV=prod")
+        return self
+
+    @model_validator(mode="after")
+    def _require_moderation_in_prod(self) -> Self:
+        if self.env is Env.PROD and self.openai_api_key is None:
+            raise ValueError("OPENAI_API_KEY (input moderation) is required when ENV=prod")
         return self
 
 

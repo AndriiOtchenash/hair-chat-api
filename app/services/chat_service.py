@@ -1,9 +1,10 @@
 """Chat use cases: conversations, messages and one streamed reply per user message.
 
-A reply is two steps so HTTP can answer 404/409 before the stream starts:
-`async with service.reply(...)` checks the conversation, takes its generation slot and saves the
-user message; `reply.events()` then streams the answer. Only a complete answer (Done) is saved:
-a client that disconnects cancels the stream and leaves no partial assistant message behind.
+A reply is two steps so HTTP can answer 404/409/422 before the stream starts:
+`async with service.reply(...)` checks the conversation, takes its generation slot, moderates
+and saves the user message; `reply.events()` then streams the answer. Only a complete answer
+(Done) is saved: a client that disconnects cancels the stream and leaves no partial assistant
+message behind.
 """
 
 import logging
@@ -11,13 +12,16 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from app.db.models import Conversation, Message
 from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
+from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
 from app.services.context_builder import Context, ContextBuilder
+from app.services.moderation_policy import ModerationAction, decide
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,14 @@ class ConversationNotFound(Exception):
 
 class ConversationBusy(Exception):
     """An answer is already being generated in this conversation."""
+
+
+class MessageBlocked(Exception):
+    """Moderation blocked the message (API code message_blocked); it is not saved."""
+
+    def __init__(self, categories: tuple[str, ...]) -> None:
+        super().__init__("message_blocked")
+        self.categories = categories
 
 
 class ConversationLocks:
@@ -69,7 +81,16 @@ class ChatError:
     message: str
 
 
-ChatEvent = Token | Restart | ChatDone | ChatError
+@dataclass(frozen=True, slots=True)
+class SafetyNotice:
+    """Sent before the first token: the client shows a card with help lines for `kind`."""
+
+    kind: str  # "self_harm"
+
+
+SELF_HARM_NOTICE = SafetyNotice("self_harm")
+
+ChatEvent = SafetyNotice | Token | Restart | ChatDone | ChatError
 
 
 class Reply:
@@ -79,18 +100,22 @@ class Reply:
         user_id: uuid.UUID,
         conversation_id: uuid.UUID,
         user_message_id: uuid.UUID,
+        safety_notice: SafetyNotice | None = None,
     ) -> None:
         self._service = service
         self.user_id = user_id
         self.conversation_id = conversation_id
         self.user_message_id = user_message_id
+        self.safety_notice = safety_notice
         self._events: AsyncGenerator[ChatEvent] | None = None
         # Set with ChatDone: the context left messages out, so the caller should run the
         # summarizer once the answer is delivered (never when the reply failed).
         self.summary_due = False
 
     def events(self) -> AsyncIterator[ChatEvent]:
-        """Token* (Restart Token*)* then ChatDone, or ChatError. Never raises for LLM failures.
+        """SafetyNotice? Token* (Restart Token*)* then ChatDone, or ChatError.
+
+        Never raises for LLM failures.
 
         Single use. Closed by `ChatService.reply` on exit, see `aclose`.
         """
@@ -115,6 +140,8 @@ class Reply:
 
     async def _generate(self) -> AsyncGenerator[ChatEvent]:
         service = self._service
+        if self.safety_notice is not None:
+            yield self.safety_notice
         try:
             context = await service.context_builder.build(
                 self.user_id, self.conversation_id, service.budget_tokens
@@ -215,15 +242,19 @@ class ChatService:
         llm: ResilientLLM,
         context_builder: ContextBuilder,
         locks: ConversationLocks,
+        moderator: Moderator,
         *,
         max_answer_tokens: int,
         budget_tokens: int,
+        violence_threshold: float = 0.9,
     ) -> None:
         self.conversations = conversations
         self.repo = conversations.repo
         self.llm = llm
         self.context_builder = context_builder
         self.locks = locks
+        self.moderator = moderator
+        self.violence_threshold = violence_threshold
         self.max_answer_tokens = max_answer_tokens
         # Input tokens per reply: app.services.tokens.context_budget.
         self.budget_tokens = budget_tokens
@@ -232,15 +263,56 @@ class ChatService:
     async def reply(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
     ) -> AsyncIterator[Reply]:
-        """Raises ConversationNotFound / ConversationBusy before anything is saved.
+        """Raises ConversationNotFound / ConversationBusy / MessageBlocked before anything is saved.
 
         The slot is held until the block exits, i.e. until the stream ends or is cancelled.
+        Moderation runs after the slot is taken, so a busy conversation costs no moderation call.
         """
         await self.conversations.require(user_id, conversation_id)
         with self.locks.hold(conversation_id):
-            message = await self.repo.add_user_message(user_id, conversation_id, content)
-            reply = Reply(self, user_id, conversation_id, message.id)
+            moderation = await self._moderate(content)
+            message = await self.repo.add_user_message(
+                user_id, conversation_id, content, moderation=moderation
+            )
+            # The context builder reads the same "soft" mark from the saved message.
+            soft = moderation.get("action") == ModerationAction.SOFT
+            notice = SELF_HARM_NOTICE if soft else None
+            reply = Reply(self, user_id, conversation_id, message.id, notice)
             try:
                 yield reply
             finally:
                 await reply.aclose()
+
+    async def _moderate(self, content: str) -> dict[str, Any]:
+        """Raises MessageBlocked; otherwise returns what to store in messages.moderation.
+
+        Policy in app.services.moderation_policy. Fail-open (ADR 0004): if moderation is down
+        the message goes through, marked "unavailable". Logs carry the action and categories
+        only: no text, no scores, no user id (rule 6).
+        """
+        if not self.moderator.enabled:
+            return {"status": "disabled"}
+        try:
+            result = await self.moderator.check(content)
+        except ModerationUnavailable as exc:
+            log = logger.error if exc.misconfigured else logger.warning
+            log("moderation unavailable, message let through: code=%s", exc.code)
+            return {"status": "unavailable"}
+        decision = decide(result, violence_threshold=self.violence_threshold)
+        if decision.categories:
+            logger.info(
+                "moderation flagged: action=%s categories=%s",
+                decision.action,
+                ",".join(decision.categories),
+            )
+        if decision.action is ModerationAction.BLOCK:
+            raise MessageBlocked(decision.categories)
+        stored: dict[str, Any] = {
+            "provider": result.provider,
+            "model": result.model,
+            "flagged": result.flagged,
+            "action": decision.action.value,
+        }
+        if decision.categories:
+            stored["categories"] = list(decision.categories)
+        return stored

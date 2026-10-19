@@ -16,7 +16,7 @@ import uvicorn
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.core.chat import get_conversation_locks, get_llm
+from app.core.chat import get_conversation_locks, get_llm, get_moderator
 from app.core.config import get_settings
 from app.core.security import get_token_verifier
 from app.db.models import ConsentType, Conversation, LLMCall, Message, MessageRole
@@ -31,8 +31,10 @@ from app.services.tokens import message_tokens
 from tests.auth_fakes import FakeAuth0, SigningKey, bearer, mint
 from tests.llm_fakes import (
     FakeLLMProvider,
+    FakeModerator,
     fail_before_first,
     fail_mid_stream,
+    flag,
     hang,
     stall_after,
     success,
@@ -45,6 +47,7 @@ KEY = SigningKey("key-1")
 class Live:
     client: AsyncClient
     locks: ConversationLocks
+    moderator: FakeModerator
     primary: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("gemini", "flash"))
     backup: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("groq", "oss"))
 
@@ -54,11 +57,13 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
     app = create_app()
     verifier = FakeAuth0(KEY).verifier()
     locks = ConversationLocks()
+    moderator = FakeModerator()
     providers = (FakeLLMProvider("gemini", "flash"), FakeLLMProvider("groq", "oss"))
     llm = ResilientLLM(providers, SqlLLMCallRecorder(get_sessionmaker()), first_token_timeout=2)
     app.dependency_overrides[get_token_verifier] = lambda: verifier
     app.dependency_overrides[get_llm] = lambda: llm
     app.dependency_overrides[get_conversation_locks] = lambda: locks
+    app.dependency_overrides[get_moderator] = lambda: moderator
 
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
@@ -72,7 +77,7 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         pytest.fail("uvicorn did not start")
     port = server.servers[0].sockets[0].getsockname()[1]
     async with AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as client:
-        yield Live(client, locks, *providers)
+        yield Live(client, locks, moderator, *providers)
     server.should_exit = True
     await task
     await verifier.aclose()
@@ -175,6 +180,12 @@ async def test_streams_tokens_then_done_and_persists_everything(live: Live) -> N
 
     user_msg, assistant = await stored(conversation_id)
     assert (user_msg.role, user_msg.content) == (MessageRole.USER, "Як часто мити голову?")
+    assert user_msg.moderation == {
+        "provider": "openai",
+        "model": "omni-moderation-test",
+        "flagged": False,
+        "action": "allow",
+    }
     assert (assistant.role, assistant.content) == (
         MessageRole.ASSISTANT,
         "Привіт, мийте двічі на тиждень",
@@ -188,6 +199,45 @@ async def test_streams_tokens_then_done_and_persists_everything(live: Live) -> N
 
     listing = (await live.client.get("/conversations", headers=headers)).json()
     assert listing["items"][0]["title"] == "Як часто мити голову?"
+
+
+async def test_blocked_message_is_422_before_the_stream_and_not_saved(live: Live) -> None:
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.moderator.verdicts.append(flag("harassment/threatening", "violence"))
+
+    response = await live.client.post(
+        f"/conversations/{conversation_id}/messages", headers=headers, json={"content": "bad"}
+    )
+
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/json"
+    assert response.json()["code"] == "message_blocked"
+    assert set(response.json()) == {"code", "message"}
+    assert await stored(conversation_id) == []
+    assert live.primary.calls == 0
+    await wait_until_free(live, conversation_id)
+
+
+async def test_self_harm_gets_safety_notice_before_tokens_and_is_saved(live: Live) -> None:
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.moderator.verdicts.append(flag("self-harm/intent"))
+    live.primary.script(success("Мені шкода, ", "що вам важко"))
+
+    events = await send(live, headers, conversation_id, "волосся випадає, не хочу жити")
+
+    assert [e.event for e in events] == ["safety_notice", "token", "token", "done"]
+    assert events[0].data == {"kind": "self_harm"}
+    user_msg, _ = await stored(conversation_id)
+    assert user_msg.moderation == {
+        "provider": "openai",
+        "model": "omni-moderation-test",
+        "flagged": True,
+        "action": "soft",
+        "categories": ["self-harm/intent"],
+    }
+    assert "<moderation_signal>\n" in live.primary.received[0][0]["content"]
 
 
 async def test_restart_then_full_answer_from_backup_with_linked_attempts(live: Live) -> None:

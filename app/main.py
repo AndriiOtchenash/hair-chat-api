@@ -1,14 +1,17 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, Depends, FastAPI
 
 from app.api import consents, conversations, health, me
-from app.core.chat import close_llm
+from app.core.chat import close_llm, get_moderator
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
 from app.core.security import current_user, get_token_verifier
 from app.db.session import get_engine
+
+logger = logging.getLogger(__name__)
 
 # Token required (current_user).
 PROTECTED_ROUTERS: tuple[APIRouter, ...] = (me.router, consents.router)
@@ -18,6 +21,8 @@ CONSENTED_ROUTERS: tuple[APIRouter, ...] = (conversations.router,)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if not get_moderator().enabled:
+        logger.warning("OPENAI_API_KEY not set: input moderation is off (dev only)")
     yield
     await close_llm()
     await get_engine().dispose()

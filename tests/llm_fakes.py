@@ -1,4 +1,7 @@
-"""FakeLLMProvider with scripted scenarios and an in-memory llm_calls recorder (no real APIs)."""
+"""FakeLLMProvider and FakeModerator with scripted scenarios, an in-memory llm_calls recorder.
+
+No real APIs (CLAUDE.md rule 1).
+"""
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
@@ -6,6 +9,7 @@ from dataclasses import dataclass, field
 
 from app.db.repositories.llm_calls import LLMCallRecord
 from app.llm.base import ChatMessage, ProviderError, StreamEnd
+from app.llm.moderation import ModerationResult, ModerationUnavailable
 
 
 @dataclass(frozen=True)
@@ -100,3 +104,39 @@ class FailingLLMCallRecorder:
 
     async def record(self, call: LLMCallRecord) -> None:
         raise ConnectionError("db is down")
+
+
+class FakeModerator:
+    """Moderator with scripted verdicts: flag(...) / unavailable(...) apply to the next calls,
+    then every message is clean. Records the texts it was asked about."""
+
+    enabled = True
+
+    def __init__(self, *verdicts: ModerationResult | ModerationUnavailable) -> None:
+        self.verdicts = list(verdicts)
+        self.checked: list[str] = []
+
+    async def check(self, text: str) -> ModerationResult:
+        self.checked.append(text)
+        verdict = self.verdicts.pop(0) if self.verdicts else clean()
+        if isinstance(verdict, ModerationUnavailable):
+            raise verdict
+        return verdict
+
+    async def aclose(self) -> None:
+        return None
+
+
+def clean() -> ModerationResult:
+    return ModerationResult("openai", "omni-moderation-test", flagged=False)
+
+
+def flag(*categories: str, scores: dict[str, float] | None = None) -> ModerationResult:
+    """Flagged `categories`; each scores 1.0 unless `scores` says otherwise."""
+    return ModerationResult(
+        "openai",
+        "omni-moderation-test",
+        flagged=True,
+        categories=categories,
+        scores={c: 1.0 for c in categories} | (scores or {}),
+    )

@@ -14,6 +14,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from typing import TextIO
 
+from app.core.chat import build_moderator
 from app.core.config import Env, get_settings
 from app.db.models import ConsentType
 from app.db.repositories.consents import SqlConsentRepository
@@ -33,6 +34,8 @@ from app.services.chat_service import (
     ConversationLocks,
     ConversationNotFound,
     ConversationService,
+    MessageBlocked,
+    SafetyNotice,
 )
 from app.services.context_builder import TokenBudgetContextBuilder
 from app.services.prompts import FilePromptProvider
@@ -41,6 +44,10 @@ from app.services.tokens import context_budget
 
 DEV_AUTH_SUB = "dev|local"
 EXIT_COMMANDS = {"/exit", "/quit"}
+BLOCKED_TEXT = "Message not sent: moderation flagged it as breaking the usage rules."
+NOTICE_TEXT = {
+    "self_harm": "The app shows a card with help line numbers in the user's language here.",
+}
 
 
 async def converse(
@@ -57,19 +64,25 @@ async def converse(
             return
         if not content:
             continue
-        async with chat.reply(user_id, conversation_id, content) as reply:
-            async for event in reply.events():
-                match event:
-                    case Token(text=text):
-                        out.write(text)
-                        out.flush()
-                    case Restart(reason=reason):
-                        out.write(f"\n[restart: {reason}]\n")
-                    case ChatDone():
-                        flag = " (truncated)" if event.truncated else ""
-                        out.write(f"\n— {event.provider}:{event.model}{flag}\n\n")
-                    case ChatError(code=code, message=message):
-                        out.write(f"\n[error {code}: {message}]\n\n")
+        try:
+            async with chat.reply(user_id, conversation_id, content) as reply:
+                async for event in reply.events():
+                    match event:
+                        case SafetyNotice(kind=kind):
+                            out.write(f"[safety_notice {kind}: {NOTICE_TEXT[kind]}]\n")
+                        case Token(text=text):
+                            out.write(text)
+                            out.flush()
+                        case Restart(reason=reason):
+                            out.write(f"\n[restart: {reason}]\n")
+                        case ChatDone():
+                            flag = " (truncated)" if event.truncated else ""
+                            out.write(f"\n— {event.provider}:{event.model}{flag}\n\n")
+                        case ChatError(code=code, message=message):
+                            out.write(f"\n[error {code}: {message}]\n\n")
+        except MessageBlocked as exc:
+            out.write(f"[message_blocked: {', '.join(exc.categories)}] {BLOCKED_TEXT}\n\n")
+            continue
         # Inline instead of a background task: the next prompt waits until it is done.
         if summarizer is not None and reply.summary_due:
             await summarizer.run(user_id, conversation_id)
@@ -90,6 +103,7 @@ async def _main(conversation: uuid.UUID | None) -> int:
         return 2
     try:
         llm = build_llm(settings, SqlLLMCallRecorder(get_sessionmaker()))
+        moderator = build_moderator(settings)
         budget = context_budget(
             settings.context_budget_tokens, llm.max_context_tokens, settings.chat_max_answer_tokens
         )
@@ -113,8 +127,10 @@ async def _main(conversation: uuid.UUID | None) -> int:
                 llm,
                 TokenBudgetContextBuilder(repo, FilePromptProvider()),
                 ConversationLocks(),
+                moderator,
                 max_answer_tokens=settings.chat_max_answer_tokens,
                 budget_tokens=budget,
+                violence_threshold=settings.moderation_violence_threshold,
             )
             summarizer = Summarizer(
                 sql_conversation_repositories(get_sessionmaker()),
@@ -122,6 +138,8 @@ async def _main(conversation: uuid.UUID | None) -> int:
                 SqlLLMCallRecorder(get_sessionmaker()),
                 budget_tokens=budget,
             )
+            if not moderator.enabled:
+                print("OPENAI_API_KEY not set: moderation is off", file=sys.stderr)
             print(f"conversation {conversation} as {DEV_AUTH_SUB}; /exit to quit", file=sys.stderr)
             await converse(chat, user.id, conversation, _stdin_lines("> "), sys.stdout, summarizer)
     except ConversationNotFound:
@@ -129,6 +147,7 @@ async def _main(conversation: uuid.UUID | None) -> int:
         return 1
     finally:
         await llm.aclose()
+        await moderator.aclose()
         await get_engine().dispose()
     return 0
 
