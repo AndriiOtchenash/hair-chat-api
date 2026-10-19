@@ -75,12 +75,19 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
   3 s timeout, no retries) in `ChatService.reply` after the 404/409 checks, before it is saved.
-- Flagged `self-harm*` -> 422 `message_blocked_self_harm`; other flagged -> 422 `message_blocked`.
-  A blocked message is never saved; log only the code and categories (no text, no user_id).
+- Policy = `app.services.moderation_policy.decide` (shared with the eval script):
+  self-harm* -> soft (saved, answered; `<moderation_signal>` block after the system prompt,
+  SSE `safety_notice` before the first token; wins over other categories);
+  violence(/graphic) -> block only at score >= MODERATION_VIOLENCE_THRESHOLD (0.9);
+  any other flagged -> block = 422 `message_blocked`, never saved; else allow.
+- Log only the action and categories (no text, no scores, no user_id).
 - Fail-open: moderation down (timeout, 429, 5xx, network; 4xx too but logged as error) ->
-  the message goes through. `messages.moderation` = `{provider, model, flagged: false}`,
-  `{status: "unavailable"}` or `{status: "disabled"}` (no key, dev only). Never store scores.
+  the message goes through. `messages.moderation` = `{provider, model, flagged, action,
+  categories?}`, `{status: "unavailable"}` or `{status: "disabled"}` (no key, dev only).
+  Never store scores.
 - Tests use FakeModerator (tests/llm_fakes.py); prod refuses to start without OPENAI_API_KEY.
+- Policy or threshold change -> re-run the eval (real API, our phrases only, not in CI):
+  `uv run python -m scripts.moderation_eval` over tests/moderation_eval/phrases.yaml.
 
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
@@ -115,6 +122,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
 uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local via ChatService
+uv run python -m scripts.moderation_eval            # moderation eval set, real API, not in CI
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
@@ -128,6 +136,7 @@ uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local
 - Record decisions that are hard to reverse as ADRs in docs/adr/NNNN-title.md.
 
 ## SSE contract (POST /conversations/{id}/messages)
+event: safety_notice data: {"kind": "self_harm"}  # optional, first; client shows help lines
 event: token    data: {"text": "..."}
 event: restart  data: {"reason": "..."}    # provider failed mid-stream; client clears partial answer
 event: done     data: {"message_id": "...", "provider": "...", "model": "...", "truncated": false}
@@ -136,9 +145,11 @@ event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as RE
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
 - error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
   internal_error. The user's message is kept in every case.
+- safety_notice comes at most once, before any token/restart/done/error, when moderation
+  marked the message soft (ADR 0004).
 - 404 not_found (missing or someone else's conversation), 409 conversation_busy, 422
-  validation_error / message_blocked / message_blocked_self_harm come as normal HTTP responses
-  before the stream starts (checked in the `start_reply` dependency).
+  validation_error / message_blocked come as normal HTTP responses before the stream starts
+  (checked in the `start_reply` dependency).
 - Only a complete answer is saved (on done); a client disconnect cancels the generation and
   saves nothing. One generation per conversation, in-memory per process (ADR 0003).
 - Test SSE against a live uvicorn (tests/integration/test_chat_sse.py): httpx's ASGITransport

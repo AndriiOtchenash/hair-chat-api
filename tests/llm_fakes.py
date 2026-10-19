@@ -131,5 +131,12 @@ def clean() -> ModerationResult:
     return ModerationResult("openai", "omni-moderation-test", flagged=False)
 
 
-def flag(*categories: str) -> ModerationResult:
-    return ModerationResult("openai", "omni-moderation-test", flagged=True, categories=categories)
+def flag(*categories: str, scores: dict[str, float] | None = None) -> ModerationResult:
+    """Flagged `categories`; each scores 1.0 unless `scores` says otherwise."""
+    return ModerationResult(
+        "openai",
+        "omni-moderation-test",
+        flagged=True,
+        categories=categories,
+        scores={c: 1.0 for c in categories} | (scores or {}),
+    )

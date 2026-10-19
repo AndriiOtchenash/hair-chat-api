@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     # Whole moderation call; on timeout the message goes through unchecked (ADR 0004).
     moderation_timeout_s: float = 3.0
+    # violence / violence/graphic block only at this score (or with harassment/threatening):
+    # burns and bleeding scalps are hair-care topics, not violence (ADR 0004).
+    moderation_violence_threshold: float = 0.9
     # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
     auth0_domain: str | None = None
     auth0_audience: str | None = None

@@ -141,4 +141,5 @@ def get_chat_service(
         moderator,
         max_answer_tokens=settings.chat_max_answer_tokens,
         budget_tokens=budget,
+        violence_threshold=settings.moderation_violence_threshold,
     )

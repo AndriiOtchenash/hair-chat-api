@@ -21,6 +21,7 @@ from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
 from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
 from app.services.context_builder import Context, ContextBuilder
+from app.services.moderation_policy import ModerationAction, decide
 
 logger = logging.getLogger(__name__)
 
@@ -34,18 +35,11 @@ class ConversationBusy(Exception):
 
 
 class MessageBlocked(Exception):
-    """Moderation flagged the message; it is not saved. `code` is the API error code."""
+    """Moderation blocked the message (API code message_blocked); it is not saved."""
 
-    def __init__(self, code: str, categories: tuple[str, ...]) -> None:
-        super().__init__(code)
-        self.code = code
+    def __init__(self, categories: tuple[str, ...]) -> None:
+        super().__init__("message_blocked")
         self.categories = categories
-
-
-BLOCKED_SELF_HARM = "message_blocked_self_harm"
-BLOCKED = "message_blocked"
-# self-harm, self-harm/intent, self-harm/instructions: the client shows help lines instead.
-SELF_HARM_PREFIX = "self-harm"
 
 
 class ConversationLocks:
@@ -87,7 +81,16 @@ class ChatError:
     message: str
 
 
-ChatEvent = Token | Restart | ChatDone | ChatError
+@dataclass(frozen=True, slots=True)
+class SafetyNotice:
+    """Sent before the first token: the client shows a card with help lines for `kind`."""
+
+    kind: str  # "self_harm"
+
+
+SELF_HARM_NOTICE = SafetyNotice("self_harm")
+
+ChatEvent = SafetyNotice | Token | Restart | ChatDone | ChatError
 
 
 class Reply:
@@ -97,18 +100,22 @@ class Reply:
         user_id: uuid.UUID,
         conversation_id: uuid.UUID,
         user_message_id: uuid.UUID,
+        safety_notice: SafetyNotice | None = None,
     ) -> None:
         self._service = service
         self.user_id = user_id
         self.conversation_id = conversation_id
         self.user_message_id = user_message_id
+        self.safety_notice = safety_notice
         self._events: AsyncGenerator[ChatEvent] | None = None
         # Set with ChatDone: the context left messages out, so the caller should run the
         # summarizer once the answer is delivered (never when the reply failed).
         self.summary_due = False
 
     def events(self) -> AsyncIterator[ChatEvent]:
-        """Token* (Restart Token*)* then ChatDone, or ChatError. Never raises for LLM failures.
+        """SafetyNotice? Token* (Restart Token*)* then ChatDone, or ChatError.
+
+        Never raises for LLM failures.
 
         Single use. Closed by `ChatService.reply` on exit, see `aclose`.
         """
@@ -133,6 +140,8 @@ class Reply:
 
     async def _generate(self) -> AsyncGenerator[ChatEvent]:
         service = self._service
+        if self.safety_notice is not None:
+            yield self.safety_notice
         try:
             context = await service.context_builder.build(
                 self.user_id, self.conversation_id, service.budget_tokens
@@ -237,6 +246,7 @@ class ChatService:
         *,
         max_answer_tokens: int,
         budget_tokens: int,
+        violence_threshold: float = 0.9,
     ) -> None:
         self.conversations = conversations
         self.repo = conversations.repo
@@ -244,6 +254,7 @@ class ChatService:
         self.context_builder = context_builder
         self.locks = locks
         self.moderator = moderator
+        self.violence_threshold = violence_threshold
         self.max_answer_tokens = max_answer_tokens
         # Input tokens per reply: app.services.tokens.context_budget.
         self.budget_tokens = budget_tokens
@@ -263,7 +274,10 @@ class ChatService:
             message = await self.repo.add_user_message(
                 user_id, conversation_id, content, moderation=moderation
             )
-            reply = Reply(self, user_id, conversation_id, message.id)
+            # The context builder reads the same "soft" mark from the saved message.
+            soft = moderation.get("action") == ModerationAction.SOFT
+            notice = SELF_HARM_NOTICE if soft else None
+            reply = Reply(self, user_id, conversation_id, message.id, notice)
             try:
                 yield reply
             finally:
@@ -272,8 +286,9 @@ class ChatService:
     async def _moderate(self, content: str) -> dict[str, Any]:
         """Raises MessageBlocked; otherwise returns what to store in messages.moderation.
 
-        Fail-open (ADR 0004): if moderation is down the message goes through, marked
-        "unavailable". Logs carry codes and categories only: no text, no user id (rule 6).
+        Policy in app.services.moderation_policy. Fail-open (ADR 0004): if moderation is down
+        the message goes through, marked "unavailable". Logs carry the action and categories
+        only: no text, no scores, no user id (rule 6).
         """
         if not self.moderator.enabled:
             return {"status": "disabled"}
@@ -283,9 +298,21 @@ class ChatService:
             log = logger.error if exc.misconfigured else logger.warning
             log("moderation unavailable, message let through: code=%s", exc.code)
             return {"status": "unavailable"}
-        if result.flagged:
-            self_harm = any(c.startswith(SELF_HARM_PREFIX) for c in result.categories)
-            code = BLOCKED_SELF_HARM if self_harm else BLOCKED
-            logger.info("message blocked: code=%s categories=%s", code, ",".join(result.categories))
-            raise MessageBlocked(code, result.categories)
-        return {"provider": result.provider, "model": result.model, "flagged": False}
+        decision = decide(result, violence_threshold=self.violence_threshold)
+        if decision.categories:
+            logger.info(
+                "moderation flagged: action=%s categories=%s",
+                decision.action,
+                ",".join(decision.categories),
+            )
+        if decision.action is ModerationAction.BLOCK:
+            raise MessageBlocked(decision.categories)
+        stored: dict[str, Any] = {
+            "provider": result.provider,
+            "model": result.model,
+            "flagged": result.flagged,
+            "action": decision.action.value,
+        }
+        if decision.categories:
+            stored["categories"] = list(decision.categories)
+        return stored

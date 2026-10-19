@@ -1,11 +1,13 @@
 """Input moderation: one call per user message, before it is saved or sent to the chat chain.
 
-Moderators only classify. What to do with the verdict (block, or let the message through when
-moderation is down) is the chat service's decision, see docs/adr/0004-moderation-fail-open.md.
-Results carry category names only, never scores or text, so they are safe to log and store.
+Moderators only classify. What to do with the verdict (allow / soft / block, and letting the
+message through when moderation is down) is app.services.moderation_policy, see
+docs/adr/0004-moderation-fail-open.md. Results never carry text; scores are read by the policy
+but never logged or stored.
 """
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx2
@@ -22,6 +24,8 @@ class ModerationResult:
     flagged: bool
     # Flagged categories by their API names ("self-harm/intent"); empty when not flagged.
     categories: tuple[str, ...] = ()
+    # Score per category (API names), for our own thresholds. Never log or store them.
+    scores: Mapping[str, float] = field(default_factory=dict, repr=False)
 
 
 class ModerationUnavailable(Exception):
@@ -98,11 +102,13 @@ class OpenAIModerator:
             raise ModerationUnavailable("empty_result")
         result = response.results[0]
         flags = result.categories.model_dump(by_alias=True)
+        scores = result.category_scores.model_dump(by_alias=True)
         return ModerationResult(
             provider=self.provider,
             model=response.model,
             flagged=result.flagged,
             categories=tuple(name for name, flagged in flags.items() if flagged),
+            scores={name: float(score) for name, score in scores.items() if score is not None},
         )
 
 

@@ -85,6 +85,8 @@ async def test_flagged_categories_come_back_by_api_name() -> None:
 
     assert result.flagged is True
     assert result.categories == ("self-harm", "self-harm/intent")
+    assert result.scores["self-harm/intent"] == 0.9
+    assert result.scores["hate"] == 0.01
 
 
 @pytest.mark.parametrize(

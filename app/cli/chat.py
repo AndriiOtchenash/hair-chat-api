@@ -28,8 +28,6 @@ from app.db.session import get_engine, get_sessionmaker
 from app.llm.base import Restart, Token
 from app.llm.registry import build_llm
 from app.services.chat_service import (
-    BLOCKED,
-    BLOCKED_SELF_HARM,
     ChatDone,
     ChatError,
     ChatService,
@@ -37,6 +35,7 @@ from app.services.chat_service import (
     ConversationNotFound,
     ConversationService,
     MessageBlocked,
+    SafetyNotice,
 )
 from app.services.context_builder import TokenBudgetContextBuilder
 from app.services.prompts import FilePromptProvider
@@ -45,10 +44,9 @@ from app.services.tokens import context_budget
 
 DEV_AUTH_SUB = "dev|local"
 EXIT_COMMANDS = {"/exit", "/quit"}
-BLOCKED_TEXT = {
-    BLOCKED_SELF_HARM: "Message not sent: it looks like you may be going through a hard time. "
-    "The app shows help line numbers in the user's language here.",
-    BLOCKED: "Message not sent: moderation flagged it as breaking the usage rules.",
+BLOCKED_TEXT = "Message not sent: moderation flagged it as breaking the usage rules."
+NOTICE_TEXT = {
+    "self_harm": "The app shows a card with help line numbers in the user's language here.",
 }
 
 
@@ -70,6 +68,8 @@ async def converse(
             async with chat.reply(user_id, conversation_id, content) as reply:
                 async for event in reply.events():
                     match event:
+                        case SafetyNotice(kind=kind):
+                            out.write(f"[safety_notice {kind}: {NOTICE_TEXT[kind]}]\n")
                         case Token(text=text):
                             out.write(text)
                             out.flush()
@@ -81,7 +81,7 @@ async def converse(
                         case ChatError(code=code, message=message):
                             out.write(f"\n[error {code}: {message}]\n\n")
         except MessageBlocked as exc:
-            out.write(f"[{exc.code}: {', '.join(exc.categories)}] {BLOCKED_TEXT[exc.code]}\n\n")
+            out.write(f"[message_blocked: {', '.join(exc.categories)}] {BLOCKED_TEXT}\n\n")
             continue
         # Inline instead of a background task: the next prompt waits until it is done.
         if summarizer is not None and reply.summary_due:
@@ -130,6 +130,7 @@ async def _main(conversation: uuid.UUID | None) -> int:
                 moderator,
                 max_answer_tokens=settings.chat_max_answer_tokens,
                 budget_tokens=budget,
+                violence_threshold=settings.moderation_violence_threshold,
             )
             summarizer = Summarizer(
                 sql_conversation_repositories(get_sessionmaker()),

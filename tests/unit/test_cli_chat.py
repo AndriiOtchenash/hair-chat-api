@@ -62,23 +62,23 @@ async def test_error_is_printed_and_dialog_goes_on() -> None:
     assert out.endswith("back\n— gemini:flash\n\n")
 
 
-async def test_blocked_message_is_explained_and_dialog_goes_on() -> None:
+async def test_safety_notice_and_block_are_explained_and_dialog_goes_on() -> None:
     world = World(
-        FakeLLMProvider("gemini", "flash").script(success("fine")),
+        FakeLLMProvider("gemini", "flash").script(success("care"), success("fine")),
         moderator=FakeModerator(flag("self-harm/intent"), flag("harassment")),
     )
 
     conversation_id, out = await run(world, "one", "two", "three")
 
     assert out == (
-        "[message_blocked_self_harm: self-harm/intent] Message not sent: it looks like you may be "
-        "going through a hard time. The app shows help line numbers in the user's language "
-        "here.\n\n"
+        "[safety_notice self_harm: The app shows a card with help line numbers in the user's "
+        "language here.]\n"
+        "care\n— gemini:flash\n\n"
         "[message_blocked: harassment] Message not sent: moderation flagged it as breaking the "
         "usage rules.\n\n"
         "fine\n— gemini:flash\n\n"
     )
-    assert [m.content for m in world.repo.of(conversation_id)] == ["three", "fine"]
+    assert [m.content for m in world.repo.of(conversation_id)] == ["one", "care", "three", "fine"]
 
 
 class RecordingSummarizer:

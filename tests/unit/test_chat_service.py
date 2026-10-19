@@ -5,7 +5,7 @@ import pytest
 
 from app.db.models import MessageRole
 from app.llm.base import ProviderHTTPError, ProviderTimeout, Restart, StreamBroken, Token
-from app.llm.moderation import ModerationUnavailable, Moderator, NoopModerator
+from app.llm.moderation import ModerationResult, ModerationUnavailable, Moderator, NoopModerator
 from app.llm.resilient import ResilientLLM
 from app.services.chat_service import (
     ChatDone,
@@ -17,6 +17,7 @@ from app.services.chat_service import (
     ConversationNotFound,
     ConversationService,
     MessageBlocked,
+    SafetyNotice,
 )
 from app.services.context_builder import TokenBudgetContextBuilder
 from app.services.prompts import FilePromptProvider, PromptProvider
@@ -302,46 +303,123 @@ async def test_no_summary_is_due_when_the_reply_failed() -> None:
 
 
 @pytest.mark.parametrize("category", ["self-harm", "self-harm/intent", "self-harm/instructions"])
-async def test_self_harm_is_blocked_with_its_own_code_and_nothing_is_saved(category: str) -> None:
+async def test_self_harm_is_answered_softly_notice_first_and_saved(category: str) -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(success("care"))
+    world = World(provider, prompts=StaticPrompt(), moderator=FakeModerator(flag(category)))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "I can't take it anymore, my hair is falling out")
+
+    assert events[0] == SafetyNotice("self_harm")
+    assert events[1] == Token("care", "gemini", "flash")
+    assert isinstance(events[-1], ChatDone)
+    user_message = world.repo.of(conversation_id)[0]
+    assert user_message.content == "I can't take it anymore, my hair is falling out"
+    assert user_message.moderation == {
+        "provider": "openai",
+        "model": "omni-moderation-test",
+        "flagged": True,
+        "action": "soft",
+        "categories": [category],
+    }
+    system = provider.received[0][0]["content"]
+    assert system.startswith("You are a hair-care assistant.\n\n<moderation_signal>\n")
+    assert "Possible crisis signal" in system
+
+
+async def test_self_harm_wins_over_blocking_categories() -> None:
+    world = World(moderator=FakeModerator(flag("self-harm/intent", "violence", "harassment")))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "q")
+
+    assert events[0] == SafetyNotice("self_harm")
+    assert isinstance(events[-1], ChatDone)
+
+
+async def test_safety_signal_is_only_for_the_flagged_message() -> None:
     provider = FakeLLMProvider("gemini", "flash")
-    world = World(provider, moderator=FakeModerator(flag(category, "violence")))
+    world = World(provider, moderator=FakeModerator(flag("self-harm")))
+    conversation_id = await world.conversation()
+
+    await world.send(conversation_id, "first")
+    events = await world.send(conversation_id, "second")
+
+    assert not any(isinstance(e, SafetyNotice) for e in events)
+    assert "<moderation_signal>" not in provider.received[1][0]["content"]
+
+
+async def test_notice_comes_before_the_error_when_the_chain_is_down() -> None:
+    world = World(
+        FakeLLMProvider("gemini", "flash").script(fail_before_first(ProviderTimeout())),
+        moderator=FakeModerator(flag("self-harm")),
+    )
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "q")
+
+    assert events[0] == SafetyNotice("self_harm")
+    assert isinstance(events[-1], ChatError)
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        flag("harassment"),
+        flag("hate"),
+        flag("violence", scores={"violence": 0.9}),
+        flag("violence/graphic", scores={"violence/graphic": 0.95}),
+        flag("violence", "harassment/threatening", scores={"violence": 0.3}),
+    ],
+)
+async def test_blocked_message_is_not_saved_and_frees_the_slot(verdict: ModerationResult) -> None:
+    provider = FakeLLMProvider("gemini", "flash")
+    world = World(provider, moderator=FakeModerator(verdict))
     conversation_id = await world.conversation()
 
     with pytest.raises(MessageBlocked) as caught:
         await world.send(conversation_id, "blocked text")
 
-    assert caught.value.code == "message_blocked_self_harm"
+    assert caught.value.categories == verdict.categories
     assert world.repo.of(conversation_id) == []
     assert world.repo.conversations[conversation_id].title is None
     assert provider.calls == 0
     assert not world.locks.is_busy(conversation_id)
 
 
-async def test_other_flagged_categories_are_blocked_as_message_blocked() -> None:
-    world = World(moderator=FakeModerator(flag("harassment", "violence")))
+async def test_violence_below_threshold_is_allowed_and_kept_as_flagged() -> None:
+    world = World(
+        moderator=FakeModerator(
+            flag("violence", "violence/graphic", scores={"violence": 0.5, "violence/graphic": 0.2})
+        )
+    )
     conversation_id = await world.conversation()
 
-    with pytest.raises(MessageBlocked) as caught:
-        await world.send(conversation_id, "blocked text")
+    events = await world.send(conversation_id, "I burned my scalp with bleach")
 
-    assert (caught.value.code, caught.value.categories) == (
-        "message_blocked",
-        ("harassment", "violence"),
-    )
-    assert world.repo.of(conversation_id) == []
+    assert not any(isinstance(e, SafetyNotice) for e in events)
+    assert isinstance(events[-1], ChatDone)
+    assert world.repo.of(conversation_id)[0].moderation == {
+        "provider": "openai",
+        "model": "omni-moderation-test",
+        "flagged": True,
+        "action": "allow",
+        "categories": ["violence", "violence/graphic"],
+    }
 
 
-async def test_block_log_has_code_and_categories_but_no_text_or_user(
+async def test_moderation_log_has_action_and_categories_only(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    world = World(moderator=FakeModerator(flag("self-harm/intent")))
+    world = World(moderator=FakeModerator(flag("harassment", scores={"harassment": 0.123456})))
     conversation_id = await world.conversation()
 
     with caplog.at_level("DEBUG"), pytest.raises(MessageBlocked):
         await world.send(conversation_id, "secret words here")
 
-    assert "code=message_blocked_self_harm categories=self-harm/intent" in caplog.text
+    assert "action=block categories=harassment" in caplog.text
     assert "secret words" not in caplog.text
+    assert "0.123" not in caplog.text
     assert str(USER) not in caplog.text
 
 
@@ -352,13 +430,14 @@ async def test_clean_message_is_checked_saved_with_moderation_and_answered() -> 
 
     events = await world.send(conversation_id, "How often should I wash oily hair?")
 
+    assert isinstance(events[0], Token)
     assert isinstance(events[-1], ChatDone)
     assert moderator.checked == ["How often should I wash oily hair?"]
-    user_message = world.repo.of(conversation_id)[0]
-    assert user_message.moderation == {
+    assert world.repo.of(conversation_id)[0].moderation == {
         "provider": "openai",
         "model": "omni-moderation-test",
         "flagged": False,
+        "action": "allow",
     }
 
 

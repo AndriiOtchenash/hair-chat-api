@@ -15,8 +15,6 @@ from app.db.models import MessageRole
 from app.db.pagination import Cursor, InvalidCursor
 from app.llm.base import Restart, Token
 from app.services.chat_service import (
-    BLOCKED,
-    BLOCKED_SELF_HARM,
     ChatDone,
     ChatError,
     ChatEvent,
@@ -26,6 +24,7 @@ from app.services.chat_service import (
     ConversationService,
     MessageBlocked,
     Reply,
+    SafetyNotice,
 )
 from app.services.summarizer import SummaryRunner
 
@@ -84,14 +83,6 @@ def _cursor(value: str | None) -> Cursor | None:
         return Cursor.decode(value)
     except InvalidCursor:
         raise api_error(422, "validation_error", "query.cursor: invalid cursor") from None
-
-
-# The client shows its own localized text (help lines for self-harm); these are fallbacks.
-BLOCKED_MESSAGES = {
-    BLOCKED_SELF_HARM: "This message was not sent. If you are going through a hard time, "
-    "please reach out to someone you trust or a local help line.",
-    BLOCKED: "This message was not sent because it breaks the usage rules",
-}
 
 
 def _not_found() -> Exception:
@@ -153,15 +144,19 @@ async def start_reply(
             "conversation_busy",
             "An answer is already being generated in this conversation",
         ) from None
-    except MessageBlocked as exc:
+    except MessageBlocked:
         raise api_error(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, exc.code, BLOCKED_MESSAGES[exc.code]
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "message_blocked",
+            "This message was not sent because it breaks the usage rules",
         ) from None
 
 
 def _sse(event: ChatEvent) -> ServerSentEvent:
     data: dict[str, Any]
     match event:
+        case SafetyNotice(kind=kind):
+            name, data = "safety_notice", {"kind": kind}
         case Token(text=text):
             name, data = "token", {"text": text}
         case Restart(reason=reason):
@@ -189,8 +184,8 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
         404: {"description": "Missing or someone else's conversation"},
         409: {"description": "conversation_busy: an answer is already streaming"},
         422: {
-            "description": "message_blocked_self_harm / message_blocked (moderation; the "
-            "message is not saved) or validation_error"
+            "description": "message_blocked (moderation; the message is not saved) or "
+            "validation_error"
         },
     },
 )
@@ -199,7 +194,9 @@ async def send_message(
     background: BackgroundTasks,
     summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
 ) -> AsyncIterable[ServerSentEvent]:
-    """Streams the answer: token* (restart token*)* then done, or error (CLAUDE.md SSE contract).
+    """Streams the answer: safety_notice? token* (restart token*)* then done, or error.
+
+    See the SSE contract in CLAUDE.md.
 
     FastAPI adds a `: ping` comment every 15 s while idle and the no-buffering headers.
     Background tasks run after the stream ends, and not at all if the client disconnects.

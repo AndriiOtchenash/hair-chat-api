@@ -184,6 +184,7 @@ async def test_streams_tokens_then_done_and_persists_everything(live: Live) -> N
         "provider": "openai",
         "model": "omni-moderation-test",
         "flagged": False,
+        "action": "allow",
     }
     assert (assistant.role, assistant.content) == (
         MessageRole.ASSISTANT,
@@ -200,16 +201,10 @@ async def test_streams_tokens_then_done_and_persists_everything(live: Live) -> N
     assert listing["items"][0]["title"] == "Як часто мити голову?"
 
 
-@pytest.mark.parametrize(
-    ("category", "code"),
-    [("self-harm/intent", "message_blocked_self_harm"), ("harassment", "message_blocked")],
-)
-async def test_blocked_message_is_422_before_the_stream_and_not_saved(
-    live: Live, category: str, code: str
-) -> None:
+async def test_blocked_message_is_422_before_the_stream_and_not_saved(live: Live) -> None:
     headers = await consented_user(live)
     conversation_id = await new_conversation(live, headers)
-    live.moderator.verdicts.append(flag(category))
+    live.moderator.verdicts.append(flag("harassment/threatening", "violence"))
 
     response = await live.client.post(
         f"/conversations/{conversation_id}/messages", headers=headers, json={"content": "bad"}
@@ -217,11 +212,32 @@ async def test_blocked_message_is_422_before_the_stream_and_not_saved(
 
     assert response.status_code == 422
     assert response.headers["content-type"] == "application/json"
-    assert response.json()["code"] == code
+    assert response.json()["code"] == "message_blocked"
     assert set(response.json()) == {"code", "message"}
     assert await stored(conversation_id) == []
     assert live.primary.calls == 0
     await wait_until_free(live, conversation_id)
+
+
+async def test_self_harm_gets_safety_notice_before_tokens_and_is_saved(live: Live) -> None:
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.moderator.verdicts.append(flag("self-harm/intent"))
+    live.primary.script(success("Мені шкода, ", "що вам важко"))
+
+    events = await send(live, headers, conversation_id, "волосся випадає, не хочу жити")
+
+    assert [e.event for e in events] == ["safety_notice", "token", "token", "done"]
+    assert events[0].data == {"kind": "self_harm"}
+    user_msg, _ = await stored(conversation_id)
+    assert user_msg.moderation == {
+        "provider": "openai",
+        "model": "omni-moderation-test",
+        "flagged": True,
+        "action": "soft",
+        "categories": ["self-harm/intent"],
+    }
+    assert "<moderation_signal>" in live.primary.received[0][0]["content"]
 
 
 async def test_restart_then_full_answer_from_backup_with_linked_attempts(live: Live) -> None:
