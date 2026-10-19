@@ -8,9 +8,13 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 ## Stack (do not change without an ADR in docs/adr/)
 - Python 3.12, uv, FastAPI, Pydantic v2, pydantic-settings
 - SQLAlchemy 2.0 async (asyncpg), Alembic, PostgreSQL 16 + pgvector
-- httpx, openai SDK (used against OpenAI-compatible endpoints: Gemini, Mistral, Bedrock, Portkey)
-- Provider chain from env `LLM_CHAIN`: dev = gemini-free,mistral-experiment;
-  prod = gemini,mistral[,bedrock]. Tests use FakeLLMProvider only.
+- httpx, openai SDK (used against OpenAI-compatible endpoints: Gemini, Groq; later Mistral,
+  Bedrock, Portkey). openai SDK v3 runs on `httpx2`: provider code and its tests use httpx2 types.
+- Provider chain from env `LLM_CHAIN` = `provider:model,...` in priority order (ADR 0002);
+  every model must be listed in app/llm/registry.py with max_context_tokens. Default:
+  gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b.
+  Prod needs a paid-tier GEMINI_API_KEY (free tier may train on prompts).
+  Tests use FakeLLMProvider (tests/llm_fakes.py) only.
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
 - Never call China-hosted APIs (DeepSeek, Zhipu, Moonshot, Qwen Singapore) with real user data.
@@ -87,6 +91,7 @@ uv run pytest tests/unit
 uv run pytest tests/integration        # needs Docker
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
+uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.

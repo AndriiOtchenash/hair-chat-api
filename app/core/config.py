@@ -19,8 +19,15 @@ class Settings(BaseSettings):
 
     env: Env = Env.DEV
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/hair_chat"
-    llm_chain: str = "gemini-free,mistral-experiment"
+    # "provider:model,provider:model,...", priority order; models are listed in app/llm/registry.py.
+    llm_chain: str = "gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b"
+    llm_connect_timeout_s: float = 5.0
+    # Until the first content token; thinking models need a few seconds before they answer.
+    llm_first_token_timeout_s: float = 20.0
+    # Max silence between chunks once streaming; longer counts as a broken stream.
+    llm_read_timeout_s: float = 30.0
     gemini_api_key: SecretStr | None = None
+    groq_api_key: SecretStr | None = None
     mistral_api_key: SecretStr | None = None
     # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
     auth0_domain: str | None = None
@@ -33,10 +40,6 @@ class Settings(BaseSettings):
         if self.env is Env.PROD and not (self.auth0_domain and self.auth0_audience):
             raise ValueError("AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV=prod")
         return self
-
-    @property
-    def llm_chain_list(self) -> list[str]:
-        return [name.strip() for name in self.llm_chain.split(",") if name.strip()]
 
 
 @lru_cache
