@@ -12,7 +12,8 @@ One system message, then the history, ending with the user's new message:
 
 Profile, knowledge and summary are data, wrapped by `wrap_data` so the model can tell them from
 instructions (the system prompt says so too). The moderation signal is our own text, not the
-user's, wrapped the same way so it cannot be faked from inside a message.
+user's, wrapped the same way. Our tags are defused in every message turn too, so a message
+cannot fake a block such as <moderation_signal>.
 """
 
 import logging
@@ -59,11 +60,17 @@ _TURN_ROLES: dict[MessageRole, Literal["user", "assistant"]] = {
 }
 
 
+def defuse_tags(text: str) -> str:
+    """Our service tags in untrusted text lose their `<` (-> `‹`): the text can neither open a
+    block such as a fake <moderation_signal> nor close a real one early. Same length, so token
+    estimates do not change."""
+    return _TAG_IN_DATA.sub(r"‹\1\2", text)
+
+
 def wrap_data(tag: str, text: str, note: str) -> str:
-    """`<tag>` block of data. Our tags inside the text are defused (`<` -> `‹`), so data cannot
-    close its block early and pose as instructions after it."""
-    safe = _TAG_IN_DATA.sub(r"‹\1\2", text.strip())
-    return f"<{tag}>\n{note}\n{safe}\n</{tag}>"
+    """`<tag>` block of data, with our tags inside the text defused (see `defuse_tags`), so data
+    cannot close its block early and pose as instructions after it."""
+    return f"<{tag}>\n{note}\n{defuse_tags(text.strip())}\n</{tag}>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +193,9 @@ class TokenBudgetContextBuilder:
 
         messages: list[ChatMessage] = [{"role": "system", "content": system}]
         for message in [*reversed(kept), *([newest] if newest else [])]:
-            messages.append({"role": _TURN_ROLES[message.role], "content": message.content})
+            # User text (and answers that may echo it) never carries a working service tag.
+            content = defuse_tags(message.content)
+            messages.append({"role": _TURN_ROLES[message.role], "content": content})
         return Context(
             messages,
             tokens=budget_tokens - remaining,

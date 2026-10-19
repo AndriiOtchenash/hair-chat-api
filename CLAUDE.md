@@ -62,7 +62,9 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 
 ## Context and prompts
 - Context per reply = TokenBudgetContextBuilder: one system message (prompt + `<profile>`,
-  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions"),
+  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions";
+  our tags inside any data or message turn are defused by `defuse_tags`, so text can never open
+  or close a block such as `<moderation_signal>`),
   then as many recent messages as fit, then the new message. The prompt is never cut.
 - Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
   `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).
