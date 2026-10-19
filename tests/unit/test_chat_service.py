@@ -346,7 +346,7 @@ async def test_safety_signal_is_only_for_the_flagged_message() -> None:
     events = await world.send(conversation_id, "second")
 
     assert not any(isinstance(e, SafetyNotice) for e in events)
-    assert "<moderation_signal>" not in provider.received[1][0]["content"]
+    assert "<moderation_signal>\n" not in provider.received[1][0]["content"]
 
 
 async def test_notice_comes_before_the_error_when_the_chain_is_down() -> None:

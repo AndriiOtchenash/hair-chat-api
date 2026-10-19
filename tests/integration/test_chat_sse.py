@@ -237,7 +237,7 @@ async def test_self_harm_gets_safety_notice_before_tokens_and_is_saved(live: Liv
         "action": "soft",
         "categories": ["self-harm/intent"],
     }
-    assert "<moderation_signal>" in live.primary.received[0][0]["content"]
+    assert "<moderation_signal>\n" in live.primary.received[0][0]["content"]
 
 
 async def test_restart_then_full_answer_from_backup_with_linked_attempts(live: Live) -> None:

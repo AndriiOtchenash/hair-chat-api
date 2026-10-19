@@ -88,6 +88,7 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Tests use FakeModerator (tests/llm_fakes.py); prod refuses to start without OPENAI_API_KEY.
 - Policy or threshold change -> re-run the eval (real API, our phrases only, not in CI):
   `uv run python -m scripts.moderation_eval` over tests/moderation_eval/phrases.yaml.
+  Accepted misses carry `known_gap: "<reason>"` (ADR 0004 Known gaps); only new ones exit 1.
 
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
