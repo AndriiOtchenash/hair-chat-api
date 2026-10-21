@@ -5,8 +5,23 @@
     "ghcr.io/devcontainers/features/docker-in-docker:2": { "moby": false },
     "ghcr.io/devcontainers/features/node:1": { "version": "lts" }
   },
-  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://claude.ai/install.sh | bash",
+  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh && curl -fsSL https://claude.ai/install.sh | bash && ([ -d /workspaces/hair-chat-web ] || git clone https://github.com/AndriiOtchenash/hair-chat-web /workspaces/hair-chat-web)",
+  "forwardPorts": [8000, 5173],
+  "portsAttributes": {
+    "8000": { "label": "API (uvicorn)" },
+    "5173": { "label": "Web (Vite dev server)" }
+  },
   "customizations": {
+    "codespaces": {
+      "repositories": {
+        "AndriiOtchenash/hair-chat-web": {
+          "permissions": {
+            "contents": "write",
+            "pull_requests": "write"
+          }
+        }
+      }
+    },
     "vscode": {
       "extensions": [
         "ms-python.python",

@@ -17,6 +17,8 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   Tests use FakeLLMProvider / FakeEmbedder (tests/llm_fakes.py) only.
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
+  The frontend lives next to this repo in /workspaces/hair-chat-web (cloned by postCreateCommand,
+  codespace has write access to it) and has its own CLAUDE.md. Forwarded ports: 8000 API, 5173 web.
 - Never call China-hosted APIs (DeepSeek, Zhipu, Moonshot, Qwen Singapore) with real user data.
 - Auth: Auth0 JWT validated via JWKS; roles stored in our DB (user / specialist / admin)
 - Background work: FastAPI BackgroundTasks only (no Celery/Redis)
