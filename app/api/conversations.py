@@ -169,6 +169,9 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
                     "provider": event.provider,
                     "model": event.model,
                     "truncated": event.truncated,
+                    "sources": [
+                        {"title": s.title, "slug": s.slug, "url": s.url} for s in event.sources
+                    ],
                 },
             )
         case ChatError(code=code, message=message):

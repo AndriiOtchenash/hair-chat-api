@@ -1,15 +1,20 @@
-"""FakeLLMProvider and FakeModerator with scripted scenarios, an in-memory llm_calls recorder.
+"""FakeLLMProvider, FakeModerator and FakeEmbedder with scripted scenarios, an in-memory llm_calls
+recorder.
 
 No real APIs (CLAUDE.md rule 1).
 """
 
 import asyncio
+import hashlib
+import math
+import random
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
 from app.db.repositories.llm_calls import LLMCallRecord
 from app.llm.base import ChatMessage, ProviderError, StreamEnd
 from app.llm.moderation import ModerationResult, ModerationUnavailable
+from app.rag.embeddings import EmbeddingUnavailable
 
 
 @dataclass(frozen=True)
@@ -140,3 +145,65 @@ def flag(*categories: str, scores: dict[str, float] | None = None) -> Moderation
         categories=categories,
         scores={c: 1.0 for c in categories} | (scores or {}),
     )
+
+
+EMBEDDING_DIM = 768
+
+
+def unit_vector(*weights: float, dim: int = EMBEDDING_DIM) -> list[float]:
+    """`weights` on the first axes, zeros elsewhere, normalized: crafted cosine similarities."""
+    raw = [*weights, *([0.0] * (dim - len(weights)))]
+    norm = math.sqrt(sum(x * x for x in raw))
+    return [x / norm for x in raw]
+
+
+def text_vector(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
+    """Deterministic pseudo-random unit vector of a text: same text, same vector."""
+    rng = random.Random(hashlib.sha256(text.encode()).digest())
+    return unit_vector(*(rng.uniform(-1, 1) for _ in range(dim)), dim=dim)
+
+
+class FakeEmbedder:
+    """Embedder with deterministic vectors: `vectors[text]` if given, else text_vector(text).
+
+    fail: raise EmbeddingUnavailable on every call; hang: never answer (for timeouts);
+    wait_for: answer only after this event is set (to prove calls run in parallel).
+    """
+
+    def __init__(
+        self,
+        model: str = "fake-embedding",
+        vectors: dict[str, list[float]] | None = None,
+        *,
+        fail: bool = False,
+        hang: bool = False,
+        wait_for: asyncio.Event | None = None,
+    ) -> None:
+        self.model = model
+        self.vectors = vectors or {}
+        self.fail = fail
+        self.hang = hang
+        self.wait_for = wait_for
+        self.calls = 0
+        self.embedded: list[str] = []
+        self.cancelled = False
+        self.started = asyncio.Event()  # set on the first call
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls += 1
+        self.started.set()
+        try:
+            if self.hang:
+                await asyncio.Event().wait()
+            if self.wait_for is not None:
+                await self.wait_for.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        if self.fail:
+            raise EmbeddingUnavailable("timeout")
+        self.embedded.extend(texts)
+        return [self.vectors.get(t) or text_vector(t) for t in texts]
+
+    async def aclose(self) -> None:
+        return None

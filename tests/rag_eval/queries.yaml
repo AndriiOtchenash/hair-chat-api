@@ -1,0 +1,40 @@
+# RAG eval set: our own questions only, never real user messages.
+# Run against the real embeddings API: uv run python -m scripts.rag_eval  (not in CI)
+# expected = slug of the article (docs/kb/<slug>.md) that should be among the top-4 chunks above
+#   KB_MIN_SIMILARITY; null = off-topic, nothing should pass the threshold.
+# known_gap = why a query is accepted to miss `expected` today; listed apart, does not fail the run.
+
+# --- ru ---
+- {lang: ru, expected: washing-frequency, text: "Как часто нужно мыть голову, если корни жирнятся к вечеру?"}
+- {lang: ru, expected: dandruff, text: "У меня белые хлопья на плечах и чешется голова, что делать?"}
+- {lang: ru, expected: scalp-chemical-burn, text: "Обожгла кожу головы осветлителем, жжёт и покраснело, что делать прямо сейчас?"}
+- {lang: ru, expected: hair-loss, text: "Сколько волос в день нормально терять? Мне кажется, выпадает много"}
+- {lang: ru, expected: curly-hair, text: "Как ухаживать за кудрявыми волосами, чтобы они не пушились?"}
+- {lang: ru, expected: nutrition-and-hair, text: "Какие продукты есть, чтобы волосы были крепче?"}
+- {lang: ru, expected: hair-myths, text: "Правда ли, что если часто стричь кончики, волосы растут быстрее?"}
+
+# --- uk ---
+- {lang: uk, expected: heat-protection, text: "Яку температуру праски обрати, щоб не спалити волосся?"}
+- {lang: uk, expected: choosing-shampoo, text: "Як вибрати шампунь для чутливої шкіри голови?"}
+- {lang: uk, expected: after-perm-and-straightening, text: "Коли можна мити голову після кератинового випрямлення?"}
+- {lang: uk, expected: coloring-and-bleaching, text: "Як доглядати за фарбованим волоссям, щоб колір довше тримався?"}
+- {lang: uk, expected: scalp-types, text: "Як зрозуміти, яка в мене шкіра голови — жирна чи суха?"}
+
+# --- pl ---
+- {lang: pl, expected: conditioners-and-masks, text: "Jak często używać maski do włosów i czym różni się od odżywki?"}
+- {lang: pl, expected: dandruff, text: "Jaki szampon na łupież i jak go stosować?"}
+- {lang: pl, expected: hair-loss, text: "Kiedy wypadanie włosów to powód, żeby iść do trychologa?"}
+- {lang: pl, expected: heat-protection, text: "Czy termoochrona jest potrzebna przy suszeniu suszarką?"}
+
+# --- en ---
+- {lang: en, expected: coloring-and-bleaching, text: "Should I do a patch test before dyeing my hair at home?"}
+- {lang: en, expected: after-perm-and-straightening, text: "How do I take care of my hair after a perm?"}
+- {lang: en, expected: nutrition-and-hair, text: "Can a crash diet make my hair fall out?"}
+- {lang: en, expected: hair-myths, text: "Does shaving your head make hair grow back thicker?"}
+- {lang: en, expected: washing-frequency, text: "Is it bad to use dry shampoo every day instead of washing?"}
+
+# --- off-topic: nothing should be found ---
+- {lang: ru, expected: null, text: "Какая погода будет завтра в Киеве?"}
+- {lang: uk, expected: null, text: "Дай рецепт українського борщу"}
+- {lang: pl, expected: null, text: "Jak rozliczyć podatek PIT za zeszły rok?"}
+- {lang: en, expected: null, text: "How do I reverse a linked list in Python?"}

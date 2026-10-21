@@ -1,12 +1,16 @@
 import asyncio
+import logging
 import uuid
+from collections.abc import Sequence
 
 import pytest
 
 from app.db.models import MessageRole
+from app.db.repositories.kb import KBHit
 from app.llm.base import ProviderHTTPError, ProviderTimeout, Restart, StreamBroken, Token
 from app.llm.moderation import ModerationResult, ModerationUnavailable, Moderator, NoopModerator
 from app.llm.resilient import ResilientLLM
+from app.rag.retriever import QueryEmbedder, RagKnowledge, RagQueryEmbedder, Source
 from app.services.chat_service import (
     ChatDone,
     ChatError,
@@ -19,10 +23,15 @@ from app.services.chat_service import (
     MessageBlocked,
     SafetyNotice,
 )
-from app.services.context_builder import TokenBudgetContextBuilder
+from app.services.context_builder import (
+    KNOWLEDGE_NOTE,
+    KnowledgeSource,
+    TokenBudgetContextBuilder,
+)
 from app.services.prompts import FilePromptProvider, PromptProvider
 from tests.fakes import FakeConversationRepository, StaticPrompt
 from tests.llm_fakes import (
+    FakeEmbedder,
     FakeLLMCallRecorder,
     FakeLLMProvider,
     FakeModerator,
@@ -48,6 +57,8 @@ class World:
         budget: int = 6000,
         prompts: PromptProvider | None = None,
         moderator: Moderator | None = None,
+        query_embedder: QueryEmbedder | None = None,
+        knowledge: KnowledgeSource | None = None,
     ) -> None:
         self.repo = FakeConversationRepository()
         self.recorder = FakeLLMCallRecorder()
@@ -57,11 +68,14 @@ class World:
         self.chat = ChatService(
             ConversationService(self.repo),
             ResilientLLM(self.providers, self.recorder, first_token_timeout=0.05),
-            TokenBudgetContextBuilder(self.repo, prompts or FilePromptProvider()),
+            TokenBudgetContextBuilder(
+                self.repo, prompts or FilePromptProvider(), knowledge=knowledge
+            ),
             self.locks,
             self.moderator,
             max_answer_tokens=100,
             budget_tokens=budget,
+            query_embedder=query_embedder,
         )
 
     async def conversation(self, user: uuid.UUID = USER) -> uuid.UUID:
@@ -501,3 +515,99 @@ async def test_busy_conversation_is_not_sent_to_moderation() -> None:
         await world.send(conversation_id, "second")
 
     assert moderator.checked == []
+
+
+# --- knowledge base (RAG) ---
+
+
+class OneArticleKB:
+    """KBRepository with one dandruff passage that matches any question."""
+
+    async def search(
+        self, vector: Sequence[float], *, model: str, include_drafts: bool, limit: int
+    ) -> list[KBHit]:
+        return [KBHit("Перхоть › Уход\nМягкий шампунь.", "Перхоть", "dandruff", None, 0.8)]
+
+
+def rag_world(embedder: FakeEmbedder, moderator: Moderator | None = None) -> World:
+    knowledge = RagKnowledge(
+        OneArticleKB(), top_k=4, min_similarity=0.6, max_tokens=1500, include_drafts=False
+    )
+    return World(
+        moderator=moderator,
+        query_embedder=RagQueryEmbedder(embedder, timeout=0.05),
+        knowledge=knowledge,
+    )
+
+
+async def test_done_lists_the_articles_that_were_in_the_context() -> None:
+    world = rag_world(FakeEmbedder())
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == (Source("Перхоть", "dandruff", None),)
+    system = world.providers[0].received[0][0]["content"]
+    assert KNOWLEDGE_NOTE in system and "Мягкий шампунь." in system
+
+
+@pytest.mark.parametrize("embedder", [FakeEmbedder(fail=True), FakeEmbedder(hang=True)])
+async def test_embeddings_down_answer_goes_without_knowledge(
+    embedder: FakeEmbedder, caplog: pytest.LogCaptureFixture
+) -> None:
+    world = rag_world(embedder)
+    conversation_id = await world.conversation()
+
+    with caplog.at_level(logging.WARNING):
+        events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == ()
+    assert KNOWLEDGE_NOTE not in world.providers[0].received[0][0]["content"]
+    assert "embeddings unavailable" in caplog.text
+    assert "перхот" not in caplog.text
+
+
+class WaitsForEmbedding:
+    """Moderator that answers only once the embedding has started: proves they run together."""
+
+    enabled = True
+
+    def __init__(self, embedder: FakeEmbedder, verdict: ModerationResult | None = None) -> None:
+        self.embedder = embedder
+        self.verdict = verdict or ModerationResult("openai", "omni-moderation-test", flagged=False)
+
+    async def check(self, text: str) -> ModerationResult:
+        async with asyncio.timeout(1):
+            await self.embedder.started.wait()
+        return self.verdict
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_question_is_embedded_while_it_is_moderated() -> None:
+    embedder = FakeEmbedder()
+    world = rag_world(embedder, moderator=WaitsForEmbedding(embedder))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    assert isinstance(events[-1], ChatDone)
+    assert embedder.embedded == ["Что делать с перхотью?"]
+
+
+async def test_blocked_message_cancels_its_embedding() -> None:
+    embedder = FakeEmbedder(hang=True)
+    world = rag_world(embedder, moderator=WaitsForEmbedding(embedder, flag("harassment")))
+    conversation_id = await world.conversation()
+
+    with pytest.raises(MessageBlocked):
+        await world.send(conversation_id, "blocked text")
+    await asyncio.sleep(0)
+
+    assert embedder.cancelled
+    assert world.repo.of(conversation_id) == []

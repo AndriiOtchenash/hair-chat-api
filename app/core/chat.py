@@ -14,11 +14,14 @@ from app.db.repositories.conversations import (
     SqlConversationRepository,
     sql_conversation_repositories,
 )
+from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.session import get_session, get_sessionmaker
 from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
 from app.llm.registry import build_llm
 from app.llm.resilient import ResilientLLM
+from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
+from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, RagKnowledge, RagQueryEmbedder
 from app.services.chat_service import ChatService, ConversationLocks, ConversationService
 from app.services.context_builder import TokenBudgetContextBuilder
 from app.services.prompts import FilePromptProvider, PromptProvider
@@ -66,6 +69,46 @@ def get_moderator() -> Moderator:
     return build_moderator(get_settings())
 
 
+def build_embedder(settings: Settings) -> Embedder | None:
+    """None without GEMINI_API_KEY: replies go without the knowledge base."""
+    if settings.gemini_api_key is None:
+        return None
+    return OpenAICompatibleEmbedder(
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
+        api_key=settings.gemini_api_key.get_secret_value(),
+        timeout=settings.embedding_timeout_s,
+    )
+
+
+@lru_cache
+def get_embedder() -> Embedder | None:
+    # One client per process: its HTTP connection pool is shared by requests.
+    embedder = build_embedder(get_settings())
+    if embedder is None:
+        logger.warning("GEMINI_API_KEY not set: answers go without the knowledge base")
+    return embedder
+
+
+def get_query_embedder(
+    embedder: Annotated[Embedder | None, Depends(get_embedder)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> QueryEmbedder:
+    if embedder is None:
+        return NoQueryEmbedder()
+    return RagQueryEmbedder(embedder, timeout=settings.embedding_timeout_s)
+
+
+def build_knowledge(session: AsyncSession, settings: Settings) -> RagKnowledge:
+    return RagKnowledge(
+        SqlKBRepository(session),
+        top_k=settings.kb_top_k,
+        min_similarity=settings.kb_min_similarity,
+        max_tokens=settings.kb_max_tokens,
+        include_drafts=settings.kb_drafts_searched,
+    )
+
+
 async def close_llm() -> None:
     if _llm.cache_info().currsize:
         await _llm().aclose()
@@ -73,6 +116,11 @@ async def close_llm() -> None:
     if get_moderator.cache_info().currsize:
         await get_moderator().aclose()
         get_moderator.cache_clear()
+    if get_embedder.cache_info().currsize:
+        embedder = get_embedder()
+        if embedder is not None:
+            await embedder.aclose()
+        get_embedder.cache_clear()
 
 
 @lru_cache
@@ -125,21 +173,24 @@ def get_conversation_service(repo: Conversations) -> ConversationService:
 
 
 def get_chat_service(
+    session: Annotated[AsyncSession, Depends(get_session)],
     repo: Conversations,
     llm: LLM,
     budget: Budget,
     prompts: Annotated[PromptProvider, Depends(get_prompt_provider)],
     locks: Annotated[ConversationLocks, Depends(get_conversation_locks)],
     moderator: Annotated[Moderator, Depends(get_moderator)],
+    query_embedder: Annotated[QueryEmbedder, Depends(get_query_embedder)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ChatService:
     return ChatService(
         ConversationService(repo),
         llm,
-        TokenBudgetContextBuilder(repo, prompts),
+        TokenBudgetContextBuilder(repo, prompts, knowledge=build_knowledge(session, settings)),
         locks,
         moderator,
         max_answer_tokens=settings.chat_max_answer_tokens,
         budget_tokens=budget,
         violence_threshold=settings.moderation_violence_threshold,
+        query_embedder=query_embedder,
     )

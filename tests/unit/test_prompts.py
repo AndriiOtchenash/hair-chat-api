@@ -9,13 +9,23 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v3"
-    assert prompt.text == (PROMPTS_DIR / "system_v3.md").read_text(encoding="utf-8").strip()
+    assert prompt.version == PROMPT_VERSION == "system_v4"
+    assert prompt.text == (PROMPTS_DIR / "system_v4.md").read_text(encoding="utf-8").strip()
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2"):
+    for version in ("system_v1", "system_v2", "system_v3"):
         assert (await FilePromptProvider(version).get_active()).version == version
+
+
+async def test_knowledge_is_used_when_on_topic_and_sources_are_never_invented() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "<knowledge>" in text
+    assert "if a passage is on the topic of the question, base your answer on it" in text
+    assert "never invent sources" in text
+    assert "if there is no <knowledge> block" in text
+    assert "more cautiously" in text
 
 
 async def test_moderation_signal_is_followed_unlike_reference_data() -> None:
