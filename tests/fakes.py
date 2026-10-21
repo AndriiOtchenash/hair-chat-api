@@ -51,6 +51,11 @@ class FakeUserRepository:
             )
         return self.by_sub[auth_sub]
 
+    async def set_locale(self, user_id: uuid.UUID, locale: Locale) -> User:
+        user = next(u for u in self.by_sub.values() if u.id == user_id)
+        user.locale = locale
+        return user
+
 
 class FakeConsentRepository:
     def __init__(self) -> None:

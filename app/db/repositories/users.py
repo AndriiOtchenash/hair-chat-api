@@ -1,18 +1,21 @@
 import logging
+import uuid
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import new_id
-from app.db.models import User
+from app.db.models import Locale, User
 
 logger = logging.getLogger(__name__)
 
 
 class UserRepository(Protocol):
     async def get_or_create_by_auth_sub(self, auth_sub: str) -> User: ...
+
+    async def set_locale(self, user_id: uuid.UUID, locale: Locale) -> User: ...
 
 
 class SqlUserRepository:
@@ -41,4 +44,14 @@ class SqlUserRepository:
         await self._session.commit()
         if created_id is not None:
             logger.info("users: created user %s", created_id)
+        return user
+
+    async def set_locale(self, user_id: uuid.UUID, locale: Locale) -> User:
+        """UPDATE ... RETURNING: also refreshes the User already loaded in this session."""
+        user = (
+            await self._session.execute(
+                update(User).where(User.id == user_id).values(locale=locale).returning(User)
+            )
+        ).scalar_one()
+        await self._session.commit()
         return user
