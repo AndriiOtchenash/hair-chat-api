@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.core.chat import build_moderator
+from app.core.chat import build_embedder, build_moderator
 from app.core.config import Settings
 
 
@@ -39,3 +39,28 @@ def test_dev_without_moderation_key_gets_noop_moderator() -> None:
 
 def test_dev_allows_missing_auth0_settings() -> None:
     assert Settings(_env_file=None).auth0_domain is None
+
+
+PROD = {"env": "prod", "auth0_domain": "t.auth0.com", "auth0_audience": "a", "openai_api_key": "k"}
+
+
+def test_drafts_are_searched_in_dev_and_not_in_prod_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KB_INCLUDE_DRAFTS", raising=False)
+
+    assert Settings(_env_file=None).kb_drafts_searched
+    assert not Settings(_env_file=None, **PROD).kb_drafts_searched
+    assert not Settings(_env_file=None, kb_include_drafts=False).kb_drafts_searched
+
+
+def test_prod_refuses_draft_articles() -> None:
+    with pytest.raises(ValidationError, match="KB_INCLUDE_DRAFTS"):
+        Settings(_env_file=None, kb_include_drafts=True, **PROD)
+
+
+def test_without_gemini_key_there_is_no_embedder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    assert build_embedder(Settings(_env_file=None)) is None
+    assert build_embedder(Settings(_env_file=None, gemini_api_key="k")) is not None

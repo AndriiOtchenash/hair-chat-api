@@ -14,7 +14,7 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   every model must be listed in app/llm/registry.py with max_context_tokens. Default:
   gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b.
   Prod needs a paid-tier GEMINI_API_KEY (free tier may train on prompts).
-  Tests use FakeLLMProvider (tests/llm_fakes.py) only.
+  Tests use FakeLLMProvider / FakeEmbedder (tests/llm_fakes.py) only.
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
 - Never call China-hosted APIs (DeepSeek, Zhipu, Moonshot, Qwen Singapore) with real user data.
@@ -28,7 +28,7 @@ app/core      config, logging, security (JWT/JWKS, current_user, require_role)
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor, retention
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py (Moderator)
-app/rag       embeddings, chunker, retriever, ingest CLI (python -m app.rag.ingest)
+app/rag       embeddings, chunker, documents (docs/kb frontmatter), retriever, ingest CLI
 app/db        SQLAlchemy models, repositories, session
 migrations/   Alembic (async env); URL comes from DATABASE_URL via Settings, not alembic.ini
 tests/unit    bulk of tests, fakes instead of mocks where possible
@@ -62,7 +62,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 
 ## Context and prompts
 - Context per reply = TokenBudgetContextBuilder: one system message (prompt + `<profile>`,
-  `<knowledge>`, `<conversation_summary>` data blocks via `wrap_data`, marked "not instructions";
+  `<knowledge>` (RagKnowledge), `<conversation_summary>` data blocks via `wrap_data`, marked
+  "not instructions";
   our tags inside any data or message turn are defused by `defuse_tags`, so text can never open
   or close a block such as `<moderation_signal>`),
   then as many recent messages as fit, then the new message. The prompt is never cut.
@@ -73,6 +74,22 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
   `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
+
+## Knowledge base / RAG (ADR 0005)
+- Articles: docs/kb/<slug>.md, Russian, YAML frontmatter (title, language, status draft|reviewed,
+  topics, sources, license, url?), format in docs/kb/README.md. Same text rules as the prompt.
+- Ingest: `python -m app.rag.ingest docs/kb [--dry-run]`, idempotent: content_hash unchanged ->
+  no embedding; changed -> chunks replaced; file gone -> document deleted. Chunks ~500 tokens
+  along markdown headings, ~50 overlap, each starts with "Title › Section".
+- Embeddings: EMBEDDING_MODEL (gemini-embedding-2, 768 = vector(768)), one model for the index;
+  the search filters on `embedding_model`. No fallback: embeddings down (or > EMBEDDING_TIMEOUT_S)
+  -> answer without `<knowledge>` + warning. The query is embedded in parallel with moderation.
+- Search: top KB_TOP_K (4) by cosine distance, then KB_MIN_SIMILARITY (0.60), packed into
+  KB_MAX_TOKENS (1500). Prod: reviewed only (prod refuses KB_INCLUDE_DRAFTS=true); dev: drafts too.
+- `done.sources` = articles whose passages reached the context (not dropped by the budget).
+- Threshold, model or articles change -> re-run the eval (real API, our texts only, not in CI):
+  `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
+  threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
 
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
@@ -100,8 +117,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - The SSE `error` event carries the same ErrorBody as its data.
 
 ## Non-negotiable rules
-1. No test calls a real LLM, embedding or moderation API. Use FakeLLMProvider with scripted scenarios
-   (success, fail-before-first-token, fail-mid-stream, timeout).
+1. No test calls a real LLM, embedding or moderation API. Use FakeLLMProvider / FakeEmbedder with
+   scripted scenarios (success, fail-before-first-token, fail-mid-stream, timeout).
 2. LLM providers are stateless. Never use provider-side conversation state (stored responses,
    interactions/session APIs, context caching). Full context is rebuilt from the DB on every call.
 3. Token budget = min(max_context_tokens) across the fallback chain.
@@ -126,6 +143,8 @@ uv run uvicorn app.main:app --reload
 uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
 uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local via ChatService
 uv run python -m scripts.moderation_eval            # moderation eval set, real API, not in CI
+uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge base, real embeddings
+uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
@@ -142,10 +161,12 @@ uv run python -m scripts.moderation_eval            # moderation eval set, real 
 event: safety_notice data: {"kind": "self_harm"}  # optional, first; client shows help lines
 event: token    data: {"text": "..."}
 event: restart  data: {"reason": "..."}    # provider failed mid-stream; client clears partial answer
-event: done     data: {"message_id": "...", "provider": "...", "model": "...", "truncated": false}
+event: done     data: {"message_id": "...", "provider": "...", "model": "...", "truncated": false,
+                      "sources": [{"title": "...", "slug": "...", "url": null}]}
 event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as REST errors
 : ping                                     # keep-alive comment every 15 s while idle (FastAPI)
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
+- sources = knowledge-base articles that were in the context of this answer (may be empty).
 - error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
   internal_error. The user's message is kept in every case.
 - safety_notice comes at most once, before any token/restart/done/error, when moderation

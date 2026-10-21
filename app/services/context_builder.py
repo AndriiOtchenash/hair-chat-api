@@ -5,7 +5,7 @@ One system message, then the history, ending with the user's new message:
     system prompt (never cut)
     <moderation_signal>     only when moderation marked the new message "soft" (never cut)
     <profile>               ProfileSource   (empty until stage 2)
-    <knowledge>             KnowledgeSource (empty until RAG, 1.9)
+    <knowledge>             KnowledgeSource (RAG: app.rag.retriever.RagKnowledge)
     <conversation_summary>  conversations.summary (rolling summary, see summarizer.py)
     messages after summary_upto_message_id, as many as fit, newest first
     the new user message (always)
@@ -25,6 +25,7 @@ from typing import Literal, Protocol
 from app.db.models import Message, MessageRole
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import ChatMessage
+from app.rag.retriever import Knowledge, QueryEmbedding, Source
 from app.services.prompts import PromptProvider
 from app.services.tokens import message_tokens
 
@@ -80,13 +81,22 @@ class Context:
     prompt_version: str
     # Messages after the summary were left out: fold them into the summary after the answer.
     needs_summary: bool
+    # Articles of the <knowledge> block, if it made it into the context (not dropped by budget).
+    sources: tuple[Source, ...] = ()
 
 
 class ContextBuilder(Protocol):
     async def build(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, budget_tokens: int
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        budget_tokens: int,
+        query: QueryEmbedding | None = None,
     ) -> Context:
-        """Full context within `budget_tokens`, ending with the user's new message."""
+        """Full context within `budget_tokens`, ending with the user's new message.
+
+        `query` is the new message's embedding, made in advance (ChatService.reply); None = no
+        knowledge base for this reply."""
         ...
 
 
@@ -97,8 +107,10 @@ class ProfileSource(Protocol):
 
 
 class KnowledgeSource(Protocol):
-    async def knowledge(self, user_id: uuid.UUID, question: str) -> str | None:
-        """Knowledge-base passages relevant to the question (RAG, 1.9), or None."""
+    async def knowledge(
+        self, user_id: uuid.UUID, question: str, query: QueryEmbedding | None
+    ) -> Knowledge | None:
+        """Knowledge-base passages relevant to the question and their articles, or None."""
         ...
 
 
@@ -108,7 +120,9 @@ class NoProfile:
 
 
 class NoKnowledge:
-    async def knowledge(self, user_id: uuid.UUID, question: str) -> str | None:
+    async def knowledge(
+        self, user_id: uuid.UUID, question: str, query: QueryEmbedding | None
+    ) -> Knowledge | None:
         return None
 
 
@@ -145,7 +159,11 @@ class TokenBudgetContextBuilder:
         self._knowledge = knowledge or NoKnowledge()
 
     async def build(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, budget_tokens: int
+        self,
+        user_id: uuid.UUID,
+        conversation_id: uuid.UUID,
+        budget_tokens: int,
+        query: QueryEmbedding | None = None,
     ) -> Context:
         prompt = await self._prompts.get_active()
         conversation = await self._repo.get(user_id, conversation_id)
@@ -162,7 +180,11 @@ class TokenBudgetContextBuilder:
         newest, older = (turns[0], turns[1:]) if turns else (None, [])
 
         head = _signal(newest)
-        blocks = await self._blocks(user_id, newest, conversation.summary if conversation else None)
+        summary = conversation.summary if conversation else None
+        knowledge = (
+            await self._knowledge.knowledge(user_id, newest.content, query) if newest else None
+        )
+        blocks = await self._blocks(user_id, knowledge.text if knowledge else None, summary)
         system = self._system(prompt.text, [*head, *blocks])
         fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         for tag in _DROP_ORDER:
@@ -196,18 +218,20 @@ class TokenBudgetContextBuilder:
             # User text (and answers that may echo it) never carries a working service tag.
             content = defuse_tags(message.content)
             messages.append({"role": _TURN_ROLES[message.role], "content": content})
+        # Sources only for passages the model actually sees (the block may be dropped above).
+        kept_knowledge = knowledge if any(b.tag == "knowledge" for b in blocks) else None
         return Context(
             messages,
             tokens=budget_tokens - remaining,
             prompt_version=prompt.version,
             needs_summary=left_out,
+            sources=kept_knowledge.sources if kept_knowledge else (),
         )
 
     async def _blocks(
-        self, user_id: uuid.UUID, newest: Message | None, summary: str | None
+        self, user_id: uuid.UUID, knowledge: str | None, summary: str | None
     ) -> list[_Block]:
         profile = await self._profile.profile(user_id)
-        knowledge = await self._knowledge.knowledge(user_id, newest.content) if newest else None
         candidates = (
             ("profile", profile, PROFILE_NOTE),
             ("knowledge", knowledge, KNOWLEDGE_NOTE),

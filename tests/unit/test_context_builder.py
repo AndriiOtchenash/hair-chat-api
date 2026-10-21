@@ -1,6 +1,7 @@
 import uuid
 
 from app.db.models import Conversation, Message
+from app.rag.retriever import Knowledge, QueryEmbedding, Source
 from app.services.context_builder import (
     DATA_TAGS,
     Context,
@@ -25,14 +26,23 @@ class StaticProfile:
         return self.text
 
 
-class StaticKnowledge:
-    def __init__(self, text: str | None) -> None:
-        self.text = text
-        self.questions: list[str] = []
+DANDRUFF = Source("Перхоть", "dandruff", None)
+QUERY = QueryEmbedding([0.1, 0.2], "test-embedding")
 
-    async def knowledge(self, user_id: uuid.UUID, question: str) -> str | None:
+
+class StaticKnowledge:
+    def __init__(self, text: str | None, sources: tuple[Source, ...] = (DANDRUFF,)) -> None:
+        self.text = text
+        self.sources = sources
+        self.questions: list[str] = []
+        self.queries: list[QueryEmbedding | None] = []
+
+    async def knowledge(
+        self, user_id: uuid.UUID, question: str, query: QueryEmbedding | None
+    ) -> Knowledge | None:
         self.questions.append(question)
-        return self.text
+        self.queries.append(query)
+        return Knowledge(self.text, self.sources) if self.text is not None else None
 
 
 class Dialog:
@@ -74,10 +84,11 @@ class Dialog:
         profile: StaticProfile | None = None,
         knowledge: StaticKnowledge | None = None,
         user: uuid.UUID = USER,
+        query: QueryEmbedding | None = None,
     ) -> Context:
         assert self.conversation is not None
         builder = TokenBudgetContextBuilder(self.repo, prompt or StaticPrompt(), profile, knowledge)
-        return await builder.build(user, self.conversation.id, budget)
+        return await builder.build(user, self.conversation.id, budget, query)
 
 
 def contents(context: Context) -> list[str]:
@@ -165,6 +176,31 @@ async def test_knowledge_goes_before_profile_when_blocks_do_not_fit() -> None:
     system = context.messages[0]["content"]
     assert "<profile>" in system and "P" + MEDIUM in system
     assert "<knowledge>" not in system
+    assert context.sources == ()  # only articles the model actually sees
+
+
+async def test_sources_of_knowledge_in_the_context_and_the_query_is_passed_on() -> None:
+    dialog = Dialog()
+    await dialog.start()
+    await dialog.turns("перхоть?")
+    knowledge = StaticKnowledge("Перхоть › Уход\nмягкий шампунь")
+
+    context = await dialog.build(6000, knowledge=knowledge, query=QUERY)
+
+    assert "<knowledge>" in context.messages[0]["content"]
+    assert context.sources == (DANDRUFF,)
+    assert knowledge.queries == [QUERY]
+
+
+async def test_no_knowledge_found_means_no_block_and_no_sources() -> None:
+    dialog = Dialog()
+    await dialog.start()
+    await dialog.turns("q")
+
+    context = await dialog.build(6000, knowledge=StaticKnowledge(None))
+
+    assert "<knowledge>" not in context.messages[0]["content"]
+    assert context.sources == ()
 
 
 async def test_profile_goes_before_summary_when_blocks_do_not_fit() -> None:

@@ -7,6 +7,7 @@ and saves the user message; `reply.events()` then streams the answer. Only a com
 message behind.
 """
 
+import asyncio
 import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
@@ -20,6 +21,7 @@ from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
 from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
+from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, QueryEmbedding, Source
 from app.services.context_builder import Context, ContextBuilder
 from app.services.moderation_policy import ModerationAction, decide
 
@@ -73,6 +75,8 @@ class ChatDone:
     provider: str
     model: str
     truncated: bool
+    # Knowledge-base articles that were in the context of this answer.
+    sources: tuple[Source, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,8 +105,10 @@ class Reply:
         conversation_id: uuid.UUID,
         user_message_id: uuid.UUID,
         safety_notice: SafetyNotice | None = None,
+        query: QueryEmbedding | None = None,
     ) -> None:
         self._service = service
+        self._query = query
         self.user_id = user_id
         self.conversation_id = conversation_id
         self.user_message_id = user_message_id
@@ -144,7 +150,7 @@ class Reply:
             yield self.safety_notice
         try:
             context = await service.context_builder.build(
-                self.user_id, self.conversation_id, service.budget_tokens
+                self.user_id, self.conversation_id, service.budget_tokens, self._query
             )
             answer: list[str] = []
             stream = service.llm.stream(context.messages, service.max_answer_tokens)
@@ -196,7 +202,7 @@ class Reply:
         )
         logger.info(
             "chat reply saved: conversation=%s message=%s provider=%s model=%s prompt=%s "
-            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s",
+            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s sources=%d",
             self.conversation_id,
             message.id,
             done.provider,
@@ -206,8 +212,11 @@ class Reply:
             done.tokens_in,
             done.tokens_out,
             done.truncated,
+            len(context.sources),
         )
-        return ChatDone(message.id, done.provider, done.model, done.truncated)
+        return ChatDone(
+            message.id, done.provider, done.model, done.truncated, sources=context.sources
+        )
 
 
 class ConversationService:
@@ -247,6 +256,7 @@ class ChatService:
         max_answer_tokens: int,
         budget_tokens: int,
         violence_threshold: float = 0.9,
+        query_embedder: QueryEmbedder | None = None,
     ) -> None:
         self.conversations = conversations
         self.repo = conversations.repo
@@ -255,6 +265,7 @@ class ChatService:
         self.locks = locks
         self.moderator = moderator
         self.violence_threshold = violence_threshold
+        self.query_embedder = query_embedder or NoQueryEmbedder()
         self.max_answer_tokens = max_answer_tokens
         # Input tokens per reply: app.services.tokens.context_budget.
         self.budget_tokens = budget_tokens
@@ -267,17 +278,24 @@ class ChatService:
 
         The slot is held until the block exits, i.e. until the stream ends or is cancelled.
         Moderation runs after the slot is taken, so a busy conversation costs no moderation call.
+        The question is embedded for the knowledge base at the same time as it is moderated.
         """
         await self.conversations.require(user_id, conversation_id)
         with self.locks.hold(conversation_id):
-            moderation = await self._moderate(content)
+            embedding = asyncio.create_task(self.query_embedder.embed_query(content))
+            try:
+                moderation = await self._moderate(content)
+            except BaseException:
+                embedding.cancel()  # blocked (or cancelled): its vector is not needed
+                raise
+            query = await embedding
             message = await self.repo.add_user_message(
                 user_id, conversation_id, content, moderation=moderation
             )
             # The context builder reads the same "soft" mark from the saved message.
             soft = moderation.get("action") == ModerationAction.SOFT
             notice = SELF_HARM_NOTICE if soft else None
-            reply = Reply(self, user_id, conversation_id, message.id, notice)
+            reply = Reply(self, user_id, conversation_id, message.id, notice, query)
             try:
                 yield reply
             finally:

@@ -12,6 +12,7 @@
 htmlcov
 tests
 docs
+!docs/kb
 .env
 .env.*
 !.env.example

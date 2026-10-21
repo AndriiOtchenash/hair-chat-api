@@ -46,11 +46,38 @@ class Settings(BaseSettings):
     auth0_audience: str | None = None
     # Version of the consent texts shipped by the frontend; see docs/consents/README.md.
     consent_version: str = "2026-10-v1"
+    # Knowledge base (RAG). One embedding model for the whole index (rule 4, ADR 0005): changing
+    # it means re-running the ingest; rows of another model are never searched.
+    embedding_model: str = "gemini-embedding-2"
+    # Must match the kb_chunks.embedding column (vector(768)).
+    embedding_dimensions: int = 768
+    # Query embedding in a chat reply; on timeout the answer goes without the knowledge base.
+    embedding_timeout_s: float = 3.0
+    kb_top_k: int = 4
+    # Cosine similarity a chunk needs to reach the context. scripts/rag_eval.py (2026-10-21,
+    # gemini-embedding-2/768): off-topic best 0.53, weakest right hit 0.64 -> 0.60.
+    kb_min_similarity: float = 0.60
+    # Tokens of the <knowledge> block at most.
+    kb_max_tokens: int = 1500
+    # Search draft articles too; empty = yes in dev, no in prod (prod refuses true).
+    kb_include_drafts: bool | None = None
+
+    @property
+    def kb_drafts_searched(self) -> bool:
+        if self.kb_include_drafts is None:
+            return self.env is Env.DEV
+        return self.kb_include_drafts
 
     @model_validator(mode="after")
     def _require_auth0_in_prod(self) -> Self:
         if self.env is Env.PROD and not (self.auth0_domain and self.auth0_audience):
             raise ValueError("AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV=prod")
+        return self
+
+    @model_validator(mode="after")
+    def _no_drafts_in_prod(self) -> Self:
+        if self.env is Env.PROD and self.kb_include_drafts:
+            raise ValueError("KB_INCLUDE_DRAFTS must not be true when ENV=prod (reviewed only)")
         return self
 
     @model_validator(mode="after")

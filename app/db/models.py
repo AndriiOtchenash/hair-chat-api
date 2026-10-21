@@ -44,6 +44,11 @@ class LLMCallStatus(StrEnum):
     FALLBACK = "fallback"
 
 
+class KBDocumentStatus(StrEnum):
+    DRAFT = "draft"
+    REVIEWED = "reviewed"
+
+
 def _pg_enum(enum_cls: type[StrEnum], name: str) -> Enum:
     """Native Postgres ENUM named `name`, storing the lowercase values (not member names)."""
     return Enum(enum_cls, name=name, values_callable=lambda cls: [m.value for m in cls])
@@ -144,7 +149,17 @@ class LLMCall(UUIDPkMixin, TimestampMixin, Base):
 class KBDocument(UUIDPkMixin, TimestampMixin, Base):
     __tablename__ = "kb_documents"
 
+    # File name without .md in docs/kb: the ingest's identity of an article.
+    slug: Mapped[str] = mapped_column(Text, unique=True)
     title: Mapped[str] = mapped_column(Text)
+    status: Mapped[KBDocumentStatus] = mapped_column(
+        _pg_enum(KBDocumentStatus, "kb_document_status"),
+        default=KBDocumentStatus.DRAFT,
+        server_default=KBDocumentStatus.DRAFT.value,
+    )
+    # sha256 of what the chunks are made of (app.rag.documents.content_hash): unchanged = no
+    # re-embedding on the next ingest.
+    content_hash: Mapped[str] = mapped_column(Text)
     source_url: Mapped[str | None] = mapped_column(Text)
     language: Mapped[str | None] = mapped_column(Text)
     license: Mapped[str | None] = mapped_column(Text)

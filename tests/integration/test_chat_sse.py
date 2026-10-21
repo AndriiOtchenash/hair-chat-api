@@ -16,20 +16,25 @@ import uvicorn
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.core.chat import get_conversation_locks, get_llm, get_moderator
+from app.core.chat import get_conversation_locks, get_llm, get_moderator, get_query_embedder
 from app.core.config import get_settings
 from app.core.security import get_token_verifier
 from app.db.models import ConsentType, Conversation, LLMCall, Message, MessageRole
 from app.db.repositories.conversations import SqlConversationRepository
+from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
 from app.main import create_app
+from app.rag.chunker import Chunk
+from app.rag.documents import parse_article
+from app.rag.retriever import RagQueryEmbedder
 from app.services.chat_service import ConversationLocks
 from app.services.tokens import message_tokens
 from tests.auth_fakes import FakeAuth0, SigningKey, bearer, mint
 from tests.llm_fakes import (
+    FakeEmbedder,
     FakeLLMProvider,
     FakeModerator,
     fail_before_first,
@@ -38,6 +43,7 @@ from tests.llm_fakes import (
     hang,
     stall_after,
     success,
+    text_vector,
 )
 
 KEY = SigningKey("key-1")
@@ -64,6 +70,9 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
     app.dependency_overrides[get_llm] = lambda: llm
     app.dependency_overrides[get_conversation_locks] = lambda: locks
     app.dependency_overrides[get_moderator] = lambda: moderator
+    # Never the real embeddings API (rule 1), even with GEMINI_API_KEY in the environment.
+    query_embedder = RagQueryEmbedder(FakeEmbedder())
+    app.dependency_overrides[get_query_embedder] = lambda: query_embedder
 
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
@@ -177,6 +186,7 @@ async def test_streams_tokens_then_done_and_persists_everything(live: Live) -> N
     assert "".join(str(e.data["text"]) for e in events[:3]) == "Привіт, мийте двічі на тиждень"
     done = events[-1].data
     assert (done["provider"], done["model"], done["truncated"]) == ("gemini", "flash", False)
+    assert done["sources"] == []  # no article of the fake embedder's model in the KB
 
     user_msg, assistant = await stored(conversation_id)
     assert (user_msg.role, user_msg.content) == (MessageRole.USER, "Як часто мити голову?")
@@ -479,3 +489,33 @@ async def test_long_conversation_is_summarized_after_the_answer_and_fits_the_bud
     sent = [m["content"] for m in context[1:]]
     assert all(m.content not in sent for m in folded[: upto_index + 1])
     assert sent[-1] == "Thanks!"
+
+
+async def test_done_lists_the_knowledge_base_articles_used_for_the_answer(live: Live) -> None:
+    question = "Що робити з лупою? (sse kb test)"
+    article = parse_article(
+        "sse-dandruff",
+        "---\ntitle: Перхоть\nlanguage: ru\nstatus: draft\ntopics: [dandruff]\n"
+        "license: internal\nurl: https://example.test/kb/dandruff\n---\n\n"
+        "## Уход\n\nМягкий шампунь.\n",
+    )
+    async with get_sessionmaker()() as session:
+        # The fake embedder maps the question to text_vector(question): similarity 1.0.
+        await SqlKBRepository(session).replace(
+            article,
+            [Chunk(0, "Перхоть › Уход\n\nМягкий шампунь.")],
+            [text_vector(question)],
+            model="fake-embedding",
+        )
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.primary.script(success("Мийте м'яким шампунем"))
+
+    events = await send(live, headers, conversation_id, question)
+
+    assert events[-1].event == "done"
+    assert events[-1].data["sources"] == [
+        {"title": "Перхоть", "slug": "sse-dandruff", "url": "https://example.test/kb/dandruff"}
+    ]
+    system = live.primary.received[0][0]["content"]
+    assert "Мягкий шампунь." in system

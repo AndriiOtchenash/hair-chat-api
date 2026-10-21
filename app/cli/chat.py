@@ -14,7 +14,7 @@ import uuid
 from collections.abc import AsyncIterator, Sequence
 from typing import TextIO
 
-from app.core.chat import build_moderator
+from app.core.chat import build_embedder, build_knowledge, build_moderator
 from app.core.config import Env, get_settings
 from app.db.models import ConsentType
 from app.db.repositories.consents import SqlConsentRepository
@@ -27,6 +27,7 @@ from app.db.repositories.users import SqlUserRepository
 from app.db.session import get_engine, get_sessionmaker
 from app.llm.base import Restart, Token
 from app.llm.registry import build_llm
+from app.rag.retriever import NoQueryEmbedder, RagQueryEmbedder
 from app.services.chat_service import (
     ChatDone,
     ChatError,
@@ -77,7 +78,11 @@ async def converse(
                             out.write(f"\n[restart: {reason}]\n")
                         case ChatDone():
                             flag = " (truncated)" if event.truncated else ""
-                            out.write(f"\n— {event.provider}:{event.model}{flag}\n\n")
+                            out.write(f"\n— {event.provider}:{event.model}{flag}\n")
+                            if event.sources:
+                                titles = "; ".join(s.title for s in event.sources)
+                                out.write(f"— sources: {titles}\n")
+                            out.write("\n")
                         case ChatError(code=code, message=message):
                             out.write(f"\n[error {code}: {message}]\n\n")
         except MessageBlocked as exc:
@@ -104,6 +109,7 @@ async def _main(conversation: uuid.UUID | None) -> int:
     try:
         llm = build_llm(settings, SqlLLMCallRecorder(get_sessionmaker()))
         moderator = build_moderator(settings)
+        embedder = build_embedder(settings)
         budget = context_budget(
             settings.context_budget_tokens, llm.max_context_tokens, settings.chat_max_answer_tokens
         )
@@ -125,12 +131,19 @@ async def _main(conversation: uuid.UUID | None) -> int:
             chat = ChatService(
                 conversations,
                 llm,
-                TokenBudgetContextBuilder(repo, FilePromptProvider()),
+                TokenBudgetContextBuilder(
+                    repo, FilePromptProvider(), knowledge=build_knowledge(session, settings)
+                ),
                 ConversationLocks(),
                 moderator,
                 max_answer_tokens=settings.chat_max_answer_tokens,
                 budget_tokens=budget,
                 violence_threshold=settings.moderation_violence_threshold,
+                query_embedder=(
+                    RagQueryEmbedder(embedder, timeout=settings.embedding_timeout_s)
+                    if embedder
+                    else NoQueryEmbedder()
+                ),
             )
             summarizer = Summarizer(
                 sql_conversation_repositories(get_sessionmaker()),
@@ -140,6 +153,8 @@ async def _main(conversation: uuid.UUID | None) -> int:
             )
             if not moderator.enabled:
                 print("OPENAI_API_KEY not set: moderation is off", file=sys.stderr)
+            if embedder is None:
+                print("GEMINI_API_KEY not set: no knowledge base", file=sys.stderr)
             print(f"conversation {conversation} as {DEV_AUTH_SUB}; /exit to quit", file=sys.stderr)
             await converse(chat, user.id, conversation, _stdin_lines("> "), sys.stdout, summarizer)
     except ConversationNotFound:
@@ -148,6 +163,8 @@ async def _main(conversation: uuid.UUID | None) -> int:
     finally:
         await llm.aclose()
         await moderator.aclose()
+        if embedder is not None:
+            await embedder.aclose()
         await get_engine().dispose()
     return 0
 

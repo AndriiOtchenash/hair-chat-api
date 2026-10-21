@@ -18,6 +18,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY app ./app
 COPY migrations ./migrations
 COPY alembic.ini ./
+# Knowledge-base articles, so the image can run `python -m app.rag.ingest docs/kb`.
+COPY docs/kb ./docs/kb
 
 # --- runtime stage: no uv, no build tooling ---
 FROM python:3.12-slim AS runtime
