@@ -2,7 +2,7 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
     auth0_domain: str | None = None
     auth0_audience: str | None = None
+    # Auth0 Management API (machine-to-machine app with the delete:users scope): DELETE /me also
+    # removes the Auth0 account. Unset = our data is deleted, the Auth0 account stays (warning).
+    auth0_mgmt_client_id: str | None = None
+    auth0_mgmt_client_secret: SecretStr | None = None
+    # python -m app.cli.retention deletes conversations idle (last_message_at) for longer.
+    retention_days: int = Field(default=30, gt=0)
     # Version of the consent texts shipped by the frontend; see docs/consents/README.md.
     consent_version: str = "2026-10-v1"
     # Knowledge base (RAG). One embedding model for the whole index (rule 4, ADR 0005): changing
