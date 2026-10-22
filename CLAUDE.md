@@ -26,9 +26,11 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 - Lint/types: ruff (lint + format), mypy --strict on app/
 
 ## Layout
-app/core      config, logging, security (JWT/JWKS, current_user, require_role)
+app/core      config, logging, security (JWT/JWKS, current_user, require_role), auth0_mgmt
 app/api       routers only: request/response models, no business logic
-app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor, retention
+app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor,
+              account (export/delete), retention
+app/cli       chat (dev), retention (scheduled cleanup)
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py (Moderator)
 app/rag       embeddings, chunker, documents (docs/kb frontmatter), retriever, ingest CLI
 app/db        SQLAlchemy models, repositories, session
@@ -111,6 +113,18 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `uv run python -m scripts.moderation_eval` over tests/moderation_eval/phrases.yaml.
   Accepted misses carry `known_gap: "<reason>"` (ADR 0004 Known gaps); only new ones exit 1.
 
+## Data rights (ADR 0006)
+- `GET /me/export` (JSON attachment) and `DELETE /me` `{"confirm": "DELETE"}` (204, else 422)
+  are PROTECTED, not consented: they work after consents are revoked.
+- Delete = hard `DELETE FROM users`, everything else goes by `ON DELETE CASCADE` (new user
+  data tables must cascade from users or conversations, and appear in the export). Then Auth0
+  via Management API in a background task (AUTH0_MGMT_CLIENT_ID/SECRET): not configured ->
+  warning, failed -> error log with user_id + auth_sub; our deletion is never rolled back.
+- Retention: `python -m app.cli.retention [--dry-run]`, conversations with last_message_at
+  older than RETENTION_DAYS (30) plus unlinked llm_calls as old; batches with
+  `FOR UPDATE SKIP LOCKED`, counts only in the output. No HTTP endpoint. Daily scheduled Fly
+  machine, docs/deploy.md.
+
 ## Error format (REST and SSE)
 - Every error body is `{"code": "...", "message": "..."}` (`app.core.errors.ErrorBody`), no
   `detail` wrapper. Raise `api_error(status, code, message)`; a plain HTTPException gets a code
@@ -144,6 +158,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 uv run python -m app.llm.cli "question" [--skip provider:model]   # live chain check, real APIs
 uv run python -m app.cli.chat [--conversation ID]   # dev chat as user dev|local via ChatService
+uv run python -m app.cli.retention [--dry-run]      # delete conversations idle > RETENTION_DAYS
 uv run python -m scripts.moderation_eval            # moderation eval set, real API, not in CI
 uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge base, real embeddings
 uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI

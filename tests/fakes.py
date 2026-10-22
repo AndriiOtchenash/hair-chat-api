@@ -18,6 +18,7 @@ from app.db.models import (
     UserRole,
 )
 from app.db.pagination import Cursor, Page
+from app.db.repositories.account import AccountData
 from app.db.repositories.conversations import (
     TITLE_MAX_CHARS,
     ConversationRepository,
@@ -243,3 +244,53 @@ class FakeConversationRepository:
         self.messages.append(message)
         conversation.last_message_at = now
         return message
+
+
+class FakeAccountRepository:
+    """Export and delete over the other fakes, as the cascade in Postgres would do it."""
+
+    def __init__(
+        self,
+        users: FakeUserRepository,
+        consents: FakeConsentRepository,
+        conversations: FakeConversationRepository,
+    ) -> None:
+        self.users = users
+        self.consents = consents
+        self.conversations = conversations
+
+    async def export(self, user_id: uuid.UUID) -> AccountData:
+        return AccountData(
+            consents=[c for c in self.consents.rows if c.user_id == user_id],
+            conversations=sorted(
+                (c for c in self.conversations.conversations.values() if c.user_id == user_id),
+                key=lambda c: (c.created_at, c.id),
+            ),
+            messages=[m for m in self.conversations.messages if m.user_id == user_id],
+        )
+
+    async def delete_user(self, user_id: uuid.UUID) -> bool:
+        subs = [sub for sub, u in self.users.by_sub.items() if u.id == user_id]
+        for sub in subs:
+            del self.users.by_sub[sub]
+        self.consents.rows = [c for c in self.consents.rows if c.user_id != user_id]
+        self.conversations.conversations = {
+            k: c for k, c in self.conversations.conversations.items() if c.user_id != user_id
+        }
+        self.conversations.messages = [
+            m for m in self.conversations.messages if m.user_id != user_id
+        ]
+        return bool(subs)
+
+
+class FakeIdentityProvider:
+    """Auth0 stand-in for AccountService: records deletes, or fails with `error`."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.deleted: list[str] = []
+
+    async def delete_user(self, auth_sub: str) -> None:
+        if self.error is not None:
+            raise self.error
+        self.deleted.append(auth_sub)

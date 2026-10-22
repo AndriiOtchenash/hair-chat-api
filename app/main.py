@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, Depends, FastAPI
 
 from app.api import consents, conversations, health, me
+from app.core.auth0_mgmt import get_auth0_management
 from app.core.chat import close_llm, get_moderator
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
@@ -28,6 +29,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await get_engine().dispose()
     if (verifier := get_token_verifier()) is not None:
         await verifier.aclose()
+    if (auth0 := get_auth0_management()) is not None:
+        await auth0.aclose()
 
 
 def create_app() -> FastAPI:
