@@ -1,6 +1,6 @@
 # Staging (ENV=staging): private, reachable only through Flycast; see docs/deploy.md.
 app = "hair-chat-api-stg"
-primary_region = "ams"
+primary_region = "fra"
 
 [build]
   # Dockerfile in the repo root; uvicorn listens on 0.0.0.0:8000, as Flycast requires.

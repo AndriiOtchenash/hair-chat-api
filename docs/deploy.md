@@ -4,7 +4,7 @@
 
 `fly.toml` in the repo root describes staging: `ENV=staging` (prod checks: Auth0, moderation,
 every LLM_CHAIN key and GEMINI_API_KEY are required, `app.cli.chat` refuses to run) plus
-`KB_INCLUDE_DRAFTS=true`. One `shared-cpu-1x`/512 MB machine in `ams` that suspends when idle
+`KB_INCLUDE_DRAFTS=true`. One `shared-cpu-1x`/512 MB machine in `fra` that suspends when idle
 and wakes on the next request. Migrations run as the `release_command` before each release.
 
 ### Private only: Flycast
@@ -115,7 +115,10 @@ to another host (redeploy, host migration) can get a different one, blocked or n
   `<knowledge>` (error log), and `app.rag.ingest` exits with
   `embeddings unavailable (BadRequestError:400:location_unsupported)`.
 - Checked: a temporary machine in `fra` (egress `204.93.236.11`, DE) gets answers for chat
-  (`gemini-3.5-flash-lite`) and embeddings. Probe a region without redeploying:
+  (`gemini-3.5-flash-lite`) and embeddings. Staging was moved to `fra` the same day; its app
+  machine left through yet another address (`152.233.61.3`) and works too. Moving a region:
+  `fly deploy` keeps existing machines where they are, so
+  `fly machine clone <id> --region fra`, check it, then `fly machine destroy <old id>`. Probe a region without redeploying:
 
   ```sh
   fly machine run registry.fly.io/hair-chat-api-stg:<tag> -a hair-chat-api-stg \
