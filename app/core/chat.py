@@ -18,7 +18,7 @@ from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
 from app.db.session import get_session, get_sessionmaker
 from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
-from app.llm.registry import build_llm
+from app.llm.registry import build_llm, build_providers
 from app.llm.resilient import ResilientLLM
 from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
 from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, RagKnowledge, RagQueryEmbedder
@@ -55,7 +55,7 @@ def get_llm() -> ResilientLLM:
 
 
 def build_moderator(settings: Settings) -> Moderator:
-    if settings.openai_api_key is None:  # dev only: Settings refuses prod without the key
+    if settings.openai_api_key is None:  # dev only: Settings refuses staging/prod without it
         return NoopModerator()
     return OpenAIModerator(
         api_key=settings.openai_api_key.get_secret_value(),
@@ -79,6 +79,20 @@ def build_embedder(settings: Settings) -> Embedder | None:
         api_key=settings.gemini_api_key.get_secret_value(),
         timeout=settings.embedding_timeout_s,
     )
+
+
+async def check_deployed_config(settings: Settings) -> None:
+    """staging/prod refuse to start without every LLM_CHAIN key or the embeddings key.
+
+    In dev a missing key only turns chat into 503 llm_not_configured / answers without RAG.
+    """
+    if not settings.is_deployed:
+        return
+    for provider in build_providers(settings):  # ValueError: missing key / unknown model
+        if (aclose := getattr(provider, "aclose", None)) is not None:
+            await aclose()
+    if settings.gemini_api_key is None:
+        raise ValueError(f"GEMINI_API_KEY (embeddings) is required when ENV={settings.env}")
 
 
 @lru_cache

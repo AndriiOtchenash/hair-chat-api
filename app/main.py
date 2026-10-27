@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, FastAPI
 
 from app.api import consents, conversations, health, me
 from app.core.auth0_mgmt import get_auth0_management
-from app.core.chat import close_llm, get_moderator
+from app.core.chat import check_deployed_config, close_llm, get_moderator
+from app.core.config import get_settings
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
 from app.core.security import current_user, get_token_verifier
@@ -22,6 +23,8 @@ CONSENTED_ROUTERS: tuple[APIRouter, ...] = (conversations.router,)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # Fails startup, so the Fly health check never passes and the old release keeps serving.
+    await check_deployed_config(get_settings())
     if not get_moderator().enabled:
         logger.warning("OPENAI_API_KEY not set: input moderation is off (dev only)")
     yield

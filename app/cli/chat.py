@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import TextIO
 
 from app.core.chat import build_embedder, build_knowledge, build_moderator
-from app.core.config import Env, get_settings
+from app.core.config import get_settings
 from app.db.models import ConsentType
 from app.db.repositories.consents import SqlConsentRepository
 from app.db.repositories.conversations import (
@@ -103,8 +103,10 @@ async def _stdin_lines(prompt: str) -> AsyncIterator[str]:
 
 async def _main(conversation: uuid.UUID | None) -> int:
     settings = get_settings()
-    if settings.env is Env.PROD:
-        print("app.cli.chat is dev-only and refuses to run with ENV=prod", file=sys.stderr)
+    if settings.is_deployed:
+        print(
+            f"app.cli.chat is dev-only and refuses to run with ENV={settings.env}", file=sys.stderr
+        )
         return 2
     try:
         llm = build_llm(settings, SqlLLMCallRecorder(get_sessionmaker()))

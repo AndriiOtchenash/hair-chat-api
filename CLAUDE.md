@@ -15,6 +15,12 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b.
   Prod needs a paid-tier GEMINI_API_KEY (free tier may train on prompts).
   Tests use FakeLLMProvider / FakeEmbedder (tests/llm_fakes.py) only.
+- ENV = dev | staging | prod. staging behaves like prod (AUTH0_*, OPENAI_API_KEY, every
+  LLM_CHAIN key and GEMINI_API_KEY required at startup, app.cli.chat refuses) but may set
+  KB_INCLUDE_DRAFTS=true. Staging = Fly app hair-chat-api-stg (fly.toml), Flycast only, no
+  public IPs (docs/deploy.md).
+- DATABASE_URL may be a libpq URL (Neon): Settings normalizes it to postgresql+asyncpg with
+  `ssl` from `sslmode`, other query parameters dropped; app and Alembic both read Settings.
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
   The frontend lives next to this repo in /workspaces/hair-chat-web (cloned by postCreateCommand,
