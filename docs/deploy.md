@@ -104,7 +104,7 @@ same key works from the codespace); Google rejects the Fly shared egress IP
 address evidently differs.
 
 It is that one address, not Fly or `ams` as a whole: another app of ours, `otchenashhair-warehouse`
-(also `ams`, also the Gemini API, no static egress IP: `fly machine egress-ip list` is empty), works
+(also `ams`, also the Gemini API, no static egress IP in `fly ips list`), works
 at the same time. Machines without a static egress IP leave through a shared address of the host
 they run on, so two machines in one region can get different addresses, and a machine that moves
 to another host (redeploy, host migration) can get a different one, blocked or not.
@@ -127,9 +127,10 @@ to another host (redeploy, host migration) can get a different one, blocked or n
   - another machine whose shared egress Google accepts: `fra` worked on 2026-10-27; a new `ams`
     machine on another host may work too. Free, but the address can change on any redeploy or
     host move, so after each deploy check `fly logs` for `location_unsupported`;
-  - a static egress IP (`fly machine egress-ip allocate <machine id>`, paid), probed once as
-    above: stays with the machine across deploys, so a working one keeps working. If Google
-    rejects it, release it and allocate another.
+  - a static egress IP for the app in its region
+    (`fly ips allocate-egress -a hair-chat-api-stg -r <region>`, paid), probed once as above:
+    it stays across deploys and host moves, so a working one keeps working. If Google rejects
+    it, `fly ips release-egress` it and allocate another.
   The egress geolocation is outside our control either way; the fallback to Groq keeps the chat
   answering, but without the knowledge base.
 - Prod: plan Gemini via **Vertex AI in an EU region** (`europe-west1/3/4`): regional endpoints,
