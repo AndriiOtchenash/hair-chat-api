@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from dataclasses import asdict, replace
 
@@ -227,11 +228,27 @@ async def test_400_is_not_retried(recorder: FakeLLMCallRecorder) -> None:
 
 async def test_invalid_key_reported_as_400_falls_back() -> None:
     primary = FakeLLMProvider("gemini", "flash").script(
-        fail_before_first(ProviderHTTPError(400, "BadRequestError", invalid_api_key=True))
+        fail_before_first(ProviderHTTPError(400, "BadRequestError", reason="invalid_api_key"))
     )
     backup = FakeLLMProvider("groq", "oss").script(success("ok"))
 
     assert text_of(await collect(make_llm(primary, backup))) == "ok"
+
+
+async def test_unsupported_location_400_falls_back_and_logs_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(
+        fail_before_first(ProviderHTTPError(400, "BadRequestError", reason="location_unsupported"))
+    )
+    backup = FakeLLMProvider("groq", "oss").script(success("ok"))
+
+    with caplog.at_level(logging.WARNING):
+        assert text_of(await collect(make_llm(primary, backup))) == "ok"
+
+    [failure] = [r for r in caplog.records if "llm attempt failed" in r.getMessage()]
+    assert failure.levelno == logging.ERROR
+    assert "location_unsupported" in failure.getMessage()
 
 
 async def test_400_does_not_count_towards_cooldown() -> None:

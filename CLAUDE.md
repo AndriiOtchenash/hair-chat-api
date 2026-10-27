@@ -190,7 +190,8 @@ event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as RE
 : ping                                     # keep-alive comment every 15 s while idle (FastAPI)
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
 - sources = knowledge-base articles that were in the context of this answer (may be empty).
-- error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400),
+- error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400; not Gemini's bad-key / unsupported-location 400s,
+  which fall back like 401/403: `app.llm.base.provider_side_400`),
   internal_error. The user's message is kept in every case.
 - safety_notice comes at most once, before any token/restart/done/error, when moderation
   marked the message soft (ADR 0004).

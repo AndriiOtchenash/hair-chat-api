@@ -59,7 +59,8 @@ class RagQueryEmbedder:
             async with asyncio.timeout(self._timeout):
                 vectors = await self._embedder.embed([text])
         except EmbeddingUnavailable as exc:
-            logger.warning("embeddings unavailable, answering without knowledge: code=%s", exc.code)
+            log = logger.error if exc.misconfigured else logger.warning
+            log("embeddings unavailable, answering without knowledge: code=%s", exc.code)
             return None
         except TimeoutError:
             logger.warning("embeddings unavailable, answering without knowledge: code=timeout")
