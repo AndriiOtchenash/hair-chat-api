@@ -42,8 +42,9 @@ def link_key(provider: str, model: str) -> str:
 class ProviderError(Exception):
     """A provider call failed. `code` is safe to log and store: never request or response text.
 
-    retryable: another provider may succeed (network, timeout, 408/429/5xx, 401/403).
-    misconfigured: our side of this provider is wrong (key, permissions) -> logged as error.
+    retryable: another provider may succeed (network, timeout, 408/429/5xx, 401/403, provider-side
+    400s from `provider_side_400`).
+    misconfigured: our side of this provider is wrong (key, permissions, region) -> logged as error.
     """
 
     def __init__(self, code: str, *, retryable: bool = True, misconfigured: bool = False) -> None:
@@ -76,15 +77,35 @@ NON_RETRYABLE_STATUSES = frozenset({400, 413, 422})
 MISCONFIGURED_STATUSES = frozenset({401, 403, 404})
 
 
+def provider_side_400(status: int, body: object) -> str | None:
+    """Reason when a 400 is the provider's setup, not our request (Gemini has no other status
+    for these), so the next link may still answer:
+
+    - invalid_api_key: "Please pass a valid API key" (INVALID_ARGUMENT);
+    - location_unsupported: "User location is not supported for the API use."
+      (FAILED_PRECONDITION), e.g. a Fly egress IP Google places outside supported regions.
+
+    The body text is only matched here, never logged or stored.
+    """
+    if status != 400:
+        return None
+    text = str(body).lower()
+    if "failed_precondition" in text or "location is not supported" in text:
+        return "location_unsupported"
+    if "api key" in text:
+        return "invalid_api_key"
+    return None
+
+
 class ProviderHTTPError(ProviderError):
     def __init__(
-        self, status: int, error_class: str = "HTTPError", *, invalid_api_key: bool = False
+        self, status: int, error_class: str = "HTTPError", *, reason: str | None = None
     ) -> None:
-        # invalid_api_key: a bad key reported with a non-auth status (Gemini answers 400).
+        # reason: a provider-side failure reported as 400 (`provider_side_400`): like 401/403.
         super().__init__(
-            f"{error_class}:{status}" + (":invalid_api_key" if invalid_api_key else ""),
-            retryable=invalid_api_key or status not in NON_RETRYABLE_STATUSES,
-            misconfigured=invalid_api_key or status in MISCONFIGURED_STATUSES,
+            f"{error_class}:{status}" + (f":{reason}" if reason else ""),
+            retryable=reason is not None or status not in NON_RETRYABLE_STATUSES,
+            misconfigured=reason is not None or status in MISCONFIGURED_STATUSES,
         )
         self.status = status
 

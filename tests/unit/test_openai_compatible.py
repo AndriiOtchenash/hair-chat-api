@@ -283,3 +283,40 @@ async def test_gemini_invalid_key_400_is_misconfiguration_not_bad_request() -> N
     err = exc_info.value
     assert err.code == "BadRequestError:400:invalid_api_key"
     assert err.retryable and err.misconfigured
+
+
+# Real Gemini body from a Fly machine in ams (2026-10-27).
+GEMINI_LOCATION_BODY = [
+    {
+        "error": {
+            "code": 400,
+            "message": "User location is not supported for the API use.",
+            "status": "FAILED_PRECONDITION",
+        }
+    }
+]
+
+
+async def test_gemini_unsupported_location_400_is_misconfiguration_not_bad_request() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(400, json=GEMINI_LOCATION_BODY)
+
+    with pytest.raises(ProviderHTTPError) as exc_info:
+        await collect(provider(handler))
+
+    err = exc_info.value
+    assert err.code == "BadRequestError:400:location_unsupported"
+    assert err.retryable and err.misconfigured
+
+
+async def test_other_400_stays_our_bad_request() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = {"error": {"message": "max_tokens is too large", "status": "INVALID_ARGUMENT"}}
+        return httpx2.Response(400, json=body)
+
+    with pytest.raises(ProviderHTTPError) as exc_info:
+        await collect(provider(handler))
+
+    err = exc_info.value
+    assert err.code == "BadRequestError:400"
+    assert not err.retryable and not err.misconfigured

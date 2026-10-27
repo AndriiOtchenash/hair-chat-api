@@ -17,8 +17,8 @@ link can take over with the same full context. Each SDK per provider would multi
   Initial chain: `gemini:gemini-3.8-flash, gemini:gemini-3.5-flash-lite, groq:openai/gpt-oss-120b`
   (pinned versions, not `*-latest` aliases). Thinking models run with `reasoning_effort=low`.
 - **Fallback (ResilientLLM)** on connect / first-token / read timeouts, dropped connections,
-  408/429/5xx, 401/403/404 (link misconfigured, logged as error; includes Gemini's bad-key 400,
-  recognised by its message). **No fallback** on 400/413/422: our request is wrong, every
+  408/429/5xx, 401/403/404 (link misconfigured, logged as error; includes Gemini's bad-key and
+  unsupported-location (FAILED_PRECONDITION, 2026-10-27) 400s, recognised by their message). **No fallback** on 400/413/422: our request is wrong, every
   provider would reject it. A failure after the first token emits `Restart`, then the next link
   generates the full answer.
 - SDK retries are off (`max_retries=0`): the chain owns the retry policy.

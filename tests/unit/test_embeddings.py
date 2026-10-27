@@ -103,6 +103,56 @@ async def test_failures_become_embedding_unavailable(response: httpx2.Response, 
 
 
 @pytest.mark.parametrize(
+    ("response", "code", "misconfigured"),
+    [
+        (
+            httpx2.Response(
+                400,
+                json=[
+                    {
+                        "error": {
+                            "code": 400,
+                            "message": "User location is not supported for the API use.",
+                            "status": "FAILED_PRECONDITION",
+                        }
+                    }
+                ],
+            ),
+            "BadRequestError:400:location_unsupported",
+            True,
+        ),
+        (
+            httpx2.Response(400, json={"error": {"message": "Please pass a valid API key"}}),
+            "BadRequestError:400:invalid_api_key",
+            True,
+        ),
+        (
+            httpx2.Response(403, json={"error": {"message": "denied"}}),
+            "PermissionDeniedError:403",
+            True,
+        ),
+        (
+            httpx2.Response(400, json={"error": {"message": "too long"}}),
+            "BadRequestError:400",
+            False,
+        ),
+        (
+            httpx2.Response(503, json={"error": {"message": "down"}}),
+            "InternalServerError:503",
+            False,
+        ),
+    ],
+)
+async def test_provider_side_failures_are_misconfiguration(
+    response: httpx2.Response, code: str, misconfigured: bool
+) -> None:
+    with pytest.raises(EmbeddingUnavailable) as exc:
+        await embedder(lambda request: response).embed(["a"])
+
+    assert (exc.value.code, exc.value.misconfigured) == (code, misconfigured)
+
+
+@pytest.mark.parametrize(
     ("error", "code"),
     [(httpx2.ReadTimeout("slow"), "timeout"), (httpx2.ConnectError("refused"), "connection_error")],
 )

@@ -113,7 +113,7 @@ class OpenAIModerator:
 
 
 class NoopModerator:
-    """No OPENAI_API_KEY (dev only; prod refuses to start): every message passes unchecked."""
+    """No OPENAI_API_KEY (dev only; staging/prod refuse to start): messages pass unchecked."""
 
     enabled = False
 

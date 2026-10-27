@@ -11,17 +11,24 @@ from typing import Protocol
 import httpx2
 import openai
 
+from app.llm.base import MISCONFIGURED_STATUSES, provider_side_400
+
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # Inputs per /embeddings request; Gemini accepts up to 100.
 MAX_BATCH = 100
 
 
 class EmbeddingUnavailable(Exception):
-    """The embedding call failed. `code` is safe to log (no request or response text)."""
+    """The embedding call failed. `code` is safe to log (no request or response text).
 
-    def __init__(self, code: str) -> None:
+    misconfigured: our side is wrong (key, permissions, region: 401/403/404 or a provider-side
+    400) -> logged as error; it will not heal by itself.
+    """
+
+    def __init__(self, code: str, *, misconfigured: bool = False) -> None:
         super().__init__(code)
         self.code = code
+        self.misconfigured = misconfigured
 
 
 class Embedder(Protocol):
@@ -85,7 +92,11 @@ class OpenAICompatibleEmbedder:
                 encoding_format="float",
             )
         except openai.APIStatusError as exc:
-            raise EmbeddingUnavailable(f"{type(exc).__name__}:{exc.status_code}") from exc
+            reason = provider_side_400(exc.status_code, exc.body)
+            raise EmbeddingUnavailable(
+                f"{type(exc).__name__}:{exc.status_code}" + (f":{reason}" if reason else ""),
+                misconfigured=reason is not None or exc.status_code in MISCONFIGURED_STATUSES,
+            ) from exc
         except openai.APITimeoutError as exc:
             raise EmbeddingUnavailable("timeout") from exc
         except openai.APIConnectionError as exc:

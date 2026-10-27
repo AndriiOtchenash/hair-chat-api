@@ -2,7 +2,11 @@ import io
 import uuid
 from collections.abc import AsyncIterator
 
+import pytest
+
+from app.cli import chat as chat_cli
 from app.cli.chat import converse
+from app.core.config import Settings
 from app.db.models import MessageRole
 from app.llm.base import ProviderHTTPError, StreamBroken
 from tests.fakes import StaticPrompt
@@ -99,3 +103,15 @@ async def test_summarizer_runs_after_an_answer_whose_context_overflowed() -> Non
 
     # The first answer had everything in context; the second had to leave messages out.
     assert summarizer.runs == [conversation_id]
+
+
+async def test_refuses_to_run_outside_dev(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = Settings(
+        _env_file=None, env="staging", auth0_domain="t", auth0_audience="a", openai_api_key="k"
+    )
+    monkeypatch.setattr(chat_cli, "get_settings", lambda: settings)
+
+    assert await chat_cli._main(None) == 2
+    assert "ENV=staging" in capsys.readouterr().err

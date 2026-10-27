@@ -2,13 +2,30 @@ from enum import StrEnum
 from functools import lru_cache
 from typing import Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 
 class Env(StrEnum):
     DEV = "dev"
+    # Behaves like prod (keys required, moderation on, no dev CLI) but may search draft articles.
+    STAGING = "staging"
     PROD = "prod"
+
+
+def normalize_database_url(url: str) -> str:
+    """A libpq URL (Neon: postgresql://...?sslmode=require&channel_binding=require) for asyncpg.
+
+    asyncpg rejects libpq-only query parameters, so only `ssl` survives (from `sslmode`).
+    """
+    parsed = make_url(url)
+    query = dict(parsed.query)
+    ssl = query.get("ssl", query.get("sslmode"))
+    parsed = parsed.set(
+        drivername="postgresql+asyncpg", query={"ssl": ssl} if isinstance(ssl, str) else {}
+    )
+    return parsed.render_as_string(hide_password=False)
 
 
 class Settings(BaseSettings):
@@ -41,7 +58,7 @@ class Settings(BaseSettings):
     # violence / violence/graphic block only at this score (or with harassment/threatening):
     # burns and bleeding scalps are hair-care topics, not violence (ADR 0004).
     moderation_violence_threshold: float = 0.9
-    # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required in prod.
+    # Auth0 tenant domain (e.g. hair-chat.eu.auth0.com) and API identifier; required outside dev.
     auth0_domain: str | None = None
     auth0_audience: str | None = None
     # Auth0 Management API (machine-to-machine app with the delete:users scope): DELETE /me also
@@ -65,8 +82,13 @@ class Settings(BaseSettings):
     kb_min_similarity: float = 0.60
     # Tokens of the <knowledge> block at most.
     kb_max_tokens: int = 1500
-    # Search draft articles too; empty = yes in dev, no in prod (prod refuses true).
+    # Search draft articles too; empty = yes in dev only (prod refuses true, staging allows it).
     kb_include_drafts: bool | None = None
+
+    @property
+    def is_deployed(self) -> bool:
+        """staging or prod: real users' keys and checks are mandatory."""
+        return self.env is not Env.DEV
 
     @property
     def kb_drafts_searched(self) -> bool:
@@ -74,10 +96,17 @@ class Settings(BaseSettings):
             return self.env is Env.DEV
         return self.kb_include_drafts
 
+    @field_validator("database_url")
+    @classmethod
+    def _asyncpg_database_url(cls, value: str) -> str:
+        return normalize_database_url(value)
+
     @model_validator(mode="after")
-    def _require_auth0_in_prod(self) -> Self:
-        if self.env is Env.PROD and not (self.auth0_domain and self.auth0_audience):
-            raise ValueError("AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV=prod")
+    def _require_auth0_when_deployed(self) -> Self:
+        if self.is_deployed and not (self.auth0_domain and self.auth0_audience):
+            raise ValueError(
+                "AUTH0_DOMAIN and AUTH0_AUDIENCE are required when ENV is staging or prod"
+            )
         return self
 
     @model_validator(mode="after")
@@ -87,9 +116,11 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _require_moderation_in_prod(self) -> Self:
-        if self.env is Env.PROD and self.openai_api_key is None:
-            raise ValueError("OPENAI_API_KEY (input moderation) is required when ENV=prod")
+    def _require_moderation_when_deployed(self) -> Self:
+        if self.is_deployed and self.openai_api_key is None:
+            raise ValueError(
+                "OPENAI_API_KEY (input moderation) is required when ENV is staging or prod"
+            )
         return self
 
 

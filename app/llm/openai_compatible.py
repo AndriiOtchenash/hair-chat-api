@@ -22,6 +22,7 @@ from app.llm.base import (
     ProviderTimeout,
     StreamBroken,
     StreamEnd,
+    provider_side_400,
 )
 
 
@@ -110,7 +111,9 @@ class OpenAICompatibleProvider:
             )
         except openai.APIStatusError as exc:
             raise ProviderHTTPError(
-                exc.status_code, type(exc).__name__, invalid_api_key=_is_invalid_api_key(exc)
+                exc.status_code,
+                type(exc).__name__,
+                reason=provider_side_400(exc.status_code, exc.body),
             ) from exc
         except openai.APITimeoutError as exc:
             raise (StreamBroken("stream_timeout") if started else ProviderTimeout()) from exc
@@ -119,12 +122,3 @@ class OpenAICompatibleProvider:
         except openai.APIError as exc:
             # An `error` object inside the SSE stream (provider-side failure after HTTP 200).
             raise ProviderError("stream_error") from exc
-
-
-def _is_invalid_api_key(exc: openai.APIStatusError) -> bool:
-    """Gemini's OpenAI endpoint answers a bad key with 400 INVALID_ARGUMENT, no machine-readable
-    reason, only the message "Please pass a valid API key". Without this check a broken Gemini
-    key would count as our bad request and block the fallback. The text is only matched here,
-    never logged or stored.
-    """
-    return exc.status_code == 400 and "api key" in str(exc.body).lower()

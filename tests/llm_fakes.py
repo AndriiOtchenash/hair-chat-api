@@ -166,7 +166,7 @@ def text_vector(text: str, dim: int = EMBEDDING_DIM) -> list[float]:
 class FakeEmbedder:
     """Embedder with deterministic vectors: `vectors[text]` if given, else text_vector(text).
 
-    fail: raise EmbeddingUnavailable on every call; hang: never answer (for timeouts);
+    fail: raise EmbeddingUnavailable on every call (`error` if given); hang: never answer;
     wait_for: answer only after this event is set (to prove calls run in parallel).
     """
 
@@ -176,12 +176,14 @@ class FakeEmbedder:
         vectors: dict[str, list[float]] | None = None,
         *,
         fail: bool = False,
+        error: EmbeddingUnavailable | None = None,
         hang: bool = False,
         wait_for: asyncio.Event | None = None,
     ) -> None:
         self.model = model
         self.vectors = vectors or {}
-        self.fail = fail
+        self.fail = fail or error is not None
+        self.error = error
         self.hang = hang
         self.wait_for = wait_for
         self.calls = 0
@@ -201,7 +203,7 @@ class FakeEmbedder:
             self.cancelled = True
             raise
         if self.fail:
-            raise EmbeddingUnavailable("timeout")
+            raise self.error or EmbeddingUnavailable("timeout")
         self.embedded.extend(texts)
         return [self.vectors.get(t) or text_vector(t) for t in texts]
 

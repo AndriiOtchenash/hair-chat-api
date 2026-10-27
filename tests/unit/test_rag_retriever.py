@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from app.db.repositories.kb import KBHit
+from app.rag.embeddings import EmbeddingUnavailable
 from app.rag.retriever import QueryEmbedding, RagKnowledge, RagQueryEmbedder, Source
 from app.services.tokens import estimate_tokens
 from tests.llm_fakes import FakeEmbedder
@@ -141,3 +142,17 @@ async def test_embeddings_down_means_none_and_a_warning_without_the_text(
     assert query is None
     assert "embeddings unavailable" in caplog.text
     assert "секретный вопрос" not in caplog.text
+
+
+async def test_misconfigured_embeddings_are_logged_as_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = EmbeddingUnavailable("BadRequestError:400:location_unsupported", misconfigured=True)
+
+    with caplog.at_level(logging.WARNING):
+        query = await RagQueryEmbedder(FakeEmbedder(error=error)).embed_query("вопрос")
+
+    assert query is None
+    [record] = caplog.records
+    assert record.levelno == logging.ERROR
+    assert "location_unsupported" in record.getMessage()
