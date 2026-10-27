@@ -93,6 +93,38 @@ fly logs -a hair-chat-api-stg                  # live; --no-tail for recent line
 fly status -a hair-chat-api-stg                # machines, health checks, release
 ```
 
+## Known issues
+
+### Gemini: "User location is not supported" from Fly `ams` (2026-10-27)
+
+From the staging machine in `ams` every Gemini call (chat and embeddings) answers
+`400 FAILED_PRECONDITION: User location is not supported for the API use.` The key is fine (the
+same key works from the codespace); Google rejects the Fly shared egress IP
+(`216.246.119.90`, AS30081, which ipinfo places in Amsterdam, NL), so its own geolocation of that
+range evidently differs. Shared egress IPs belong to the region and may change without notice.
+
+- Effect: the `gemini:*` links fail -> since `fix: provider-side 400s`, ResilientLLM falls back
+  to `groq:openai/gpt-oss-120b` and logs `llm attempt failed ... code=BadRequestError:400:location_unsupported`
+  at error level (then the link cools down). Embeddings fail the same way: answers go without
+  `<knowledge>` (error log), and `app.rag.ingest` exits with
+  `embeddings unavailable (BadRequestError:400:location_unsupported)`.
+- Checked: a temporary machine in `fra` (egress `204.93.236.11`, DE) gets answers for chat
+  (`gemini-3.5-flash-lite`) and embeddings. Probe a region without redeploying:
+
+  ```sh
+  fly machine run registry.fly.io/hair-chat-api-stg:<tag> -a hair-chat-api-stg \
+    --region fra --vm-size shared-cpu-1x --rm --restart no -- python -c "<probe>"
+  fly logs -a hair-chat-api-stg --machine <id> --no-tail
+  ```
+
+- Workarounds for staging: run in a region whose egress Google accepts (`fra` today), or a static
+  egress IP (`fly machine egress-ip allocate`, paid) checked the same way. Neither is guaranteed
+  to last: the egress geolocation is outside our control.
+- Prod: plan Gemini via **Vertex AI in an EU region** (`europe-west1/3/4`): regional endpoints,
+  no AI Studio location check, data processed in the EU, service-account auth instead of an API
+  key. That changes the LLM and embedding providers (endpoint, auth, possibly the embedding
+  model name -> re-ingest), so it needs its own ADR before prod. Not started.
+
 ## Daily retention cleanup on Fly.io (ADR 0006)
 
 `python -m app.cli.retention` deletes conversations idle for longer than `RETENTION_DAYS`
