@@ -101,7 +101,13 @@ From the staging machine in `ams` every Gemini call (chat and embeddings) answer
 `400 FAILED_PRECONDITION: User location is not supported for the API use.` The key is fine (the
 same key works from the codespace); Google rejects the Fly shared egress IP
 (`216.246.119.90`, AS30081, which ipinfo places in Amsterdam, NL), so its own geolocation of that
-range evidently differs. Shared egress IPs belong to the region and may change without notice.
+address evidently differs.
+
+It is that one address, not Fly or `ams` as a whole: another app of ours, `otchenashhair-warehouse`
+(also `ams`, also the Gemini API, no static egress IP: `fly machine egress-ip list` is empty), works
+at the same time. Machines without a static egress IP leave through a shared address of the host
+they run on, so two machines in one region can get different addresses, and a machine that moves
+to another host (redeploy, host migration) can get a different one, blocked or not.
 
 - Effect: the `gemini:*` links fail -> since `fix: provider-side 400s`, ResilientLLM falls back
   to `groq:openai/gpt-oss-120b` and logs `llm attempt failed ... code=BadRequestError:400:location_unsupported`
@@ -117,9 +123,15 @@ range evidently differs. Shared egress IPs belong to the region and may change w
   fly logs -a hair-chat-api-stg --machine <id> --no-tail
   ```
 
-- Workarounds for staging: run in a region whose egress Google accepts (`fra` today), or a static
-  egress IP (`fly machine egress-ip allocate`, paid) checked the same way. Neither is guaranteed
-  to last: the egress geolocation is outside our control.
+- Workarounds for staging:
+  - another machine whose shared egress Google accepts: `fra` worked on 2026-10-27; a new `ams`
+    machine on another host may work too. Free, but the address can change on any redeploy or
+    host move, so after each deploy check `fly logs` for `location_unsupported`;
+  - a static egress IP (`fly machine egress-ip allocate <machine id>`, paid), probed once as
+    above: stays with the machine across deploys, so a working one keeps working. If Google
+    rejects it, release it and allocate another.
+  The egress geolocation is outside our control either way; the fallback to Groq keeps the chat
+  answering, but without the knowledge base.
 - Prod: plan Gemini via **Vertex AI in an EU region** (`europe-west1/3/4`): regional endpoints,
   no AI Studio location check, data processed in the EU, service-account auth instead of an API
   key. That changes the LLM and embedding providers (endpoint, auth, possibly the embedding
