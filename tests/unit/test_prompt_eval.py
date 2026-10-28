@@ -1,9 +1,12 @@
 import io
 from collections.abc import Sequence
 
+import pytest
+
 from app.core.config import Settings
 from app.llm.base import ProviderHTTPError
 from app.llm.resilient import ResilientLLM
+from app.rag.retriever import Knowledge, Source
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts import prompt_eval
 from tests.llm_fakes import FakeLLMCallRecorder, FakeLLMProvider, fail_before_first, success
@@ -111,3 +114,61 @@ async def test_the_kb_used_tag_is_cut_out_and_checked_against_the_case() -> None
     assert "!! has a <kb_used> tag" in out
     assert "!! has no <kb_used> tag" not in out
     assert "2 answers, 1 with !! flags, 0 errors" in out
+
+
+async def test_kb_case_without_passages_is_unsure_not_flagged() -> None:
+    provider = FakeLLMProvider("groq", "oss").script(success("Мойте мягким шампунем."))
+
+    code, out = await run(provider, case(id="kb", kb_used=True))
+
+    assert code == 0
+    assert "kb_context: off (--no-kb)\n" in out
+    assert "?? no kb context" in out
+    assert "\n!! " not in out
+    assert "1 answers, 0 with !! flags, 0 errors, 1 with ?? (could not be judged)" in out
+
+
+async def test_kb_context_lists_the_passages_and_the_reminder_follows_them() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(
+        success("Мойте мягким шампунем.", '<kb_used ids="2"/>')
+    )
+    knowledge = Knowledge(
+        "[1] Перхоть › Уход\nМягкий шампунь.\n\n[2] Мытьё › Частота\nПо мере загрязнения.",
+        (Source("Перхоть", "dandruff", None), Source("Как часто мыть", "washing-frequency", None)),
+    )
+    prompt = await FilePromptProvider().get_active()
+    chat = prompt_eval.messages(prompt, case(), knowledge)
+    kb = prompt_eval.KbContext(knowledge)
+    result = await prompt_eval.answer(
+        factory(provider)(Settings(), ()), chat, 100, case(kb_used=True), knowledge
+    )
+    out = io.StringIO()
+    prompt_eval.report(case(), kb, result, out)
+
+    assert prompt.knowledge_reminder is not None
+    assert chat[0]["content"].endswith("</knowledge>\n\n" + prompt.knowledge_reminder)
+    assert "kb_context: 2 — [1] Перхоть; [2] Как часто мыть\n" in out.getvalue()
+    assert "kb_used: 2\nsources: washing-frequency\n" in out.getvalue()
+    assert result.flagged == [] and result.unsure == []
+
+
+def test_kb_context_shows_the_embeddings_error() -> None:
+    kb = prompt_eval.KbContext(error="embeddings: EmbeddingUnavailable: timeout")
+
+    assert kb.describe() == "0 — ERROR embeddings: EmbeddingUnavailable: timeout"
+
+
+def test_link_skips_every_other_link_of_the_chain() -> None:
+    chain = "gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b"
+
+    assert prompt_eval.skip_all_but("gemini:gemini-3.5-flash-lite", chain) == [
+        "gemini:gemini-3.8-flash",
+        "groq:openai/gpt-oss-120b",
+    ]
+    with pytest.raises(ValueError, match="not in LLM_CHAIN"):
+        prompt_eval.skip_all_but("mistral:small", chain)
+
+
+def test_link_and_skip_cannot_be_combined() -> None:
+    with pytest.raises(SystemExit):
+        prompt_eval.main(["--link", "groq:openai/gpt-oss-120b", "--skip", "gemini:x"])

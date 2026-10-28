@@ -1,7 +1,12 @@
 from pathlib import Path
 
 import app.services.prompts as prompts
-from app.services.prompts import PROMPT_VERSION, SUMMARY_PROMPT, FilePromptProvider
+from app.services.prompts import (
+    KNOWLEDGE_REMINDER_MARKER,
+    PROMPT_VERSION,
+    SUMMARY_PROMPT,
+    FilePromptProvider,
+)
 
 PROMPTS_DIR = Path(prompts.__file__).parent
 
@@ -10,7 +15,11 @@ async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
     assert prompt.version == PROMPT_VERSION == "system_v6"
-    assert prompt.text == (PROMPTS_DIR / "system_v6.md").read_text(encoding="utf-8").strip()
+    shipped = (PROMPTS_DIR / "system_v6.md").read_text(encoding="utf-8")
+    text, marker, reminder = shipped.partition(KNOWLEDGE_REMINDER_MARKER)
+    assert marker
+    assert prompt.text == text.strip()
+    assert prompt.knowledge_reminder == reminder.strip()
 
 
 async def test_shipped_versions_stay_loadable() -> None:
@@ -132,3 +141,19 @@ async def test_answers_based_on_passages_end_with_the_kb_used_tag() -> None:
     assert '<kb_used ids="1,3"/>' in text
     assert "if you used no passage, or there is no <knowledge> block, do not add the tag" in text
     assert "never mention the tag or the passage numbers" in text
+
+
+async def test_older_prompts_have_no_knowledge_reminder() -> None:
+    prompt = await FilePromptProvider("system_v5").get_active()
+
+    assert prompt.knowledge_reminder is None
+    assert KNOWLEDGE_REMINDER_MARKER not in prompt.text
+
+
+async def test_the_knowledge_reminder_repeats_the_kb_used_rule() -> None:
+    reminder = (await FilePromptProvider().get_active()).knowledge_reminder
+
+    assert reminder is not None
+    assert '<kb_used ids="..."/>' in reminder
+    assert "add no tag" in reminder
+    assert "never mention the tag" in reminder.lower()
