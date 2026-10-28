@@ -21,6 +21,10 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   public IPs (docs/deploy.md).
 - DATABASE_URL may be a libpq URL (Neon): Settings normalizes it to postgresql+asyncpg with
   `ssl` from `sslmode`, other query parameters dropped; app and Alembic both read Settings.
+- DB engine (app/db/session.py): asyncpg command/connect timeout DB_COMMAND_TIMEOUT_S (10),
+  pool_recycle DB_POOL_RECYCLE_S (240), own ping on checkout instead of pool_pre_ping (that one
+  lets a ping timeout reach the request): a dead or hung pooled connection invalidates the pool
+  and the request runs on a fresh one (tests/integration/test_db_pool_recovery.py).
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
   The frontend lives next to this repo in /workspaces/hair-chat-web (cloned by postCreateCommand,

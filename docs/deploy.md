@@ -4,8 +4,9 @@
 
 `fly.toml` in the repo root describes staging: `ENV=staging` (prod checks: Auth0, moderation,
 every LLM_CHAIN key and GEMINI_API_KEY are required, `app.cli.chat` refuses to run) plus
-`KB_INCLUDE_DRAFTS=true`. One `shared-cpu-1x`/512 MB machine in `fra` that suspends when idle
-and wakes on the next request. Migrations run as the `release_command` before each release.
+`KB_INCLUDE_DRAFTS=true`. One `shared-cpu-1x`/512 MB machine in `fra` that stops when idle
+and starts on the next request (a cold start of a few seconds). Not `suspend`: a resumed memory
+snapshot keeps the pool's dead DB sockets, and requests on them hung until nginx's 504. Migrations run as the `release_command` before each release.
 
 ### Private only: Flycast
 
@@ -27,7 +28,7 @@ fly ips list -a hair-chat-api-stg   # only "private ingress" v6, nothing public
 Reach it from the codespace:
 
 ```sh
-# Through Flycast (port 80 -> internal 8000; wakes a suspended machine): http://localhost:8000/health
+# Through Flycast (port 80 -> internal 8000; starts a stopped machine): http://localhost:8000/health
 fly proxy 8000:80 hair-chat-api-stg.flycast -a hair-chat-api-stg
 # or, with a WireGuard peer (fly wireguard create): http://hair-chat-api-stg.flycast/health
 ```
@@ -69,7 +70,7 @@ passes and the deploy fails.
 After a deploy that changed `docs/kb` (the image carries the articles):
 
 ```sh
-fly machine list -a hair-chat-api-stg          # wake a suspended one: fly machine start <id>
+fly machine list -a hair-chat-api-stg          # start a stopped one: fly machine start <id>
 fly ssh console -a hair-chat-api-stg -C "python -m app.rag.ingest docs/kb"
 ```
 

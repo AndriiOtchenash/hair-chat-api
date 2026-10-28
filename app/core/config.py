@@ -36,6 +36,11 @@ class Settings(BaseSettings):
 
     env: Env = Env.DEV
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/hair_chat"
+    # Per statement and per connect: a pooled connection that died during a Fly suspend hangs
+    # instead of failing; past this it is dropped and the pool reconnects (app/db/session.py).
+    db_command_timeout_s: float = Field(default=10.0, gt=0)
+    # Pooled connections older than this are replaced on checkout (Neon/proxies drop idle ones).
+    db_pool_recycle_s: int = Field(default=240, gt=0)
     # "provider:model,provider:model,...", priority order; models are listed in app/llm/registry.py.
     llm_chain: str = "gemini:gemini-3.8-flash,gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b"
     llm_connect_timeout_s: float = 5.0
