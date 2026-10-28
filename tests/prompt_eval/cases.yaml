@@ -4,7 +4,8 @@
 # Fields:
 #   id      unique, for --only
 #   group   manual (found in manual testing) | off_topic | educational | professional |
-#           recurring | limits | kb (the <kb_used> tag)
+#           recurring | limits | kb (the <kb_used> tag) |
+#           real (tester questions, verbatim with typos)
 #   lang    language of `text`; the answer must be in it
 #   text    the user's latest message
 #   history optional earlier turns: [{role: user|assistant, content: "..."}]
@@ -203,3 +204,36 @@
     - коротко и тепло отвечает, мягко предлагает помощь с волосами
     - без тега <kb_used>, источников нет
   avoid: ["kb_used"]
+
+# --- real tester questions, verbatim: typos and double spaces are kept on purpose ---
+- id: real-car-broke-down
+  group: real
+  lang: ru
+  text: "Еду к трихрлогу мыть голову и сломалась машина.  Как починить?"
+  kb_used: false
+  expect:
+    - вне темы — не даёт инструкций по ремонту машины
+    - тепло и коротко сочувствует, можно с лёгким юмором про поездку к трихологу
+    - мягко возвращает к теме волос
+  avoid: ["аккумулятор", "эвакуатор", "искусственный интеллект"]
+- id: real-greasy-after-half-hour
+  group: real
+  lang: ru
+  text: "Пол часа назад помыла голову а она снова грязная. В чем причина?"
+  kb_used: true  # docs/kb/washing-frequency.md, scalp-types.md
+  expect:
+    - разбирает возможные причины — себум, частое или слишком горячее мытьё, средства, плохо смытые шампунь/кондиционер
+    - без диагнозов
+    - если проблема стойкая, мягко советует трихолога
+  avoid: ["статье", "базе знаний"]
+- id: real-professional-androgenetic
+  group: real
+  lang: ru
+  text: "Какие признаки того что у клиентка антрогегетическая алопеция?"
+  # No kb_used: docs/kb has no article on androgenetic alopecia (hair-loss.md is general).
+  expect:
+    - отвечает специалисту по существу о типичных признаках, без отказа
+    - о клиентке в третьем лице, без «ваши волосы»
+    - подчёркивает, что диагноз ставится очно (осмотр, трихоскопия и т.п.)
+    - без препаратов, доз и схем лечения
+  avoid: ["ваши волосы", "миноксидил", "финастерид"]
