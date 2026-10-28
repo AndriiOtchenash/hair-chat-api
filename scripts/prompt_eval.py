@@ -4,8 +4,10 @@
                                          [--skip PROVIDER:MODEL ...] [--file PATH]
 
 Sends only our own questions from the YAML file, never user data. Not run in CI (real APIs, and
-the verdict is a human one): each answer is printed with the case's `expect` list, the sources
-that would go under it, and `!!` for every `avoid` substring found in it.
+the verdict is a human one): each answer is printed with the case's `expect` list, the passage
+numbers of its <kb_used> tag (cut out of the answer as the chat does), the sources that would go
+under it, `!!` for every `avoid` substring found in it and `!!` when the tag is there or missing
+against the case's `kb_used`.
 The system message is built like the chat builds it: the prompt file, then the <knowledge> block
 from the docs/kb articles (embedded in memory by the same loader, chunker and RagKnowledge as
 scripts.rag_eval), then the case's history and the question. --no-kb skips the embeddings API.
@@ -30,6 +32,7 @@ from app.llm.registry import build_llm
 from app.llm.resilient import ResilientLLM
 from app.rag.retriever import Knowledge, RagKnowledge
 from app.services.context_builder import KNOWLEDGE_NOTE, defuse_tags, wrap_data
+from app.services.kb_used import KbUsedFilter, used_sources
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts.rag_eval import DEFAULT_KB, embed_all
 
@@ -49,6 +52,8 @@ class Case:
     expect: tuple[str, ...]
     avoid: tuple[str, ...] = ()
     history: tuple[ChatMessage, ...] = ()
+    # Whether the answer should end with a <kb_used> tag; None = not checked.
+    kb_used: bool | None = None
 
 
 @dataclass
@@ -58,6 +63,7 @@ class Answer:
     restarts: int = 0
     truncated: bool = False
     error: str | None = None
+    kb_ids: tuple[int, ...] = ()
     sources: tuple[str, ...] = ()
     flagged: list[str] = field(default_factory=list)
 
@@ -89,6 +95,7 @@ def load(path: Path) -> list[Case]:
             expect=tuple(r["expect"]),
             avoid=tuple(r.get("avoid") or ()),
             history=tuple(_turn(t) for t in r.get("history") or ()),
+            kb_used=r.get("kb_used"),
         )
         for r in rows
     ]
@@ -121,25 +128,41 @@ async def knowledge_for(cases: Sequence[Case], kb_dir: Path) -> list[Knowledge |
     ]
 
 
-async def answer(llm: ResilientLLM, chat: list[ChatMessage], max_tokens: int, case: Case) -> Answer:
+async def answer(
+    llm: ResilientLLM,
+    chat: list[ChatMessage],
+    max_tokens: int,
+    case: Case,
+    knowledge: Knowledge | None = None,
+) -> Answer:
     result = Answer()
     parts: list[str] = []
+    tag = KbUsedFilter()
     try:
         async for event in llm.stream(chat, max_tokens):
             match event:
                 case Token(text=text):
-                    parts.append(text)
+                    parts.append(tag.feed(text))
                 case Restart():
                     parts.clear()
+                    tag = KbUsedFilter()
                     result.restarts += 1
                 case Done(provider=provider, model=model, truncated=truncated):
+                    parts.append(tag.finish())
                     result.by = f"{provider}:{model}"
                     result.truncated = truncated
     except (AllProvidersDown, LLMRequestError) as exc:
         result.error = f"{type(exc).__name__}: {exc}"
     result.text = "".join(parts).strip()
+    result.kb_ids = tuple(sorted(tag.ids))
+    passages = knowledge.passages if knowledge else ()
+    result.sources = tuple(s.slug for s in used_sources(tag.ids, passages))
     lowered = result.text.lower()
-    result.flagged = [a for a in case.avoid if a.lower() in lowered]
+    result.flagged = [f"contains {a!r}" for a in case.avoid if a.lower() in lowered]
+    # Without a <knowledge> block (--no-kb) only "no tag" can be checked.
+    checked = case.kb_used is not None and (knowledge is not None or not case.kb_used)
+    if checked and case.kb_used != bool(tag.ids):
+        result.flagged.append("has a <kb_used> tag" if tag.ids else "has no <kb_used> tag")
     return result
 
 
@@ -152,7 +175,6 @@ def report(case: Case, result: Answer, out: TextIO) -> None:
     print("expect:", file=out)
     for item in case.expect:
         print(f"  - {item}", file=out)
-    print(f"sources: {', '.join(result.sources) or '-'}", file=out)
     if result.error:
         print(f"ERROR {result.error}", file=out)
         return
@@ -163,8 +185,10 @@ def report(case: Case, result: Answer, out: TextIO) -> None:
         notes.append("truncated")
     print(f"A ({', '.join(notes)}):", file=out)
     print(result.text, file=out)
-    for found in result.flagged:
-        print(f"!! contains {found!r}", file=out)
+    print(f"kb_used: {', '.join(map(str, result.kb_ids)) or '-'}", file=out)
+    print(f"sources: {', '.join(result.sources) or '-'}", file=out)
+    for flag in result.flagged:
+        print(f"!! {flag}", file=out)
 
 
 async def run(
@@ -185,10 +209,8 @@ async def run(
     results: list[Answer] = []
     try:
         for case, found in zip(cases, knowledge, strict=True):
-            result = await answer(
-                llm, messages(prompt.text, case, found), settings.chat_max_answer_tokens, case
-            )
-            result.sources = tuple(s.slug for s in found.sources) if found else ()
+            chat = messages(prompt.text, case, found)
+            result = await answer(llm, chat, settings.chat_max_answer_tokens, case, found)
             report(case, result, out)
             results.append(result)
     finally:

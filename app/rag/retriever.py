@@ -37,7 +37,16 @@ class Source:
 @dataclass(frozen=True, slots=True)
 class Knowledge:
     text: str
-    sources: tuple[Source, ...]
+    # The article of each passage: passages[0] is [1] in the text (app.services.kb_used).
+    passages: tuple[Source, ...]
+
+    @property
+    def sources(self) -> tuple[Source, ...]:
+        """Every article in the text, once each, in passage order."""
+        sources: dict[str, Source] = {}
+        for source in self.passages:
+            sources.setdefault(source.slug, source)
+        return tuple(sources.values())
 
 
 class QueryEmbedder(Protocol):
@@ -113,18 +122,15 @@ class RagKnowledge:
         )
         if not packed:
             return None
-        sources: dict[str, Source] = {}
-        for hit in packed:
-            sources.setdefault(hit.slug, Source(hit.title, hit.slug, hit.url))
-        text = "\n\n".join(_passage(hit) for hit in packed)
-        return Knowledge(text, tuple(sources.values()))
+        text = "\n\n".join(_passage(number, hit) for number, hit in enumerate(packed, start=1))
+        return Knowledge(text, tuple(Source(h.title, h.slug, h.url) for h in packed))
 
     def _pack(self, hits: list[KBHit]) -> list[KBHit]:
         """Closest first, within max_tokens; a passage that does not fit is skipped."""
         packed: list[KBHit] = []
         used = 0
         for hit in hits:
-            cost = estimate_tokens(_passage(hit))
+            cost = estimate_tokens(_passage(len(packed) + 1, hit))
             if used + cost > self._max_tokens:
                 continue
             packed.append(hit)
@@ -132,6 +138,7 @@ class RagKnowledge:
         return packed
 
 
-def _passage(hit: KBHit) -> str:
-    # The chunk already starts with "Title › Section". No slug: the model must not cite ids.
-    return f"---\n{hit.content}"
+def _passage(number: int, hit: KBHit) -> str:
+    # The chunk already starts with "Title › Section". No slug: the model must not cite it; the
+    # number is only for the <kb_used> tag, which the app cuts out of the answer.
+    return f"[{number}] {hit.content}"

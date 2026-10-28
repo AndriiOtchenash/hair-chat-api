@@ -92,7 +92,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
 - Prompt change -> run the prompt eval (real chain + embeddings, our texts only, not in CI) and
   read the answers: `uv run python -m scripts.prompt_eval [--prompt system_vN] [--only ID]` over
-  tests/prompt_eval/cases.yaml (`expect` for the reader, `avoid` substrings flagged `!!`).
+  tests/prompt_eval/cases.yaml (`expect` for the reader, `avoid` substrings flagged `!!`,
+  `kb_used: true|false` flags a tag that is missing / unexpected).
 - The answer never mentions articles / the knowledge base: the client shows `done.sources`.
 
 ## Knowledge base / RAG (ADR 0005)
@@ -106,7 +107,11 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   -> answer without `<knowledge>` + warning. The query is embedded in parallel with moderation.
 - Search: top KB_TOP_K (4) by cosine distance, then KB_MIN_SIMILARITY (0.60), packed into
   KB_MAX_TOKENS (1500). Prod: reviewed only (prod refuses KB_INCLUDE_DRAFTS=true); dev: drafts too.
-- `done.sources` = articles whose passages reached the context (not dropped by the budget).
+- Passages in `<knowledge>` are numbered `[1]..[n]`; the prompt (system_v6+) makes an answer
+  that relies on them end with `<kb_used ids="1,3"/>`. `app.services.kb_used.KbUsedFilter` cuts
+  the tag out of the stream (holds back a tail that may start it; never sent, never saved).
+  `done.sources` = articles of the passages named in the tag (invalid / out-of-range ids
+  ignored); no tag -> `[]`. `kb_used` is in DATA_TAGS, so no text can write one for the model.
 - Threshold, model or articles change -> re-run the eval (real API, our texts only, not in CI):
   `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
   threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
@@ -205,7 +210,8 @@ event: done     data: {"message_id": "...", "provider": "...", "model": "...", "
 event: error    data: {"code": "...", "message": "..."}   # same ErrorBody as REST errors
 : ping                                     # keep-alive comment every 15 s while idle (FastAPI)
 - truncated = the answer hit max_tokens (finish_reason "length"); it is still saved.
-- sources = knowledge-base articles that were in the context of this answer (may be empty).
+- sources = knowledge-base articles the answer used, per its `<kb_used>` tag (may be empty;
+  always present, the client hides an empty list).
 - error codes: llm_unavailable (all providers down), llm_request_rejected (provider 400; not
   Gemini's bad-key / unsupported-location 400s, which fall back like 401/403:
   `app.llm.base.provider_side_400`), internal_error. The user's message is kept in every case.

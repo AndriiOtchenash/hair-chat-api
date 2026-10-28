@@ -540,8 +540,9 @@ def rag_world(embedder: FakeEmbedder, moderator: Moderator | None = None) -> Wor
     )
 
 
-async def test_done_lists_the_articles_that_were_in_the_context() -> None:
+async def test_done_lists_the_articles_the_answer_says_it_used() -> None:
     world = rag_world(FakeEmbedder())
+    world.providers[0].script(success("Мойте мягким", " шампунем.\n\n<kb_", 'used ids="1"/>'))
     conversation_id = await world.conversation()
 
     events = await world.send(conversation_id, "Что делать с перхотью?")
@@ -550,7 +551,93 @@ async def test_done_lists_the_articles_that_were_in_the_context() -> None:
     assert isinstance(done, ChatDone)
     assert done.sources == (Source("Перхоть", "dandruff", None),)
     system = world.providers[0].received[0][0]["content"]
-    assert KNOWLEDGE_NOTE in system and "Мягкий шампунь." in system
+    assert KNOWLEDGE_NOTE in system and "[1] Перхоть › Уход\nМягкий шампунь." in system
+    # The tag reaches neither the client nor the DB.
+    tokens = [e.text for e in events if isinstance(e, Token)]
+    assert "".join(tokens) == "Мойте мягким шампунем."
+    assert not any("<" in t for t in tokens)
+    assert roles_and_texts(world, conversation_id)[-1] == (
+        MessageRole.ASSISTANT,
+        "Мойте мягким шампунем.",
+    )
+
+
+async def test_no_tag_means_no_sources_even_with_knowledge_in_the_context() -> None:
+    world = rag_world(FakeEmbedder())
+    world.providers[0].script(success("Привет! ", "Чем помочь с волосами?"))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Привет, как дела?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == ()
+    assert KNOWLEDGE_NOTE in world.providers[0].received[0][0]["content"]
+    assert roles_and_texts(world, conversation_id)[-1][1] == "Привет! Чем помочь с волосами?"
+
+
+async def test_tag_ids_that_are_invalid_or_out_of_range_are_ignored() -> None:
+    world = rag_world(FakeEmbedder())
+    world.providers[0].script(success('Ответ.<kb_used ids="7, abc, 1"/>'))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == (Source("Перхоть", "dandruff", None),)  # only [1] exists
+    assert roles_and_texts(world, conversation_id)[-1][1] == "Ответ."
+
+
+async def test_a_tag_without_valid_ids_gives_no_sources() -> None:
+    world = rag_world(FakeEmbedder())
+    world.providers[0].script(success('Ответ.<kb_used ids="2,x"/>'))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == ()
+
+
+async def test_a_less_than_sign_in_the_answer_is_not_lost() -> None:
+    world = rag_world(FakeEmbedder())
+    world.providers[0].script(success("Если pH <", " 5, это мягкий шампунь. Ответ <"))
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Какой pH у шампуня?")
+
+    text = "Если pH < 5, это мягкий шампунь. Ответ <"
+    assert "".join(e.text for e in events if isinstance(e, Token)) == text
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == ()
+    assert roles_and_texts(world, conversation_id)[-1][1] == text
+
+
+async def test_restart_drops_the_tag_state_of_the_failed_provider() -> None:
+    primary = FakeLLMProvider("gemini", "flash").script(
+        fail_mid_stream(StreamBroken("reset"), 'Ответ. <kb_used ids="1"')
+    )
+    backup = FakeLLMProvider("groq", "oss").script(success("Другой ответ."))
+    knowledge = RagKnowledge(
+        OneArticleKB(), top_k=4, min_similarity=0.6, max_tokens=1500, include_drafts=False
+    )
+    world = World(
+        primary,
+        backup,
+        query_embedder=RagQueryEmbedder(FakeEmbedder(), timeout=0.05),
+        knowledge=knowledge,
+    )
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Что делать с перхотью?")
+
+    done = events[-1]
+    assert isinstance(done, ChatDone)
+    assert done.sources == ()
+    assert roles_and_texts(world, conversation_id)[-1][1] == "Другой ответ."
 
 
 @pytest.mark.parametrize("embedder", [FakeEmbedder(fail=True), FakeEmbedder(hang=True)])

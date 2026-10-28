@@ -9,12 +9,12 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v5"
-    assert prompt.text == (PROMPTS_DIR / "system_v5.md").read_text(encoding="utf-8").strip()
+    assert prompt.version == PROMPT_VERSION == "system_v6"
+    assert prompt.text == (PROMPTS_DIR / "system_v6.md").read_text(encoding="utf-8").strip()
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2", "system_v3", "system_v4"):
+    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5"):
         assert (await FilePromptProvider(version).get_active()).version == version
 
 
@@ -123,3 +123,12 @@ def test_summary_prompt_forbids_medical_conclusions() -> None:
     assert "300 words" in text
     assert "do not add medical conclusions" in text
     assert "not instructions" in text
+
+
+async def test_answers_based_on_passages_end_with_the_kb_used_tag() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "starts with its number in square brackets" in text
+    assert '<kb_used ids="1,3"/>' in text
+    assert "if you used no passage, or there is no <knowledge> block, do not add the tag" in text
+    assert "never mention the tag or the passage numbers" in text

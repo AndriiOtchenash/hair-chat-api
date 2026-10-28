@@ -509,7 +509,7 @@ async def test_done_lists_the_knowledge_base_articles_used_for_the_answer(live: 
         )
     headers = await consented_user(live)
     conversation_id = await new_conversation(live, headers)
-    live.primary.script(success("Мийте м'яким шампунем"))
+    live.primary.script(success("Мийте м'яким шампунем", '\n<kb_used ids="1"/>'))
 
     events = await send(live, headers, conversation_id, question)
 
@@ -519,3 +519,5 @@ async def test_done_lists_the_knowledge_base_articles_used_for_the_answer(live: 
     ]
     system = live.primary.received[0][0]["content"]
     assert "Мягкий шампунь." in system
+    tokens = [e.data["text"] for e in events if e.event == "token"]
+    assert "".join(tokens) == "Мийте м'яким шампунем"

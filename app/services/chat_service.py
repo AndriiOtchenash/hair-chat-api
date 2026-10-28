@@ -12,7 +12,7 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from contextlib import ExitStack, aclosing, asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from app.db.models import Conversation, Message
@@ -23,6 +23,7 @@ from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
 from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, QueryEmbedding, Source
 from app.services.context_builder import Context, ContextBuilder
+from app.services.kb_used import KbUsedFilter, used_sources
 from app.services.moderation_policy import ModerationAction, decide
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ class ChatDone:
     provider: str
     model: str
     truncated: bool
-    # Knowledge-base articles that were in the context of this answer.
+    # Knowledge-base articles the answer says it used (its <kb_used> tag), see kb_used.py.
     sources: tuple[Source, ...] = ()
 
 
@@ -153,19 +154,27 @@ class Reply:
                 self.user_id, self.conversation_id, service.budget_tokens, self._query
             )
             answer: list[str] = []
+            # Cuts the <kb_used> tag out of the stream: neither the client nor the DB sees it.
+            tag = KbUsedFilter()
             stream = service.llm.stream(context.messages, service.max_answer_tokens)
             # aclosing: leaving `async for` early does not close the inner generator by itself.
             async with aclosing(stream) as events:
                 async for event in events:
                     match event:
                         case Token(text=text):
-                            answer.append(text)
-                            yield event
+                            if shown := tag.feed(text):
+                                answer.append(shown)
+                                yield replace(event, text=shown)
                         case Restart():
                             answer.clear()
+                            tag = KbUsedFilter()
                             yield event
                         case Done():
-                            done = await self._save(event, "".join(answer), context)
+                            if rest := tag.finish():
+                                answer.append(rest)
+                                yield Token(rest, event.provider, event.model)
+                            sources = used_sources(tag.ids, context.passages)
+                            done = await self._save(event, "".join(answer), context, sources)
                             self.summary_due = context.needs_summary
                             yield done
         except AllProvidersDown:
@@ -189,7 +198,9 @@ class Reply:
             )
             yield ChatError("internal_error", "Something went wrong, please try again")
 
-    async def _save(self, done: Done, answer: str, context: Context) -> ChatDone:
+    async def _save(
+        self, done: Done, answer: str, context: Context, sources: tuple[Source, ...]
+    ) -> ChatDone:
         message = await self._service.repo.add_assistant_message(
             self.user_id,
             self.conversation_id,
@@ -202,7 +213,7 @@ class Reply:
         )
         logger.info(
             "chat reply saved: conversation=%s message=%s provider=%s model=%s prompt=%s "
-            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s sources=%d",
+            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s passages=%d sources=%d",
             self.conversation_id,
             message.id,
             done.provider,
@@ -212,11 +223,10 @@ class Reply:
             done.tokens_in,
             done.tokens_out,
             done.truncated,
-            len(context.sources),
+            len(context.passages),
+            len(sources),
         )
-        return ChatDone(
-            message.id, done.provider, done.model, done.truncated, sources=context.sources
-        )
+        return ChatDone(message.id, done.provider, done.model, done.truncated, sources=sources)
 
 
 class ConversationService:

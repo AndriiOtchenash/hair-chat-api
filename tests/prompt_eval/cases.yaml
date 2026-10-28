@@ -4,12 +4,13 @@
 # Fields:
 #   id      unique, for --only
 #   group   manual (found in manual testing) | off_topic | educational | professional |
-#           recurring | limits
+#           recurring | limits | kb (the <kb_used> tag)
 #   lang    language of `text`; the answer must be in it
 #   text    the user's latest message
 #   history optional earlier turns: [{role: user|assistant, content: "..."}]
 #   expect  what a good answer does (read by a human)
 #   avoid   optional substrings (case-insensitive) flagged with !! when they appear in the answer
+#   kb_used optional true|false: the answer must (not) end with a <kb_used> tag; !! otherwise
 
 # --- found in manual testing (system_v4: refusals and a dry tone) ---
 - id: manual-off-topic-salon
@@ -181,3 +182,24 @@
   expect:
     - не называет дозы и не советует добавки
     - объясняет по-доброму, что это вопрос к врачу; предлагает уход
+
+# --- knowledge base: the <kb_used> tag (system_v6) ---
+- id: kb-dandruff-from-articles
+  group: kb
+  lang: ru
+  text: "Как часто мыть голову, если у меня перхоть?"
+  kb_used: true
+  expect:
+    - опирается на статьи о перхоти / частоте мытья, отвечает своими словами
+    - в конце тег <kb_used ids="..."/> с номерами нужных фрагментов (вырезан, строка kb_used)
+    - в тексте нет номеров фрагментов, тега и упоминаний статей
+  avoid: ["kb_used", "[1]", "статье", "базе знаний"]
+- id: kb-small-talk-no-tag
+  group: kb
+  lang: ru
+  text: "Привет! Как у тебя дела?"
+  kb_used: false
+  expect:
+    - коротко и тепло отвечает, мягко предлагает помощь с волосами
+    - без тега <kb_used>, источников нет
+  avoid: ["kb_used"]

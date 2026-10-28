@@ -41,6 +41,7 @@ DATA_TAGS = (
     "conversation_summary",
     "previous_summary",
     "conversation",
+    "kb_used",  # the model's own tag (app.services.kb_used): no text may write one for it
 )
 _TAG_IN_DATA = re.compile(rf"<(/?)({'|'.join(DATA_TAGS)})\b", re.IGNORECASE)
 
@@ -81,8 +82,14 @@ class Context:
     prompt_version: str
     # Messages after the summary were left out: fold them into the summary after the answer.
     needs_summary: bool
-    # Articles of the <knowledge> block, if it made it into the context (not dropped by budget).
-    sources: tuple[Source, ...] = ()
+    # The article of each numbered <knowledge> passage [1]..[n], if the block made it into the
+    # context (not dropped by the budget); the answer's <kb_used> tag picks from these.
+    passages: tuple[Source, ...] = ()
+
+    @property
+    def sources(self) -> tuple[Source, ...]:
+        """Every article in the context, once each."""
+        return Knowledge("", self.passages).sources
 
 
 class ContextBuilder(Protocol):
@@ -225,7 +232,7 @@ class TokenBudgetContextBuilder:
             tokens=budget_tokens - remaining,
             prompt_version=prompt.version,
             needs_summary=left_out,
-            sources=kept_knowledge.sources if kept_knowledge else (),
+            passages=kept_knowledge.passages if kept_knowledge else (),
         )
 
     async def _blocks(

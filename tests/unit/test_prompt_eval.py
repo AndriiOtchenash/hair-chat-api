@@ -8,7 +8,7 @@ from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts import prompt_eval
 from tests.llm_fakes import FakeLLMCallRecorder, FakeLLMProvider, fail_before_first, success
 
-GROUPS = {"manual", "off_topic", "educational", "professional", "recurring", "limits"}
+GROUPS = {"manual", "off_topic", "educational", "professional", "recurring", "limits", "kb"}
 
 
 def factory(provider: FakeLLMProvider) -> prompt_eval.LLMFactory:
@@ -72,7 +72,7 @@ async def test_sends_the_prompt_history_and_question_and_prints_the_answer() -> 
     assert "[off_topic] c1 (ru)" in out
     assert "  - сочувствует" in out
     assert "A (gemini:flash, 2 words):\nСочувствую. Позвоните." in out
-    assert "!! contains" not in out
+    assert "\n!! " not in out
 
 
 async def test_flags_avoided_phrases_case_insensitively() -> None:
@@ -93,3 +93,21 @@ async def test_a_failed_chain_is_reported_and_fails_the_run() -> None:
 
     assert code == 1
     assert "ERROR AllProvidersDown" in out
+
+
+async def test_the_kb_used_tag_is_cut_out_and_checked_against_the_case() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(
+        success("Привет!", '\n<kb_used ids="1"/>'), success("Мойте мягким шампунем.")
+    )
+
+    code, out = await run(
+        provider,
+        case(id="small-talk", kb_used=False),
+        case(id="no-kb", kb_used=True),  # --no-kb: a missing tag is not flagged
+    )
+
+    assert code == 0
+    assert "A (gemini:flash, 1 words):\nПривет!\nkb_used: 1\n" in out
+    assert "!! has a <kb_used> tag" in out
+    assert "!! has no <kb_used> tag" not in out
+    assert "2 answers, 1 with !! flags, 0 errors" in out
