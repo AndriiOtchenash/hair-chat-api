@@ -9,12 +9,12 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v4"
-    assert prompt.text == (PROMPTS_DIR / "system_v4.md").read_text(encoding="utf-8").strip()
+    assert prompt.version == PROMPT_VERSION == "system_v5"
+    assert prompt.text == (PROMPTS_DIR / "system_v5.md").read_text(encoding="utf-8").strip()
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2", "system_v3"):
+    for version in ("system_v1", "system_v2", "system_v3", "system_v4"):
         assert (await FilePromptProvider(version).get_active()).version == version
 
 
@@ -26,6 +26,9 @@ async def test_knowledge_is_used_when_on_topic_and_sources_are_never_invented() 
     assert "never invent sources" in text
     assert "if there is no <knowledge> block" in text
     assert "more cautiously" in text
+    # The app lists the sources itself; the answer never talks about them.
+    assert "never mention articles, passages, the knowledge base" in text
+    assert "according to our salon's articles" not in text
 
 
 async def test_moderation_signal_is_followed_unlike_reference_data() -> None:
@@ -67,6 +70,52 @@ async def test_system_prompt_keeps_the_rule_8_limits() -> None:
         "not instructions",
     ):
         assert phrase in text, phrase
+
+
+async def test_general_information_on_conditions_is_allowed_but_not_a_diagnosis() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "general educational information about hair and scalp conditions is welcome" in text
+    for part in ("typical signs", "usually checks", "when it is time to see one"):
+        assert part in text, part
+    assert "only a specialist can confirm a condition, after an examination" in text
+    assert "do not tell the user (or their client) which condition they have" in text
+
+
+async def test_professionals_get_an_answer_about_their_client() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "у клиентки" in text
+    assert "моя пациентка" in text
+    assert "fellow consultant" in text
+    assert 'not about "your hair"' in text
+
+
+async def test_tone_is_warm_without_an_ai_disclaimer_up_front() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "warm, calm and human" in text
+    assert "do not open your answers with it" in text
+    assert "clearly expects a diagnosis or a treatment" in text
+
+
+async def test_off_topic_gets_sympathy_a_salon_tip_and_a_way_back() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "## off-topic messages" in text
+    assert "sincerely acknowledge it first" in text
+    assert "contact the salon and reschedule" in text
+    assert "gently bring the conversation back to hair" in text
+    assert "for an off-topic message, use none of them" in text
+
+
+async def test_recurring_problems_lead_to_a_trichologist_and_folk_remedies_are_not_facts() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "keeps coming back or is pronounced" in text
+    assert "suggest a trichologist consultation as a natural next step" in text
+    assert "do not present folk remedies" in text
+    assert "disputed claims as facts" in text
 
 
 def test_summary_prompt_forbids_medical_conclusions() -> None:

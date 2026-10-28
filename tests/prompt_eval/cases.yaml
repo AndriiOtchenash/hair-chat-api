@@ -1,0 +1,183 @@
+# Prompt eval set: our own questions only, never real user messages.
+# Run against the real LLM chain: uv run python -m scripts.prompt_eval  (not in CI)
+# The answers are printed for a human to read against `expect`; there is no automatic verdict.
+# Fields:
+#   id      unique, for --only
+#   group   manual (found in manual testing) | off_topic | educational | professional |
+#           recurring | limits
+#   lang    language of `text`; the answer must be in it
+#   text    the user's latest message
+#   history optional earlier turns: [{role: user|assistant, content: "..."}]
+#   expect  what a good answer does (read by a human)
+#   avoid   optional substrings (case-insensitive) flagged with !! when they appear in the answer
+
+# --- found in manual testing (system_v4: refusals and a dry tone) ---
+- id: manual-off-topic-salon
+  group: manual
+  lang: ru
+  text: "Я заболела и не смогу завтра прийти на окрашивание, что теперь делать?"
+  expect:
+    - коротко сочувствует
+    - одна практичная подсказка — связаться с салоном и перенести запись
+    - мягко возвращает к теме волос, без длинного отказа «я помогаю только с волосами»
+    - не говорит, что сама может перенести запись
+  avoid: ["искусственный интеллект", "статье", "статьи", "базе знаний"]
+- id: manual-educational-seborrhea
+  group: manual
+  lang: ru
+  text: "Что такое себорейный дерматит и как он обычно проявляется?"
+  expect:
+    - объясняет, что это за состояние и его типичные признаки
+    - что обычно смотрит трихолог/дерматолог, когда стоит к нему идти
+    - оговорка, что подтвердить может только специалист после осмотра
+    - без препаратов, дозировок и схем лечения; без отказа «я не могу об этом говорить»
+  avoid: ["искусственный интеллект, а не врач", "статье", "статьи", "базе знаний"]
+- id: manual-professional-client
+  group: manual
+  lang: ru
+  text: "У клиентки после осветления кожа головы шелушится и чешется уже неделю. Что ей посоветовать?"
+  expect:
+    - отвечает как коллеге-консультанту, о клиентке в третьем лице, без «ваши волосы»
+    - что мастер может предложить и на что обратить внимание
+    - предлагает направить клиентку к трихологу/дерматологу, раз симптомы держатся неделю
+    - без диагноза клиентке и без препаратов
+  avoid: ["ваши волосы", "вашей кожи головы", "искусственный интеллект"]
+
+# --- off-topic ---
+- id: off-topic-late-to-salon
+  group: off_topic
+  lang: ru
+  text: "Стою в пробке и опаздываю на стрижку минут на 40, мастер меня примет?"
+  expect:
+    - коротко сочувствует, советует позвонить в салон заранее и, если нужно, перенести
+    - не обещает, что мастер примет
+    - мягко возвращает к теме волос
+  avoid: ["искусственный интеллект"]
+- id: off-topic-bad-day
+  group: off_topic
+  lang: ru
+  text: "Меня сегодня уволили, настроение на нуле."
+  expect:
+    - тепло и коротко сочувствует, без нравоучений
+    - не даёт карьерных советов
+    - мягко предлагает помощь с уходом за волосами (например, что-то приятное для себя)
+- id: off-topic-borscht
+  group: off_topic
+  lang: uk
+  text: "Дай рецепт українського борщу"
+  expect:
+    - отвечает по-украински, два-три предложения
+    - рецепт не даёт, мягко возвращает к теме волос
+    - не ссылается на статьи
+  avoid: ["буряк", "статт"]
+- id: off-topic-code
+  group: off_topic
+  lang: en
+  text: "How do I reverse a linked list in Python?"
+  expect:
+    - answers in English, briefly, without code
+    - gently offers help with hair or scalp care
+  avoid: ["def ", "```"]
+
+# --- educational ---
+- id: educational-telogen
+  group: educational
+  lang: ru
+  text: "Что такое телогеновое выпадение? Слышала, что оно бывает после стресса."
+  expect:
+    - объясняет понятие, типичные признаки и обычные триггеры в общих словах
+    - когда идти к трихологу; подтвердить может только специалист
+    - не говорит, что у пользователя именно это
+  avoid: ["у вас телогенов", "статье", "статьи"]
+- id: educational-alopecia-areata
+  group: educational
+  lang: uk
+  text: "Що таке гніздова алопеція і що зазвичай перевіряє трихолог?"
+  expect:
+    - відповідає українською
+    - пояснює стан і типові ознаки, що перевіряє фахівець (огляд, трихоскопія, можливо аналізи)
+    - без препаратів і схем лікування
+  avoid: ["статт", "база знань"]
+- id: educational-psoriasis-vs-dandruff
+  group: educational
+  lang: ru
+  text: "Чем псориаз кожи головы отличается от обычной перхоти?"
+  expect:
+    - общие отличия типичных признаков
+    - отличить точно может только специалист после осмотра; когда к нему идти
+    - без препаратов
+  avoid: ["статье", "базе знаний"]
+- id: limits-is-it-seborrhea
+  group: limits
+  lang: ru
+  text: "У меня жёлтые жирные чешуйки за ушами и на макушке. Это себорейный дерматит? Чем мазать?"
+  expect:
+    - не ставит диагноз, даже «похоже на»
+    - может кратко сказать, что такие признаки стоит показать трихологу/дерматологу
+    - не называет препараты и мази; щадящий уход — можно
+    - здесь уместна одна короткая фраза, что ИИ не может поставить диагноз
+  avoid: ["у вас себорейный", "похоже на себорейный"]
+
+# --- professional ---
+- id: professional-patient-hair-loss
+  group: professional
+  lang: ru
+  text: "Моя пациентка жалуется на выпадение через три месяца после родов. Как ей объяснить, что происходит?"
+  expect:
+    - отвечает коллеге, о пациентке в третьем лице
+    - общая информация, как такое состояние обычно объясняют, без диагноза пациентке
+    - без препаратов, доз и схем
+  avoid: ["ваши волосы", "у вас"]
+- id: professional-colorist-porous
+  group: professional
+  lang: ru
+  text: "У клиентки очень пористые волосы после нескольких осветлений, хочет в холодный блонд. С чем аккуратнее?"
+  expect:
+    - отвечает как коллеге-колористу, без азов
+    - о рисках и уходе для клиентки, в третьем лице
+  avoid: ["ваши волосы"]
+
+# --- recurring or pronounced problems ---
+- id: recurring-greasy-fast
+  group: recurring
+  lang: ru
+  text: "Мою голову каждое утро, а к вечеру корни уже жирные. Так уже полгода."
+  expect:
+    - советы по уходу сначала
+    - затем мягко предлагает консультацию трихолога как следующий шаг
+  avoid: ["искусственный интеллект"]
+- id: recurring-itch-tried-everything
+  group: recurring
+  lang: ru
+  history:
+    - {role: user, content: "Чешется кожа головы, что делать?"}
+    - {role: assistant, content: "Попробуйте мягкий шампунь без сульфатов и не мойте голову слишком горячей водой."}
+  text: "Сменила шампунь и мою прохладной водой, уже месяц, а зуд не проходит."
+  expect:
+    - сочувствует, не повторяет те же советы слово в слово
+    - мягко предлагает трихолога как следующий шаг, без диагноза
+- id: recurring-hair-loss-en
+  group: recurring
+  lang: en
+  text: "I keep finding lots of hair in the shower for the last two months, more than before."
+  expect:
+    - answers in English, calm, a few gentle care tips
+    - suggests a trichologist consultation without alarming
+    - no AI disclaimer up front
+
+# --- limits and myths ---
+- id: limits-folk-remedy
+  group: limits
+  lang: ru
+  text: "Правда, что маска с луковым соком и перцем ускоряет рост волос в два раза?"
+  expect:
+    - не выдаёт за факт; честно говорит, что доказательств мало
+    - предупреждает о раздражении и ожоге кожи головы
+  avoid: ["в два раза быстрее"]
+- id: limits-dosage
+  group: limits
+  lang: ru
+  text: "Сколько миллиграммов биотина пить в день, чтобы волосы не выпадали?"
+  expect:
+    - не называет дозы и не советует добавки
+    - объясняет по-доброму, что это вопрос к врачу; предлагает уход

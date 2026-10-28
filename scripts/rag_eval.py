@@ -93,7 +93,8 @@ def load(path: Path) -> list[Query]:
     return [Query(r["lang"], r["expected"], r["text"], r.get("known_gap")) for r in rows]
 
 
-async def embed_all(kb_dir: Path, queries: list[Query]) -> tuple[MemoryKB, list[QueryEmbedding]]:
+async def embed_all(kb_dir: Path, queries: Sequence[str]) -> tuple[MemoryKB, list[QueryEmbedding]]:
+    """The KB chunks and the query texts, embedded with the real model (shared with prompt_eval)."""
     settings = get_settings()
     if settings.gemini_api_key is None:
         raise SystemExit("GEMINI_API_KEY is not set")
@@ -111,7 +112,7 @@ async def embed_all(kb_dir: Path, queries: list[Query]) -> tuple[MemoryKB, list[
             for chunk in chunk_markdown(article.meta.title, article.body)
         ]
         chunk_vectors = await embedder.embed([c.text for _, c in chunks])
-        query_vectors = await embedder.embed([q.text for q in queries])
+        query_vectors = await embedder.embed(list(queries))
     finally:
         await embedder.aclose()
     rows = [
@@ -199,7 +200,7 @@ def report(outcomes: list[Outcome], threshold: float) -> str:
 
 async def run(kb_dir: Path, path: Path, threshold: float) -> int:
     queries = load(path)
-    kb, embeddings = await embed_all(kb_dir, queries)
+    kb, embeddings = await embed_all(kb_dir, [q.text for q in queries])
     print(f"model {get_settings().embedding_model}, {len(kb)} chunks, {len(queries)} queries")
     print("\nthreshold sweep: hit@4 / false finds")
     for value in SWEEP:
