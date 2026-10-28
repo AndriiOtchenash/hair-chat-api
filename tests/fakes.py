@@ -137,6 +137,26 @@ class FakeConversationRepository:
         )
         return Page(rows[:limit], None)
 
+    async def ids(self, user_id: uuid.UUID) -> list[uuid.UUID]:
+        return [c.id for c in self.conversations.values() if c.user_id == user_id]
+
+    async def rename(
+        self, user_id: uuid.UUID, conversation_id: uuid.UUID, title: str
+    ) -> Conversation | None:
+        conversation = self._owned(user_id, conversation_id)
+        if conversation is not None:
+            conversation.title = title
+        return conversation
+
+    async def delete(self, user_id: uuid.UUID, conversation_ids: Sequence[uuid.UUID]) -> int:
+        doomed = {i for i in conversation_ids if self._owned(user_id, i)}
+        for conversation_id in doomed:
+            del self.conversations[conversation_id]
+        gone = {m.id for m in self.messages if m.conversation_id in doomed}
+        self.messages = [m for m in self.messages if m.id not in gone]
+        self.linked_calls = {c: m for c, m in self.linked_calls.items() if m not in gone}
+        return len(doomed)
+
     async def list_messages_page(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, limit: int, cursor: Cursor | None
     ) -> Page[Message]:

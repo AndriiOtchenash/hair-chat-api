@@ -24,6 +24,13 @@ from tests.fakes import FakeConsentRepository, FakeUserRepository
 PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
 DUMMY_PATH_PARAM = "01890000-0000-7000-8000-000000000000"
 KEY = SigningKey("key-1")
+# Chat routes are consented, except these data-rights ones: deleting or renaming own
+# conversations keeps working after the consents are revoked (like /me/export, DELETE /me).
+CONSENT_FREE_CONVERSATION_ROUTES = {
+    ("PATCH", f"/conversations/{DUMMY_PATH_PARAM}"),
+    ("DELETE", f"/conversations/{DUMMY_PATH_PARAM}"),
+    ("DELETE", "/conversations"),
+}
 
 # The consented level has no routers yet (chat comes later). A probe router keeps the
 # consent check below from silently testing nothing.
@@ -90,6 +97,14 @@ def test_route_lists_cover_known_routes() -> None:
     assert ("GET", "/me") not in _requests(consented_only=True)
     assert ("GET", "/consents") not in _requests(consented_only=True)
     assert ("GET", "/__consent-probe") in _requests(consented_only=True)
+
+
+def test_conversation_routes_need_consents_except_the_data_rights_ones() -> None:
+    conversation_routes = {r for r in _requests() if r[1].startswith("/conversations")}
+    consented = set(_requests(consented_only=True))
+
+    assert CONSENT_FREE_CONVERSATION_ROUTES <= conversation_routes
+    assert conversation_routes - consented == CONSENT_FREE_CONVERSATION_ROUTES
 
 
 @pytest.mark.parametrize(("method", "path"), _requests())

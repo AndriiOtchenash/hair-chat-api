@@ -60,7 +60,9 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 ## Auth conventions
 - Closed by default, two levels in app/main.py: add a business router to `PROTECTED_ROUTERS`
   (token: current_user) or `CONSENTED_ROUTERS` (token + all consents: require_consents; every
-  chat endpoint goes here, rule 7). Public allowlist: /health, /docs, /redoc, /openapi.json.
+  chat endpoint goes here, rule 7; except data rights: PATCH/DELETE /conversations/{id} and
+  DELETE /conversations are PROTECTED via `conversations.manage_router`). Public allowlist:
+  /health, /docs, /redoc, /openapi.json.
   tests/unit/test_route_protection.py walks all routes: 401 without a token outside the
   allowlist, 403 consent_required on consented routes — extend its allowlist only on purpose.
 - Use `CurrentUser` in an endpoint to get the user (cached per request, token checked once) and
@@ -130,6 +132,11 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 ## Data rights (ADR 0006)
 - `GET /me/export` (JSON attachment) and `DELETE /me` `{"confirm": "DELETE"}` (204, else 422)
   are PROTECTED, not consented: they work after consents are revoked.
+- Own conversations: `DELETE /conversations/{id}` (204), `DELETE /conversations`
+  `{"confirm": "DELETE_ALL"}` (204, else 422), `PATCH /conversations/{id}` `{title}` (strip,
+  1..120); PROTECTED, hard delete by cascade (messages -> linked llm_calls). 404 for someone
+  else's; 409 conversation_busy while an answer is generated (delete all: any busy -> nothing
+  deleted). A title set by the user is never replaced by the first-message auto-title.
 - Delete = hard `DELETE FROM users`, everything else goes by `ON DELETE CASCADE` (new user
   data tables must cascade from users or conversations, and appear in the export). Then Auth0
   via Management API in a background task (AUTH0_MGMT_CLIENT_ID/SECRET): not configured ->

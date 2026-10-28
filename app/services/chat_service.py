@@ -11,7 +11,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
-from contextlib import aclosing, asynccontextmanager, contextmanager
+from contextlib import ExitStack, aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -222,8 +222,10 @@ class Reply:
 class ConversationService:
     """Reads and plain writes; needs no LLM, so listing works even when the chain is down."""
 
-    def __init__(self, repo: ConversationRepository) -> None:
+    def __init__(self, repo: ConversationRepository, locks: ConversationLocks) -> None:
         self.repo = repo
+        # The chat's generation slots: nothing is deleted while an answer is being generated.
+        self.locks = locks
 
     async def create(self, user_id: uuid.UUID) -> Conversation:
         return await self.repo.create(user_id)
@@ -242,6 +244,35 @@ class ConversationService:
     async def require(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
         if await self.repo.get(user_id, conversation_id) is None:
             raise ConversationNotFound()
+
+    async def rename(
+        self, user_id: uuid.UUID, conversation_id: uuid.UUID, title: str
+    ) -> Conversation:
+        """A title set here is kept: the first message only titles an untitled conversation."""
+        conversation = await self.repo.rename(user_id, conversation_id, title)
+        if conversation is None:
+            raise ConversationNotFound()
+        return conversation
+
+    async def delete(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
+        """Raises ConversationNotFound, then ConversationBusy while an answer is generated."""
+        # Ownership first: a busy conversation of someone else is a 404, not a 409.
+        await self.require(user_id, conversation_id)
+        with self.locks.hold(conversation_id):
+            if not await self.repo.delete(user_id, [conversation_id]):
+                raise ConversationNotFound()
+        logger.info("conversation deleted: conversation=%s", conversation_id)
+
+    async def delete_all(self, user_id: uuid.UUID) -> int:
+        """All or nothing: ConversationBusy if any of them is generating an answer."""
+        conversation_ids = await self.repo.ids(user_id)
+        with ExitStack() as held:
+            # No await while taking the slots: all of them or none, atomically.
+            for conversation_id in conversation_ids:
+                held.enter_context(self.locks.hold(conversation_id))
+            deleted = await self.repo.delete(user_id, conversation_ids)
+        logger.info("conversations deleted: user=%s count=%d", user_id, deleted)
+        return deleted
 
 
 class ChatService:

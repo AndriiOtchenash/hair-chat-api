@@ -15,8 +15,12 @@ from app.db.session import get_engine
 
 logger = logging.getLogger(__name__)
 
-# Token required (current_user).
-PROTECTED_ROUTERS: tuple[APIRouter, ...] = (me.router, consents.router)
+# Token required (current_user). Data rights stay here, usable after consents are revoked.
+PROTECTED_ROUTERS: tuple[APIRouter, ...] = (
+    me.router,
+    consents.router,
+    conversations.manage_router,
+)
 # Token + all consents for the current CONSENT_VERSION (CLAUDE.md rule 7): chat goes here.
 CONSENTED_ROUTERS: tuple[APIRouter, ...] = (conversations.router,)
 
