@@ -84,6 +84,10 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
   `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
+- Prompt change -> run the prompt eval (real chain + embeddings, our texts only, not in CI) and
+  read the answers: `uv run python -m scripts.prompt_eval [--prompt system_vN] [--only ID]` over
+  tests/prompt_eval/cases.yaml (`expect` for the reader, `avoid` substrings flagged `!!`).
+- The answer never mentions articles / the knowledge base: the client shows `done.sources`.
 
 ## Knowledge base / RAG (ADR 0005)
 - Articles: docs/kb/<slug>.md, Russian, YAML frontmatter (title, language, status draft|reviewed,
@@ -168,6 +172,7 @@ uv run python -m app.cli.retention [--dry-run]      # delete conversations idle 
 uv run python -m scripts.moderation_eval            # moderation eval set, real API, not in CI
 uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge base, real embeddings
 uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI
+uv run python -m scripts.prompt_eval                # prompt eval, real LLM chain, prints answers
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
