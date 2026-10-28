@@ -125,7 +125,8 @@ async def _main(conversation: uuid.UUID | None) -> int:
                 user.id, list(ConsentType), settings.consent_version
             )
             repo = SqlConversationRepository(session)
-            conversations = ConversationService(repo)
+            locks = ConversationLocks()
+            conversations = ConversationService(repo, locks)
             if conversation is None:
                 conversation = (await conversations.create(user.id)).id
             else:
@@ -136,7 +137,7 @@ async def _main(conversation: uuid.UUID | None) -> int:
                 TokenBudgetContextBuilder(
                     repo, FilePromptProvider(), knowledge=build_knowledge(session, settings)
                 ),
-                ConversationLocks(),
+                locks,
                 moderator,
                 max_answer_tokens=settings.chat_max_answer_tokens,
                 budget_tokens=budget,

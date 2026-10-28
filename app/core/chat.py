@@ -182,8 +182,11 @@ def get_conversation_repository(
 Conversations = Annotated[ConversationRepository, Depends(get_conversation_repository)]
 
 
-def get_conversation_service(repo: Conversations) -> ConversationService:
-    return ConversationService(repo)
+def get_conversation_service(
+    repo: Conversations,
+    locks: Annotated[ConversationLocks, Depends(get_conversation_locks)],
+) -> ConversationService:
+    return ConversationService(repo, locks)
 
 
 def get_chat_service(
@@ -198,7 +201,7 @@ def get_chat_service(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ChatService:
     return ChatService(
-        ConversationService(repo),
+        ConversationService(repo, locks),
         llm,
         TokenBudgetContextBuilder(repo, prompts, knowledge=build_knowledge(session, settings)),
         locks,

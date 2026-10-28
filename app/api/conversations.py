@@ -2,7 +2,7 @@ import json
 import uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
@@ -29,6 +29,9 @@ from app.services.chat_service import (
 from app.services.summarizer import SummaryRunner
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+# Deleting and renaming own conversations needs a token only, not consents: like GET /me/export
+# and DELETE /me it keeps working after the consents are revoked (ADR 0006).
+manage_router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 Conversations = Annotated[ConversationService, Depends(get_conversation_service)]
 Chat = Annotated[ChatService, Depends(get_chat_service)]
@@ -36,6 +39,7 @@ Limit = Annotated[int, Query(ge=1, le=100)]
 CursorParam = Annotated[str | None, Query(description="next_cursor of the previous page")]
 
 MAX_CONTENT_CHARS = 4000
+MAX_TITLE_CHARS = 120
 
 
 class ConversationOut(BaseModel):
@@ -76,6 +80,16 @@ class SendMessageRequest(BaseModel):
     ]
 
 
+class RenameRequest(BaseModel):
+    title: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_TITLE_CHARS)
+    ]
+
+
+class DeleteAllRequest(BaseModel):
+    confirm: Literal["DELETE_ALL"]
+
+
 def _cursor(value: str | None) -> Cursor | None:
     if value is None:
         return None
@@ -87,6 +101,14 @@ def _cursor(value: str | None) -> Cursor | None:
 
 def _not_found() -> Exception:
     return api_error(status.HTTP_404_NOT_FOUND, "not_found", "Conversation not found")
+
+
+def _busy() -> Exception:
+    return api_error(
+        status.HTTP_409_CONFLICT,
+        "conversation_busy",
+        "An answer is already being generated in this conversation",
+    )
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -139,11 +161,7 @@ async def start_reply(
     except ConversationNotFound:
         raise _not_found() from None
     except ConversationBusy:
-        raise api_error(
-            status.HTTP_409_CONFLICT,
-            "conversation_busy",
-            "An answer is already being generated in this conversation",
-        ) from None
+        raise _busy() from None
     except MessageBlocked:
         raise api_error(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -208,3 +226,52 @@ async def send_message(
         yield _sse(event)
     if reply.summary_due:
         background.add_task(summarizer.run, reply.user_id, reply.conversation_id)
+
+
+@manage_router.patch(
+    "/{conversation_id}", responses={404: {"description": "Missing or someone else's"}}
+)
+async def rename_conversation(
+    conversation_id: uuid.UUID, body: RenameRequest, user: CurrentUser, conversations: Conversations
+) -> ConversationOut:
+    """The title is kept: a later first message no longer replaces it."""
+    try:
+        conversation = await conversations.rename(user.id, conversation_id, body.title)
+    except ConversationNotFound:
+        raise _not_found() from None
+    return ConversationOut.model_validate(conversation)
+
+
+@manage_router.delete(
+    "/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        404: {"description": "Missing or someone else's conversation"},
+        409: {"description": "conversation_busy: an answer is being generated"},
+    },
+)
+async def delete_conversation(
+    conversation_id: uuid.UUID, user: CurrentUser, conversations: Conversations
+) -> None:
+    """Hard delete with its messages and their llm_calls; no trash, no undo."""
+    try:
+        await conversations.delete(user.id, conversation_id)
+    except ConversationNotFound:
+        raise _not_found() from None
+    except ConversationBusy:
+        raise _busy() from None
+
+
+@manage_router.delete(
+    "",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={409: {"description": "conversation_busy: one of them is generating; none deleted"}},
+)
+async def delete_all_conversations(
+    body: DeleteAllRequest, user: CurrentUser, conversations: Conversations
+) -> None:
+    """Hard-deletes every conversation of the user; body {"confirm": "DELETE_ALL"}."""
+    try:
+        await conversations.delete_all(user.id)
+    except ConversationBusy:
+        raise _busy() from None

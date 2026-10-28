@@ -66,7 +66,7 @@ class World:
         self.locks = ConversationLocks()
         self.moderator = moderator or FakeModerator()
         self.chat = ChatService(
-            ConversationService(self.repo),
+            ConversationService(self.repo, self.locks),
             ResilientLLM(self.providers, self.recorder, first_token_timeout=0.05),
             TokenBudgetContextBuilder(
                 self.repo, prompts or FilePromptProvider(), knowledge=knowledge

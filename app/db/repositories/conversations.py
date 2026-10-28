@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Protocol
 
-from sqlalchemy import exists, func, insert, select, tuple_, update
+from sqlalchemy import delete, exists, func, insert, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.models import Conversation, LLMCall, Message, MessageRole
@@ -23,6 +23,19 @@ class ConversationRepository(Protocol):
         self, user_id: uuid.UUID, limit: int, cursor: Cursor | None
     ) -> Page[Conversation]:
         """Most recently active first (last_message_at desc)."""
+        ...
+
+    async def ids(self, user_id: uuid.UUID) -> list[uuid.UUID]: ...
+
+    async def rename(
+        self, user_id: uuid.UUID, conversation_id: uuid.UUID, title: str
+    ) -> Conversation | None:
+        """The renamed conversation, None if it is missing or someone else's."""
+        ...
+
+    async def delete(self, user_id: uuid.UUID, conversation_ids: Sequence[uuid.UUID]) -> int:
+        """Hard-deletes these of the user's conversations; messages and their llm_calls go by
+        ON DELETE CASCADE. Returns how many conversations were deleted."""
         ...
 
     async def list_messages_page(
@@ -126,6 +139,37 @@ class SqlConversationRepository:
             )
         )
         return _page(rows, limit, lambda c: Cursor(c.last_message_at, c.id))
+
+    async def ids(self, user_id: uuid.UUID) -> list[uuid.UUID]:
+        return list(
+            await self._session.scalars(
+                select(Conversation.id).where(Conversation.user_id == user_id)
+            )
+        )
+
+    async def rename(
+        self, user_id: uuid.UUID, conversation_id: uuid.UUID, title: str
+    ) -> Conversation | None:
+        conversation: Conversation | None = await self._session.scalar(
+            update(Conversation)
+            .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
+            .values(title=title)
+            .returning(Conversation)
+        )
+        await self._session.commit()
+        return conversation
+
+    async def delete(self, user_id: uuid.UUID, conversation_ids: Sequence[uuid.UUID]) -> int:
+        if not conversation_ids:
+            return 0
+        deleted = await self._session.scalars(
+            delete(Conversation)
+            .where(Conversation.user_id == user_id, Conversation.id.in_(conversation_ids))
+            .returning(Conversation.id)
+        )
+        count = len(deleted.all())
+        await self._session.commit()
+        return count
 
     async def list_messages_page(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, limit: int, cursor: Cursor | None
