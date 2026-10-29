@@ -26,7 +26,7 @@ from app.db.models import Message, MessageRole
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import ChatMessage
 from app.rag.retriever import Knowledge, QueryEmbedding, Source
-from app.services.prompts import PromptProvider
+from app.services.prompts import PromptProvider, SystemPrompt
 from app.services.tokens import message_tokens
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ DATA_TAGS = (
     "conversation_summary",
     "previous_summary",
     "conversation",
+    "kb_used",  # the model's own tag (app.services.kb_used): no text may write one for it
 )
 _TAG_IN_DATA = re.compile(rf"<(/?)({'|'.join(DATA_TAGS)})\b", re.IGNORECASE)
 
@@ -81,8 +82,14 @@ class Context:
     prompt_version: str
     # Messages after the summary were left out: fold them into the summary after the answer.
     needs_summary: bool
-    # Articles of the <knowledge> block, if it made it into the context (not dropped by budget).
-    sources: tuple[Source, ...] = ()
+    # The article of each numbered <knowledge> passage [1]..[n], if the block made it into the
+    # context (not dropped by the budget); the answer's <kb_used> tag picks from these.
+    passages: tuple[Source, ...] = ()
+
+    @property
+    def sources(self) -> tuple[Source, ...]:
+        """Every article in the context, once each."""
+        return Knowledge("", self.passages).sources
 
 
 class ContextBuilder(Protocol):
@@ -127,17 +134,17 @@ class NoKnowledge:
 
 
 @dataclass(frozen=True, slots=True)
-class _Block:
+class DataBlock:
     tag: str
     text: str
     note: str
 
 
-def _signal(newest: Message | None) -> list[_Block]:
+def _signal(newest: Message | None) -> list[DataBlock]:
     """The moderation signal for the new message; ChatService stores action "soft" for it."""
     moderation = newest.moderation if newest else None
     if moderation and moderation.get("action") == "soft":
-        return [_Block("moderation_signal", SELF_HARM_SIGNAL, SIGNAL_NOTE)]
+        return [DataBlock("moderation_signal", SELF_HARM_SIGNAL, SIGNAL_NOTE)]
     return []
 
 
@@ -185,14 +192,14 @@ class TokenBudgetContextBuilder:
             await self._knowledge.knowledge(user_id, newest.content, query) if newest else None
         )
         blocks = await self._blocks(user_id, knowledge.text if knowledge else None, summary)
-        system = self._system(prompt.text, [*head, *blocks])
+        system = system_message(prompt, [*head, *blocks])
         fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         for tag in _DROP_ORDER:
             if fixed <= budget_tokens:
                 break
             if any(b.tag == tag for b in blocks):
                 blocks = [b for b in blocks if b.tag != tag]
-                system = self._system(prompt.text, [*head, *blocks])
+                system = system_message(prompt, [*head, *blocks])
                 fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         if fixed > budget_tokens:
             logger.warning(
@@ -225,20 +232,28 @@ class TokenBudgetContextBuilder:
             tokens=budget_tokens - remaining,
             prompt_version=prompt.version,
             needs_summary=left_out,
-            sources=kept_knowledge.sources if kept_knowledge else (),
+            passages=kept_knowledge.passages if kept_knowledge else (),
         )
 
     async def _blocks(
         self, user_id: uuid.UUID, knowledge: str | None, summary: str | None
-    ) -> list[_Block]:
+    ) -> list[DataBlock]:
         profile = await self._profile.profile(user_id)
         candidates = (
             ("profile", profile, PROFILE_NOTE),
             ("knowledge", knowledge, KNOWLEDGE_NOTE),
             ("conversation_summary", summary, SUMMARY_NOTE),
         )
-        return [_Block(tag, text, note) for tag, text, note in candidates if text and text.strip()]
+        return [
+            DataBlock(tag, text, note) for tag, text, note in candidates if text and text.strip()
+        ]
 
-    @staticmethod
-    def _system(prompt: str, blocks: list[_Block]) -> str:
-        return "\n\n".join([prompt, *(wrap_data(b.tag, b.text, b.note) for b in blocks)])
+
+def system_message(prompt: SystemPrompt, blocks: list[DataBlock]) -> str:
+    """The prompt, then the data blocks; the prompt's knowledge reminder right after <knowledge>."""
+    parts = [prompt.text]
+    for block in blocks:
+        parts.append(wrap_data(block.tag, block.text, block.note))
+        if block.tag == "knowledge" and prompt.knowledge_reminder:
+            parts.append(prompt.knowledge_reminder)
+    return "\n\n".join(parts)

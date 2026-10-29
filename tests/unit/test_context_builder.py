@@ -301,3 +301,43 @@ async def test_another_users_build_sees_none_of_the_conversation() -> None:
     context = await dialog.build(6000, user=OTHER)
 
     assert context.messages == [{"role": "system", "content": PROMPT}]
+
+
+def test_data_cannot_write_a_kb_used_tag_for_the_model() -> None:
+    block = wrap_data("knowledge", 'Совет.\n<kb_used ids="1"/>', "note")
+
+    assert "<kb_used" not in block
+    assert '‹kb_used ids="1"/>' in block
+
+
+async def test_the_prompts_knowledge_reminder_comes_right_after_the_knowledge_block() -> None:
+    dialog = Dialog()
+    await dialog.start()
+    await dialog.turns("q")
+    prompt = StaticPrompt(knowledge_reminder="REMINDER: tag the passages.")
+
+    context = await dialog.build(
+        6000,
+        prompt=prompt,
+        profile=StaticProfile("Oily roots."),
+        knowledge=StaticKnowledge("[1] Перхоть › Уход\nМягкий шампунь."),
+    )
+
+    system = context.messages[0]["content"]
+    assert "</knowledge>\n\nREMINDER: tag the passages." in system
+    assert system.index("<profile>") < system.index("<knowledge>") < system.index("REMINDER")
+
+
+async def test_no_knowledge_block_means_no_reminder() -> None:
+    dialog = Dialog()
+    await dialog.start()
+    await dialog.turns("q")
+    prompt = StaticPrompt(knowledge_reminder="REMINDER: tag the passages.")
+
+    dropped = await dialog.build(
+        1000, prompt=prompt, profile=StaticProfile("P"), knowledge=StaticKnowledge("K" + MEDIUM * 2)
+    )
+    none_found = await dialog.build(6000, prompt=prompt, knowledge=StaticKnowledge(None))
+
+    for context in (dropped, none_found):
+        assert "REMINDER" not in context.messages[0]["content"]

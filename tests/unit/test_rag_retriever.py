@@ -156,3 +156,19 @@ async def test_misconfigured_embeddings_are_logged_as_error(
     [record] = caplog.records
     assert record.levelno == logging.ERROR
     assert "location_unsupported" in record.getMessage()
+
+
+async def test_passages_are_numbered_for_the_kb_used_tag_one_source_each() -> None:
+    kb = StaticKB(
+        hit("dandruff", 0.9, title="Перхоть"),
+        hit("choosing-shampoo", 0.8, title="Как выбрать шампунь"),
+        hit("dandruff", 0.7, "dandruff › other\ntext", title="Перхоть"),
+    )
+
+    result = await knowledge(kb).knowledge(USER, "q", QUERY)
+
+    assert result is not None
+    assert result.text.startswith("[1] dandruff › section\n")
+    assert "\n\n[2] choosing-shampoo › section\n" in result.text
+    assert "\n\n[3] dandruff › other\n" in result.text
+    assert [s.slug for s in result.passages] == ["dandruff", "choosing-shampoo", "dandruff"]
