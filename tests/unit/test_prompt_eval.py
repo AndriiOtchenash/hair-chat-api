@@ -11,7 +11,7 @@ from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts import prompt_eval
 from tests.llm_fakes import FakeLLMCallRecorder, FakeLLMProvider, fail_before_first, success
 
-GROUPS = {"manual", "off_topic", "educational", "professional", "recurring", "limits", "kb"}
+GROUPS = {"manual", "off_topic", "educational", "professional", "recurring", "limits", "kb", "real"}
 
 
 def factory(provider: FakeLLMProvider) -> prompt_eval.LLMFactory:
