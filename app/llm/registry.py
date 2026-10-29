@@ -39,7 +39,8 @@ PROVIDERS: dict[str, ProviderSpec] = {
 
 MODELS: dict[str, ModelSpec] = {
     "gemini:gemini-3.8-flash": ModelSpec(1_048_576, "low"),
-    "gemini:gemini-3.5-flash-lite": ModelSpec(1_048_576, "low"),
+    # "low" gave first tokens up to ~6 s, "minimal" under ~1 s; "none" is a 400 (latency_probe).
+    "gemini:gemini-3.5-flash-lite": ModelSpec(1_048_576, "minimal"),
     "groq:openai/gpt-oss-120b": ModelSpec(131_072, "low"),
 }
 

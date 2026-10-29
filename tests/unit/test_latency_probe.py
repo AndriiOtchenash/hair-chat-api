@@ -4,6 +4,7 @@ import pytest
 
 from app.core.config import Settings
 from app.llm.base import LLMProvider, ProviderHTTPError, StreamEnd
+from app.llm.registry import MODELS
 from app.services.context_builder import system_message
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts import latency_probe
@@ -91,7 +92,12 @@ def test_summary_counts_first_tokens_later_than_the_chat_timeout() -> None:
 
 @pytest.mark.parametrize(
     ("thinking", "expected"),
-    [("registry", "low"), ("default", None), ("off", "none"), ("minimal", "minimal")],
+    [
+        ("registry", MODELS[LINK].reasoning_effort),
+        ("default", None),
+        ("off", "none"),
+        ("low", "low"),
+    ],
 )
 def test_thinking_maps_to_reasoning_effort(thinking: str, expected: str | None) -> None:
     assert latency_probe.reasoning_effort(thinking, LINK) == expected
