@@ -271,3 +271,26 @@ async def test_query_embedder_embeds_the_dialog_query_in_the_same_call() -> None
 
     assert query == DIALOG_QUERY
     assert embedder.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("embedder", "outcome"),
+    [
+        (FakeEmbedder(), "ok"),
+        (FakeEmbedder(error=EmbeddingUnavailable("RateLimitError:429")), "RateLimitError:429"),
+        (FakeEmbedder(hang=True), "timeout"),
+    ],
+)
+async def test_every_embed_query_logs_outcome_timing_and_lengths_without_the_text(
+    caplog: pytest.LogCaptureFixture, embedder: FakeEmbedder, outcome: str
+) -> None:
+    with caplog.at_level(logging.INFO, logger="app.rag.retriever"):
+        await RagQueryEmbedder(embedder, timeout=0.01).embed_query("секрет", "тайна\nсекрет")
+
+    [line] = [r.getMessage() for r in caplog.records if r.getMessage().startswith("embed_query")]
+    assert f"outcome={outcome} " in line
+    assert "elapsed_ms=" in line
+    assert "n_texts=2" in line
+    assert "chars=6,12" in line
+    assert "секрет" not in caplog.text
+    assert "тайна" not in caplog.text

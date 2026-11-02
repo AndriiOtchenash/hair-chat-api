@@ -10,6 +10,7 @@ from app.core.chat import check_deployed_config, close_llm, get_moderator
 from app.core.config import get_settings
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
+from app.core.loop_monitor import start_loop_monitor, stop_loop_monitor
 from app.core.security import current_user, get_token_verifier
 from app.db.session import get_engine
 
@@ -31,7 +32,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await check_deployed_config(get_settings())
     if not get_moderator().enabled:
         logger.warning("OPENAI_API_KEY not set: input moderation is off (dev only)")
+    lag_monitor = start_loop_monitor()
     yield
+    await stop_loop_monitor(lag_monitor)
     await close_llm()
     await get_engine().dispose()
     if (verifier := get_token_verifier()) is not None:
