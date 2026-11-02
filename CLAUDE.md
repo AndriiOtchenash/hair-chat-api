@@ -84,8 +84,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   or close a block such as `<moderation_signal>`),
   then as many recent messages as fit, then the new message. The prompt is never cut.
 - Reply language (system_v7+): the latest message if clearly uk/pl/en/ru; short/ambiguous ->
-  the interface language; any other language -> interface language + one sentence on the
-  supported languages. users.locale is passed explicitly (`ChatService.reply(..., locale=)` ->
+  the language of the assistant's latest reply (first message: the interface language); any
+  other language -> interface language + one sentence on the supported languages. users.locale is passed explicitly (`ChatService.reply(..., locale=)` ->
   `ContextBuilder.build(locale=)`) and fills the prompt's `{locale}` (`SystemPrompt.render`).
 - Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
   `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).

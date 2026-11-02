@@ -59,21 +59,24 @@ async def test_reply_language_is_the_latest_message_else_the_interface_locale() 
 
     assert "reply in ukrainian, polish, english or russian only" in text
     assert "the user's interface language is {locale}" in text
-    assert "from the user's latest message alone" in text
+    assert "choose the reply language from the user's latest message" in text
     for source in ("earlier messages", "summary", "profile", "reference data"):
         assert source in text, source
     assert "clearly written in ukrainian, polish, english or russian, reply in exactly" in text
-    # Greetings, one word, "ok", emoji: the interface language, not a guess.
-    assert (
-        'a greeting, a single word, "ok", an emoji, a number), reply in {locale}, '
-        "with no note about languages" in text
-    )
+    # Greetings, one word, "ok", emoji: the interface language on the first message, ...
+    # ... mid-conversation: the language of the conversation so far.
+    assert 'a greeting, a single word, "ok", "thanks", an emoji, a number)' in text
+    assert "if the conversation already has your replies, keep the language of your latest" in text
+    assert "(polish after a polish reply, english after an english reply)" in text
+    assert "only if it is the first message, reply in {locale}" in text
+    assert "add no note about languages" in text
     # Any other language: the interface language plus one sentence about what we support.
     assert "any other language" in text
     assert "saying that you answer in ukrainian, polish, english and russian" in text
     assert "write the whole answer in {locale}, from its first sentence" in text
     assert "counts as short even if it comes from another language" in text
     assert "a message in ukrainian gets a reply in ukrainian" in text
+    assert "a short or ambiguous message keeps the language of your latest reply" in text
     assert "otherwise reply in {locale}" in text
 
 
@@ -198,3 +201,5 @@ async def test_the_knowledge_reminder_repeats_the_kb_used_rule() -> None:
     assert '<kb_used ids="..."/>' in reminder
     assert "add no tag" in reminder
     assert "never mention the tag" in reminder.lower()
+    # Right before the dialog: Russian passages must not pull the answer into Russian.
+    assert "they never decide the language of your answer" in reminder

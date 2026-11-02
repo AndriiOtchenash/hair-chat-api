@@ -387,3 +387,30 @@
   expect:
     - українською, хоча інтерфейс російський
     - м'який догляд після фарбування, без обіцянок результатів
+- id: language-ok-polish-dialog
+  group: language
+  lang: en
+  locale: ru
+  answer_lang: pl
+  history:
+    - role: user
+      content: "Jak często myć przetłuszczające się włosy?"
+    - role: assistant
+      content: "Najlepiej wtedy, gdy włosy stają się tłuste, nawet codziennie, łagodnym szamponem."
+  text: "ok"
+  expect:
+    - коротко по-польски (язык беседы), не по-русски
+    - без фразы о языках
+- id: language-thanks-english-dialog
+  group: language
+  lang: en
+  locale: ru
+  history:
+    - role: user
+      content: "How can I protect my hair from heat styling?"
+    - role: assistant
+      content: "Use a heat protectant, keep the iron below 180 °C and let your hair dry first."
+  text: "thanks"
+  expect:
+    - коротко по-английски (язык беседы), не по-русски
+    - без фразы о языках
