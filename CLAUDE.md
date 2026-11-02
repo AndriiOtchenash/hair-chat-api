@@ -208,7 +208,7 @@ uv run python -m scripts.moderation_eval            # moderation eval set, real 
 uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge base, real embeddings
 uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI
 uv run python -m scripts.prompt_eval                # prompt eval, real LLM chain, prints answers
-uv run python -m app.cli.rag_report [--days 7]     # KB use of recent answers (DATABASE_URL)
+uv run python -m app.cli.rag_report [--days 7]      # KB use of recent answers (DATABASE_URL)
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
