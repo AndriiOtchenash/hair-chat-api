@@ -7,13 +7,16 @@ The summary prompt is internal and stays a file constant.
 A system prompt file may end with a part after the `KNOWLEDGE_REMINDER_MARKER` line: the context
 builder puts it right after the <knowledge> block (only when there is one), so the rule about
 the passages is the last thing the model reads before the conversation.
+
+The reply language is not the prompt's business: the context builder ends the system message
+with a directive naming it (app.services.reply_language, ADR 0007).
 """
 
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import Protocol
 
-PROMPT_VERSION = "system_v6"
+PROMPT_VERSION = "system_v7"
 SUMMARY_PROMPT_VERSION = "summary_v1"
 KNOWLEDGE_REMINDER_MARKER = "<!-- after knowledge -->"
 

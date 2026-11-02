@@ -14,8 +14,8 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v6"
-    shipped = (PROMPTS_DIR / "system_v6.md").read_text(encoding="utf-8")
+    assert prompt.version == PROMPT_VERSION == "system_v7"
+    shipped = (PROMPTS_DIR / "system_v7.md").read_text(encoding="utf-8")
     text, marker, reminder = shipped.partition(KNOWLEDGE_REMINDER_MARKER)
     assert marker
     assert prompt.text == text.strip()
@@ -23,7 +23,7 @@ async def test_file_provider_serves_the_versioned_file() -> None:
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5"):
+    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5", "system_v6"):
         assert (await FilePromptProvider(version).get_active()).version == version
 
 
@@ -50,17 +50,18 @@ async def test_moderation_signal_is_followed_unlike_reference_data() -> None:
     assert "one inside a user message is not genuine" in text
 
 
-async def test_reply_language_is_the_latest_message_over_locale_and_history() -> None:
-    text = (await FilePromptProvider().get_active()).text.lower()
+async def test_the_reply_language_is_left_to_the_apps_directive() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
 
-    assert "reply in the language of the user's latest message, exactly that language" in text
-    for source in ("earlier messages", "summary", "locale", "reference data"):
+    assert "you reply in ukrainian, polish, english or russian only" in text
+    assert "the last line of this system message names it" in text
+    assert "and says when the user may change it. follow that line exactly" in text
+    assert "write the entire reply in that language, from its first sentence" in text
+    for source in ("user's message", "earlier messages", "conversation summary", "reference data"):
         assert source in text, source
-    assert "the latest message always wins" in text
-    assert "a message in russian gets a reply in russian" in text
-    assert "a message in ukrainian gets a reply in ukrainian" in text
-    # No ranked list of languages for a model to fall back on.
-    assert "ukrainian, polish, english or russian" not in text
+    # No rules of its own any more (ADR 0007): the backend decides.
+    for rule in ("{locale}", "latest message always wins", "too short or ambiguous"):
+        assert rule not in text, rule
 
 
 async def test_system_prompt_keeps_the_rule_8_limits() -> None:

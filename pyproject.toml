@@ -10,6 +10,7 @@ dependencies = [
     "fastapi>=0.143.0",
     "httpx>=0.28.1",
     "httpx2>=2.13.1",
+    "lingua-language-detector>=2.2.0",
     "openai>=3.31.0",
     "pgvector>=0.5.1",
     "pydantic-settings>=2.15.0",

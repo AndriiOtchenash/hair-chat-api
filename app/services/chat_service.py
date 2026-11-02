@@ -15,7 +15,7 @@ from contextlib import ExitStack, aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from app.db.models import Conversation, Message, MessageRole
+from app.db.models import Conversation, Locale, Message, MessageRole
 from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
@@ -129,9 +129,12 @@ class Reply:
         user_message_id: uuid.UUID,
         safety_notice: SafetyNotice | None = None,
         query: QueryResult = None,
+        *,
+        locale: Locale,
     ) -> None:
         self._service = service
         self._query = query
+        self._locale = locale
         self.user_id = user_id
         self.conversation_id = conversation_id
         self.user_message_id = user_message_id
@@ -173,7 +176,11 @@ class Reply:
             yield self.safety_notice
         try:
             context = await service.context_builder.build(
-                self.user_id, self.conversation_id, service.budget_tokens, self._query
+                self.user_id,
+                self.conversation_id,
+                service.budget_tokens,
+                self._query,
+                locale=self._locale,
             )
             answer: list[str] = []
             # Cuts the <kb_used> tag out of the stream: neither the client nor the DB sees it.
@@ -350,9 +357,12 @@ class ChatService:
 
     @asynccontextmanager
     async def reply(
-        self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str
+        self, user_id: uuid.UUID, conversation_id: uuid.UUID, content: str, *, locale: Locale
     ) -> AsyncIterator[Reply]:
         """Raises ConversationNotFound / ConversationBusy / MessageBlocked before anything is saved.
+
+        `locale` (users.locale) is the reply language for messages too short, ambiguous or in a
+        language we do not support (prompt system_v7+).
 
         The slot is held until the block exits, i.e. until the stream ends or is cancelled.
         Moderation runs after the slot is taken, so a busy conversation costs no moderation call.
@@ -375,7 +385,7 @@ class ChatService:
             # The context builder reads the same "soft" mark from the saved message.
             soft = moderation.get("action") == ModerationAction.SOFT
             notice = SELF_HARM_NOTICE if soft else None
-            reply = Reply(self, user_id, conversation_id, message.id, notice, query)
+            reply = Reply(self, user_id, conversation_id, message.id, notice, query, locale=locale)
             try:
                 yield reply
             finally:

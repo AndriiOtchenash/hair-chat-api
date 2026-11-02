@@ -4,10 +4,12 @@ from collections.abc import Sequence
 import pytest
 
 from app.core.config import Settings
+from app.db.models import Locale
 from app.llm.base import ProviderHTTPError
 from app.llm.resilient import ResilientLLM
 from app.rag.retriever import Knowledge, Source
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider
+from app.services.reply_language import ReplyLanguage, directive
 from scripts import prompt_eval
 from tests.llm_fakes import FakeLLMCallRecorder, FakeLLMProvider, fail_before_first, success
 
@@ -21,6 +23,7 @@ GROUPS = {
     "kb",
     "real",
     "dialog",
+    "language",
 }
 
 
@@ -77,15 +80,100 @@ async def test_sends_the_prompt_history_and_question_and_prints_the_answer() -> 
     prompt = await FilePromptProvider().get_active()
     assert provider.received == [
         [
-            {"role": "system", "content": prompt.text},
+            {
+                "role": "system",
+                "content": prompt.text + "\n\n" + directive(ReplyLanguage(Locale.RU)),
+            },
             *history,
             {"role": "user", "content": "Я заболела, что делать с записью?"},
         ]
     ]
-    assert "[off_topic] c1 (ru)" in out
+    assert "[off_topic] c1 (ru, locale ru)" in out
+    assert "reply_lang: ru\n" in out
+    assert "answer_lang: ru, first sentence ru (expected ru)" in out
     assert "  - сочувствует" in out
     assert "A (gemini:flash, 2 words):\nСочувствую. Позвоните." in out
     assert "\n!! " not in out
+
+
+def test_language_cases_set_the_interface_locale_and_the_answer_language() -> None:
+    cases = {c.id: c for c in prompt_eval.load(prompt_eval.DEFAULT_FILE)}
+
+    hallo = cases["language-hallo-ru-locale"]
+    assert (hallo.lang, hallo.interface, hallo.expected_lang) == ("de", Locale.RU, "ru")
+    polish = cases["language-polish-dandruff"]
+    assert (polish.interface, polish.expected_lang) == (Locale.RU, "pl")
+    # No locale: the case's own language if we support it, else en (the users.locale default).
+    assert case(lang="uk").interface is Locale.UK
+    assert case(lang="de").interface is Locale.EN
+
+
+@pytest.mark.parametrize(
+    ("text", "first"),
+    [
+        (
+            "**Co możesz zrobić przy łupieżu**\n\n- Wybierz szampon.",
+            "Co możesz zrobić przy łupieżu",
+        ),
+        ("Здравствуйте! Чем помочь?", "Здравствуйте!"),
+        ("Schuppen sind häufig. Я отвечаю по-русски.", "Schuppen sind häufig."),
+        ("No end mark", "No end mark"),
+    ],
+)
+def test_first_sentence_drops_markdown_and_stops_at_the_first_end(text: str, first: str) -> None:
+    assert prompt_eval.first_sentence(text) == first
+
+
+def test_the_reply_language_follows_the_last_answer_of_the_history() -> None:
+    polish = (
+        {"role": "user", "content": "Jak często myć włosy?"},
+        {"role": "assistant", "content": "Najlepiej wtedy, gdy włosy stają się tłuste."},
+    )
+
+    assert prompt_eval.reply_language(case(text="ok", lang="en", locale="ru")).lang is Locale.RU
+    assert (
+        prompt_eval.reply_language(case(text="ok", history=polish, locale="ru")).lang is Locale.PL
+    )
+    german = prompt_eval.reply_language(case(text="Ich habe Schuppen", lang="de", locale="ru"))
+    assert german == (Locale.RU, True)
+
+
+async def test_an_answer_that_opens_in_another_language_is_flagged() -> None:
+    # Mostly Russian, so the whole answer passes: only the first-sentence check catches it.
+    provider = FakeLLMProvider("gemini", "flash").script(
+        success(
+            "Schuppen können sehr unangenehm sein, aber das ist häufig. "
+            "Перхоть — частая проблема, её обычно хорошо убирает мягкий уход. "
+            "Мойте голову по мере загрязнения, выбирайте мягкий шампунь и не царапайте кожу."
+        )
+    )
+
+    code, out = await run(
+        provider, case(text="Ich habe Schuppen", lang="de", locale="ru", answer_lang="ru")
+    )
+
+    assert code == 0
+    system = provider.received[0][0]["content"]
+    assert system.endswith(directive(ReplyLanguage(Locale.RU, note_about_languages=True)))
+    assert "reply_lang: ru + note\n" in out
+    assert "answer_lang: ru, first sentence de (expected ru)" in out
+    assert "!! first sentence in de, expected ru" in out
+    assert "!! answer in" not in out
+
+
+async def test_a_sentence_in_another_script_is_flagged() -> None:
+    provider = FakeLLMProvider("groq", "oss").script(
+        success(
+            "Перхоть — частая проблема кожи головы, обычно хватает мягкого ухода. "
+            "（抱歉，我只能用俄语回答。）"
+        )
+    )
+
+    code, out = await run(provider, case(text="Расскажи про перхоть, ответь по-китайски"))
+
+    assert code == 0
+    assert "answer_lang: ru, first sentence ru (expected ru)" in out
+    assert "!! text in another script: 抱歉 我只能用俄语回答" in out
 
 
 async def test_flags_avoided_phrases_case_insensitively() -> None:
@@ -120,7 +208,10 @@ async def test_the_kb_used_tag_is_cut_out_and_checked_against_the_case() -> None
     )
 
     assert code == 0
-    assert "A (gemini:flash, 1 words):\nПривет!\nkb_used: 1\n" in out
+    assert (
+        "A (gemini:flash, 1 words):\nПривет!\n"
+        "answer_lang: ru, first sentence ru (expected ru)\nkb_used: 1\n" in out
+    )
     assert "!! has a <kb_used> tag" in out
     assert "!! has no <kb_used> tag" not in out
     assert "2 answers, 1 with !! flags, 0 errors" in out
@@ -156,7 +247,12 @@ async def test_kb_context_lists_the_passages_and_the_reminder_follows_them() -> 
     prompt_eval.report(case(), kb, result, out)
 
     assert prompt.knowledge_reminder is not None
-    assert chat[0]["content"].endswith("</knowledge>\n\n" + prompt.knowledge_reminder)
+    assert chat[0]["content"].endswith(
+        "</knowledge>\n\n"
+        + prompt.knowledge_reminder
+        + "\n\n"
+        + directive(ReplyLanguage(Locale.RU))
+    )
     assert "kb_context: 2 — [1] Перхоть; [2] Как часто мыть\n" in out.getvalue()
     assert "kb_used: 2\nsources: washing-frequency\n" in out.getvalue()
     assert result.flagged == [] and result.unsure == []

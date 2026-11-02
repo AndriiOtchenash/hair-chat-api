@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from app.db.models import MessageRole
+from app.db.models import Locale, MessageRole
 from app.db.repositories.kb import KBHit, KBRepository
 from app.llm.base import ProviderHTTPError, ProviderTimeout, Restart, StreamBroken, Token
 from app.llm.moderation import ModerationResult, ModerationUnavailable, Moderator, NoopModerator
@@ -30,6 +30,7 @@ from app.services.context_builder import (
     TokenBudgetContextBuilder,
 )
 from app.services.prompts import FilePromptProvider, PromptProvider
+from app.services.reply_language import ReplyLanguage, directive
 from tests.fakes import FakeConversationRepository, StaticPrompt
 from tests.llm_fakes import (
     FakeEmbedder,
@@ -85,7 +86,7 @@ class World:
     async def send(
         self, conversation_id: uuid.UUID, content: str = "How often to wash?"
     ) -> list[ChatEvent]:
-        async with self.chat.reply(USER, conversation_id, content) as reply:
+        async with self.chat.reply(USER, conversation_id, content, locale=Locale.EN) as reply:
             return [event async for event in reply.events()]
 
 
@@ -110,6 +111,17 @@ async def test_success_saves_both_messages_and_ends_with_done() -> None:
     assistant = world.repo.of(conversation_id)[-1]
     assert done.message_id == assistant.id
     assert (assistant.provider, assistant.model) == ("gemini", "flash")
+
+
+async def test_a_short_first_message_is_answered_in_the_given_interface_language() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(success("Witaj!"))
+    world = World(provider)
+    conversation_id = await world.conversation()
+
+    async with world.chat.reply(USER, conversation_id, "hallo", locale=Locale.PL) as reply:
+        [event async for event in reply.events()]
+
+    assert provider.received[0][0]["content"].endswith(directive(ReplyLanguage(Locale.PL)))
 
 
 async def test_first_message_sets_title_to_60_chars_later_ones_do_not() -> None:
@@ -220,7 +232,7 @@ async def test_client_cancel_mid_stream_saves_no_answer_and_frees_the_slot() -> 
     first_token = asyncio.Event()
 
     async def client() -> None:
-        async with world.chat.reply(USER, conversation_id, "question") as reply:
+        async with world.chat.reply(USER, conversation_id, "question", locale=Locale.EN) as reply:
             async for event in reply.events():
                 if isinstance(event, Token):
                     first_token.set()
@@ -245,9 +257,9 @@ async def test_second_reply_while_generating_is_busy() -> None:
     world = World(FakeLLMProvider("gemini", "flash").script(hang()))
     conversation_id = await world.conversation()
 
-    async with world.chat.reply(USER, conversation_id, "first"):
+    async with world.chat.reply(USER, conversation_id, "first", locale=Locale.EN):
         with pytest.raises(ConversationBusy):
-            async with world.chat.reply(USER, conversation_id, "second"):
+            async with world.chat.reply(USER, conversation_id, "second", locale=Locale.EN):
                 pass  # pragma: no cover
 
     # The rejected request saved nothing.
@@ -259,7 +271,7 @@ async def test_other_conversations_are_not_blocked() -> None:
     world = World()
     first, second = await world.conversation(), await world.conversation()
 
-    async with world.chat.reply(USER, first, "q"):
+    async with world.chat.reply(USER, first, "q", locale=Locale.EN):
         assert isinstance((await world.send(second))[-1], ChatDone)
 
 
@@ -269,7 +281,7 @@ async def test_someone_elses_or_missing_conversation_is_not_found() -> None:
 
     for conversation_id in (foreign, uuid.uuid4()):
         with pytest.raises(ConversationNotFound):
-            async with world.chat.reply(USER, conversation_id, "q"):
+            async with world.chat.reply(USER, conversation_id, "q", locale=Locale.EN):
                 pass  # pragma: no cover
         with pytest.raises(ConversationNotFound):
             await world.chat.conversations.list_messages(USER, conversation_id, 20, None)
@@ -286,11 +298,11 @@ async def test_summary_is_due_after_an_answer_whose_context_left_messages_out() 
     world = World(budget=TIGHT_BUDGET, prompts=StaticPrompt())
     conversation_id = await world.conversation()
 
-    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE, locale=Locale.EN) as reply:
         _ = [event async for event in reply.events()]
     assert not reply.summary_due  # everything fit
 
-    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE, locale=Locale.EN) as reply:
         events = [event async for event in reply.events()]
     assert isinstance(events[-1], ChatDone)
     assert reply.summary_due
@@ -307,7 +319,7 @@ async def test_no_summary_is_due_when_the_reply_failed() -> None:
     conversation_id = await world.conversation()
     await world.send(conversation_id, MESSAGE)
 
-    async with world.chat.reply(USER, conversation_id, MESSAGE) as reply:
+    async with world.chat.reply(USER, conversation_id, MESSAGE, locale=Locale.EN) as reply:
         events = [event async for event in reply.events()]
 
     assert isinstance(events[-1], ChatError)

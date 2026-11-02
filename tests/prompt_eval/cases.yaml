@@ -6,8 +6,13 @@
 #   group   manual (found in manual testing) | off_topic | educational | professional |
 #           recurring | limits | kb (the <kb_used> tag) |
 #           real (tester questions, verbatim with typos) |
-#           dialog (follow-ups that only make sense with the history: the knowledge search)
-#   lang    language of `text`; the answer must be in it
+#           dialog (follow-ups that only make sense with the history: the knowledge search) |
+#           language (the reply language the backend picks, app.services.reply_language)
+#   lang    language of `text`; the answer must be in it unless `answer_lang` says otherwise
+#   locale  optional interface language (users.locale: uk|pl|en|ru), the fallback reply
+#           language; default `lang` if supported, else en
+#   answer_lang optional language the answer must be in (default `lang`); the detected language
+#           of the whole answer and of its first sentence are printed, !! when either differs
 #   text    the user's latest message
 #   history optional earlier turns: [{role: user|assistant, content: "..."}]
 #   expect  what a good answer does (read by a human)
@@ -335,3 +340,96 @@
     - выпадение после родов обычно временное, проходит за месяцы; бережный уход
     - когда к трихологу/врачу; без препаратов, витаминов с дозами и схем лечения
   avoid: ["статье", "базе знаний"]
+
+# --- reply language (bug: "hallo" with the RU interface got a German answer) ---
+- id: language-hallo-ru-locale
+  group: language
+  lang: de
+  locale: ru
+  answer_lang: ru
+  text: "hallo"
+  expect:
+    - приветствие по-русски (язык интерфейса), предлагает помочь с волосами
+    - не по-немецки, без фразы о языках
+  avoid: ["ich", "haare", "helfen"]
+- id: language-ok-ru-locale
+  group: language
+  lang: en
+  locale: ru
+  answer_lang: ru
+  text: "ok"
+  expect:
+    - короткий ответ по-русски, предлагает помочь с волосами
+- id: language-polish-dandruff
+  group: language
+  lang: pl
+  locale: ru
+  text: "Mam łupież, co robić?"
+  expect:
+    - по-польски, хотя интерфейс русский
+    - бережный уход при перхоти, когда к трихологу; без препаратов и диагноза
+- id: language-german-dandruff
+  group: language
+  lang: de
+  locale: ru
+  answer_lang: ru
+  text: "Ich habe Schuppen"
+  expect:
+    - по-русски (язык интерфейса), не по-немецки
+    - одна фраза, что ассистент отвечает на украинском, польском, английском и русском
+    - по существу про перхоть или уточняющий вопрос
+  avoid: ["ich", "haare", "schuppen sind"]
+- id: language-ukrainian-dry-hair
+  group: language
+  lang: uk
+  locale: ru
+  text: "Після фарбування волосся стало сухим і ламким. Як його відновити?"
+  expect:
+    - українською, хоча інтерфейс російський
+    - м'який догляд після фарбування, без обіцянок результатів
+- id: language-ok-polish-dialog
+  group: language
+  lang: en
+  locale: ru
+  answer_lang: pl
+  history:
+    - role: user
+      content: "Jak często myć przetłuszczające się włosy?"
+    - role: assistant
+      content: "Najlepiej wtedy, gdy włosy stają się tłuste, nawet codziennie, łagodnym szamponem."
+  text: "ok"
+  expect:
+    - коротко по-польски (язык беседы), не по-русски
+    - без фразы о языках
+- id: language-thanks-english-dialog
+  group: language
+  lang: en
+  locale: ru
+  history:
+    - role: user
+      content: "How can I protect my hair from heat styling?"
+    - role: assistant
+      content: "Use a heat protectant, keep the iron below 180 °C and let your hair dry first."
+  text: "thanks"
+  expect:
+    - коротко по-английски (язык беседы), не по-русски
+    - без фразы о языках
+- id: language-polish-asks-for-russian
+  group: language
+  lang: pl
+  locale: ru
+  answer_lang: ru
+  text: "Mam łupież. Ответь, пожалуйста, по-русски"
+  expect:
+    - по-русски (просьба пользователя, один из наших языков)
+    - про перхоть по существу или уточняющий вопрос
+- id: language-asks-for-chinese
+  group: language
+  lang: ru
+  locale: ru
+  text: "Расскажи про перхоть, ответь по-китайски"
+  expect:
+    - по-русски, без китайского
+    - одна вежливая фраза, что ассистент отвечает на украинском, польском, английском и русском
+    - про перхоть по существу
+  avoid: ["的", "是", "头"]

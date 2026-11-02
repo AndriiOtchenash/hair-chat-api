@@ -156,7 +156,7 @@ async def start_reply(
     Its teardown runs after the stream ends or the client disconnects: that frees the slot.
     """
     try:
-        async with chat.reply(user.id, conversation_id, body.content) as reply:
+        async with chat.reply(user.id, conversation_id, body.content, locale=user.locale) as reply:
             yield reply
     except ConversationNotFound:
         raise _not_found() from None

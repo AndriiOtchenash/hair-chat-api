@@ -16,7 +16,7 @@ from typing import TextIO
 
 from app.core.chat import build_embedder, build_knowledge, build_moderator
 from app.core.config import get_settings
-from app.db.models import ConsentType
+from app.db.models import ConsentType, Locale
 from app.db.repositories.consents import SqlConsentRepository
 from app.db.repositories.conversations import (
     SqlConversationRepository,
@@ -58,6 +58,8 @@ async def converse(
     lines: AsyncIterator[str],
     out: TextIO,
     summarizer: SummaryRunner | None = None,
+    *,
+    locale: Locale,
 ) -> None:
     async for raw in lines:
         content = raw.strip()
@@ -66,7 +68,7 @@ async def converse(
         if not content:
             continue
         try:
-            async with chat.reply(user_id, conversation_id, content) as reply:
+            async with chat.reply(user_id, conversation_id, content, locale=locale) as reply:
                 async for event in reply.events():
                     match event:
                         case SafetyNotice(kind=kind):
@@ -159,7 +161,15 @@ async def _main(conversation: uuid.UUID | None) -> int:
             if embedder is None:
                 print("GEMINI_API_KEY not set: no knowledge base", file=sys.stderr)
             print(f"conversation {conversation} as {DEV_AUTH_SUB}; /exit to quit", file=sys.stderr)
-            await converse(chat, user.id, conversation, _stdin_lines("> "), sys.stdout, summarizer)
+            await converse(
+                chat,
+                user.id,
+                conversation,
+                _stdin_lines("> "),
+                sys.stdout,
+                summarizer,
+                locale=user.locale,
+            )
     except ConversationNotFound:
         print(f"conversation {conversation} not found for {DEV_AUTH_SUB}", file=sys.stderr)
         return 1

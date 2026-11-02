@@ -12,6 +12,12 @@ the passage numbers of its <kb_used> tag (cut out of the answer as the chat does
 that would go under it, `!!` for every `avoid` substring found in it and `!!` when the tag is
 there or missing against the case's `kb_used`. A case that expects the tag but got no passages
 is marked `??` instead: its answer says nothing about the prompt.
+The system message ends with the reply-language directive the chat would add (`reply_lang`,
+app.services.reply_language: the case's text, the last assistant turn of its history and its
+`locale`, default `lang` if we support it, else en, like users.locale). Every answer prints the
+detected language of the whole text and of its first sentence alone; each is flagged `!!` when it
+differs from the case's `answer_lang` (default: its `lang`), as is any text in a script none of
+our languages uses (CJK, Arabic...).
 The system message is built like the chat builds it: the prompt file, then the <knowledge> block
 from the docs/kb articles (embedded in memory by the same loader, chunker and RagKnowledge as
 scripts.rag_eval) followed by the prompt's knowledge reminder, then the case's history and the
@@ -26,6 +32,7 @@ No database: llm_calls are not recorded. Exit code 1 only if the chain fails on 
 
 import argparse
 import asyncio
+import re
 import sys
 import uuid
 from collections.abc import Callable, Sequence
@@ -36,6 +43,7 @@ from typing import Any, Literal, TextIO
 import yaml
 
 from app.core.config import Settings, get_settings
+from app.db.models import Locale
 from app.db.repositories.kb import KBRepository
 from app.db.repositories.llm_calls import LLMCallRecord
 from app.llm.base import (
@@ -59,6 +67,12 @@ from app.services.context_builder import (
 )
 from app.services.kb_used import KbUsedFilter, used_sources
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider, SystemPrompt
+from app.services.reply_language import (
+    ReplyLanguage,
+    reply_lang_of,
+    resolve_reply_lang,
+    top_language,
+)
 from scripts.rag_eval import DEFAULT_KB, embed_all
 
 DEFAULT_FILE = Path(__file__).resolve().parents[1] / "tests/prompt_eval/cases.yaml"
@@ -83,6 +97,51 @@ class Case:
     summary: str | None = None
     # Articles whose passages the search must find for `text`; !! when one is missing.
     kb_slugs: tuple[str, ...] = ()
+    # The user's interface language (users.locale); None = `lang` if supported, else en.
+    locale: str | None = None
+    # Language the answer must be in; None = `lang`.
+    answer_lang: str | None = None
+
+    @property
+    def interface(self) -> Locale:
+        if self.locale is not None:
+            return Locale(self.locale)
+        return Locale(self.lang) if self.lang in set(Locale) else Locale.EN
+
+    @property
+    def expected_lang(self) -> str:
+        return self.answer_lang or self.lang
+
+
+# Scripts none of our languages is written in: one such sentence in an otherwise Russian answer
+# passes the language checks (gpt-oss closed an answer with a sentence in Chinese).
+_FOREIGN_SCRIPT = re.compile(
+    "[\u0590-\u08ff\u0e00-\u0e7f\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]+"
+)
+_SENTENCE_END = re.compile(r"[.!?…](?=\s|$)|\n")
+_MARKDOWN = re.compile(r"[*_#>`~|-]+")
+
+
+def first_sentence(text: str) -> str:
+    """The answer's opening sentence, markdown markers dropped."""
+    plain = _MARKDOWN.sub(" ", text).strip()
+    match = _SENTENCE_END.search(plain)
+    return plain[: match.end()].strip() if match else plain
+
+
+def answer_lang(text: str) -> str:
+    """lingua's best guess (app.services.reply_language.LANGUAGES), ? for text without letters.
+
+    No short/unsure rule here: the eval reports what the text looks like, the reader judges."""
+    guess = top_language(text)
+    return guess[0] if guess else "?"
+
+
+def reply_language(case: Case) -> ReplyLanguage:
+    """What the chat would pick for the case (TokenBudgetContextBuilder: the latest answer)."""
+    answers = [t["content"] for t in case.history if t["role"] == "assistant"]
+    last = reply_lang_of(answers[-1]) if answers else None
+    return resolve_reply_lang(case.text, last, case.interface)
 
 
 def _dialog(case: Case, *, summary: bool = True) -> str | None:
@@ -130,6 +189,8 @@ class Answer:
     error: str | None = None
     kb_ids: tuple[int, ...] = ()
     sources: tuple[str, ...] = ()
+    lang: str = "?"  # answer_lang of the whole answer
+    first_lang: str = "?"  # ... and of its first sentence alone
     flagged: list[str] = field(default_factory=list)
     # The case cannot be judged, e.g. it expects a <kb_used> tag but got no passages.
     unsure: list[str] = field(default_factory=list)
@@ -165,6 +226,8 @@ def load(path: Path) -> list[Case]:
             kb_used=r.get("kb_used"),
             summary=r.get("summary"),
             kb_slugs=tuple(r.get("kb_slugs") or ()),
+            locale=r.get("locale"),
+            answer_lang=r.get("answer_lang"),
         )
         for r in rows
     ]
@@ -175,7 +238,7 @@ def messages(prompt: SystemPrompt, case: Case, knowledge: Knowledge | None) -> l
     blocks = [DataBlock("knowledge", knowledge.text, KNOWLEDGE_NOTE)] if knowledge else []
     if case.summary:
         blocks.append(DataBlock("conversation_summary", case.summary, SUMMARY_NOTE))
-    system = system_message(prompt, blocks)
+    system = system_message(prompt, blocks, reply_language(case))
     question: ChatMessage = {"role": "user", "content": case.text}
     turns: list[ChatMessage] = [
         {"role": t["role"], "content": defuse_tags(t["content"])} for t in [*case.history, question]
@@ -265,6 +328,17 @@ async def answer(
     result.sources = tuple(s.slug for s in used_sources(tag.ids, passages))
     lowered = result.text.lower()
     result.flagged = [f"contains {a!r}" for a in case.avoid if a.lower() in lowered]
+    if result.text:
+        result.lang = answer_lang(result.text)
+        result.first_lang = answer_lang(first_sentence(result.text))
+        if result.lang != case.expected_lang:
+            result.flagged.append(f"answer in {result.lang}, expected {case.expected_lang}")
+        if foreign := _FOREIGN_SCRIPT.findall(result.text):
+            result.flagged.append(f"text in another script: {' '.join(foreign)[:40]}")
+        if result.first_lang != case.expected_lang:
+            result.flagged.append(
+                f"first sentence in {result.first_lang}, expected {case.expected_lang}"
+            )
     if case.kb_used and knowledge is None:
         # No passages to rely on: a missing tag is right, so it tells nothing about the prompt.
         result.unsure.append("no kb context")
@@ -275,7 +349,7 @@ async def answer(
 
 def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
     print(RULE, file=out)
-    print(f"[{case.group}] {case.id} ({case.lang})", file=out)
+    print(f"[{case.group}] {case.id} ({case.lang}, locale {case.interface})", file=out)
     for turn in case.history:
         print(f"  {turn['role']}: {turn['content']}", file=out)
     print(f"Q: {case.text}", file=out)
@@ -283,6 +357,8 @@ def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
     for item in case.expect:
         print(f"  - {item}", file=out)
     print(f"kb_context: {kb.describe()}", file=out)
+    reply = reply_language(case)
+    print(f"reply_lang: {reply.lang}" + (" + note" if reply.note_about_languages else ""), file=out)
     if result.error:
         print(f"ERROR {result.error}", file=out)
         return
@@ -293,6 +369,11 @@ def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
         notes.append("truncated")
     print(f"A ({', '.join(notes)}):", file=out)
     print(result.text, file=out)
+    print(
+        f"answer_lang: {result.lang}, first sentence {result.first_lang}"
+        f" (expected {case.expected_lang})",
+        file=out,
+    )
     print(f"kb_used: {', '.join(map(str, result.kb_ids)) or '-'}", file=out)
     print(f"sources: {', '.join(result.sources) or '-'}", file=out)
     for flag in result.flagged:
