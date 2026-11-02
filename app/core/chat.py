@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.core.errors import api_error
+from app.db.repositories.conversation_search import SqlConversationSearchRepository
 from app.db.repositories.conversations import (
     ConversationRepository,
     SqlConversationRepository,
@@ -16,14 +17,17 @@ from app.db.repositories.conversations import (
 )
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
+from app.db.repositories.message_embeddings import sql_message_embedding_repositories
 from app.db.session import get_session, get_sessionmaker
 from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
 from app.llm.registry import build_llm, build_providers
 from app.llm.resilient import ResilientLLM
+from app.rag.conversation_index import AnswerIndexer
 from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
 from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, RagKnowledge, RagQueryEmbedder
 from app.services.chat_service import ChatService, ConversationLocks, ConversationService
 from app.services.context_builder import TokenBudgetContextBuilder
+from app.services.conversation_search import ConversationSearch
 from app.services.prompts import FilePromptProvider, PromptProvider
 from app.services.summarizer import Summarizer, SummaryRunner
 from app.services.tokens import context_budget
@@ -113,6 +117,35 @@ def get_query_embedder(
     return RagQueryEmbedder(embedder, timeout=settings.embedding_timeout_s)
 
 
+def get_answer_indexer(
+    embedder: Annotated[Embedder | None, Depends(get_embedder)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AnswerIndexer | None:
+    """None without an embedder (dev): answers are left for app.cli.index_conversations."""
+    if embedder is None:
+        return None
+    # Its own sessions: it runs as a background job, after the request session is closed.
+    return AnswerIndexer(
+        sql_message_embedding_repositories(get_sessionmaker()),
+        embedder,
+        max_chars=settings.conversation_index_max_chars,
+        timeout=settings.embedding_timeout_s,
+    )
+
+
+def get_conversation_search(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    embedder: Annotated[Embedder | None, Depends(get_embedder)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ConversationSearch:
+    return ConversationSearch(
+        SqlConversationSearchRepository(session),
+        embedder,
+        max_distance=settings.conversation_search_max_distance,
+        timeout=settings.embedding_timeout_s,
+    )
+
+
 def build_knowledge(session: AsyncSession, settings: Settings) -> RagKnowledge:
     return RagKnowledge(
         SqlKBRepository(session),
@@ -164,7 +197,7 @@ Budget = Annotated[int, Depends(get_context_budget)]
 
 
 def get_summarizer(llm: LLM, budget: Budget) -> SummaryRunner:
-    # Its own sessions: it runs as a background task, after the request session is closed.
+    # Its own sessions: it runs as a background job, after the request session is closed.
     return Summarizer(
         sql_conversation_repositories(get_sessionmaker()),
         llm.providers[-1],  # the cheapest link of the chain

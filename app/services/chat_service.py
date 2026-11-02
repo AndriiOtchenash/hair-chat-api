@@ -18,6 +18,7 @@ from typing import Any
 from app.db.models import Conversation, Locale, Message, MessageRole
 from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
+from app.db.repositories.message_embeddings import PendingAnswer
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
 from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
@@ -131,8 +132,12 @@ class Reply:
         query: QueryResult = None,
         *,
         locale: Locale,
+        question: str = "",
+        question_moderation: dict[str, Any] | None = None,
     ) -> None:
         self._service = service
+        self._question = question
+        self._question_moderation = question_moderation
         self._query = query
         self._locale = locale
         self.user_id = user_id
@@ -143,6 +148,9 @@ class Reply:
         # Set with ChatDone: the context left messages out, so the caller should run the
         # summarizer once the answer is delivered (never when the reply failed).
         self.summary_due = False
+        # Set with ChatDone: the saved answer and its question, for the conversation index
+        # (app.rag.conversation_index.AnswerIndexer, a background job after the stream).
+        self.saved_answer: PendingAnswer | None = None
 
     def events(self) -> AsyncIterator[ChatEvent]:
         """SafetyNotice? Token* (Restart Token*)* then ChatDone, or ChatError.
@@ -267,6 +275,14 @@ class Reply:
             context.retrieval.status,
             len(context.passages),
             len(sources),
+        )
+        self.saved_answer = PendingAnswer(
+            message.id,
+            self.user_id,
+            self.conversation_id,
+            answer,
+            self._question,
+            self._question_moderation,
         )
         return ChatDone(message.id, done.provider, done.model, done.truncated, sources=sources)
 
@@ -397,7 +413,17 @@ class ChatService:
             # The context builder reads the same "soft" mark from the saved message.
             soft = moderation.get("action") == ModerationAction.SOFT
             notice = SELF_HARM_NOTICE if soft else None
-            reply = Reply(self, user_id, conversation_id, message.id, notice, query, locale=locale)
+            reply = Reply(
+                self,
+                user_id,
+                conversation_id,
+                message.id,
+                notice,
+                query,
+                locale=locale,
+                question=content,
+                question_moderation=moderation,
+            )
             try:
                 yield reply
             finally:

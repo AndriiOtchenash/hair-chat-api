@@ -4,16 +4,24 @@ from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
-from app.core.chat import get_chat_service, get_conversation_service, get_summarizer
+from app.core.background import BackgroundJobs, get_background_jobs
+from app.core.chat import (
+    get_answer_indexer,
+    get_chat_service,
+    get_conversation_search,
+    get_conversation_service,
+    get_summarizer,
+)
 from app.core.errors import api_error
 from app.core.security import CurrentUser
 from app.db.models import MessageRole
 from app.db.pagination import Cursor, InvalidCursor
 from app.llm.base import Restart, Token
+from app.rag.conversation_index import AnswerIndexer
 from app.services.chat_service import (
     ChatDone,
     ChatError,
@@ -25,6 +33,15 @@ from app.services.chat_service import (
     MessageBlocked,
     Reply,
     SafetyNotice,
+)
+from app.services.conversation_search import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    MAX_QUERY_CHARS,
+    MIN_QUERY_CHARS,
+    ConversationSearch,
+    InvalidSearch,
+    SearchMode,
 )
 from app.services.summarizer import SummaryRunner
 
@@ -90,6 +107,25 @@ class DeleteAllRequest(BaseModel):
     confirm: Literal["DELETE_ALL"]
 
 
+class SearchHitOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    conversation_id: uuid.UUID
+    title: str | None
+    message_id: uuid.UUID  # the user's question the snippet comes from
+    snippet: str
+    created_at: datetime
+    score: float | None  # cosine similarity, higher is closer; null in text mode
+    mode: SearchMode
+
+
+class SearchResults(BaseModel):
+    """Best match per conversation; semantic: by score, text: newest first."""
+
+    mode: SearchMode
+    items: list[SearchHitOut]
+
+
 def _cursor(value: str | None) -> Cursor | None:
     if value is None:
         return None
@@ -127,6 +163,24 @@ async def list_conversations(
     return ConversationsPage(
         items=[ConversationOut.model_validate(c) for c in page.items],
         next_cursor=page.next_cursor,
+    )
+
+
+@router.get("/search")
+async def search_conversations(
+    user: CurrentUser,
+    search: Annotated[ConversationSearch, Depends(get_conversation_search)],
+    q: Annotated[str, Query(min_length=MIN_QUERY_CHARS, max_length=MAX_QUERY_CHARS)],
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+) -> SearchResults:
+    """Search the user's own conversations by meaning (mode "semantic"); when embeddings are
+    unavailable, by substring of the user's messages (mode "text", score null)."""
+    try:
+        result = await search.search(user.id, q, limit)
+    except InvalidSearch as exc:
+        raise api_error(422, "validation_error", str(exc)) from None
+    return SearchResults(
+        mode=result.mode, items=[SearchHitOut.model_validate(hit) for hit in result.hits]
     )
 
 
@@ -212,20 +266,27 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
 )
 async def send_message(
     reply: Annotated[Reply, Depends(start_reply)],
-    background: BackgroundTasks,
     summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
+    indexer: Annotated[AnswerIndexer | None, Depends(get_answer_indexer)],
+    jobs: Annotated[BackgroundJobs, Depends(get_background_jobs)],
 ) -> AsyncIterable[ServerSentEvent]:
     """Streams the answer: safety_notice? token* (restart token*)* then done, or error.
 
     See the SSE contract in CLAUDE.md.
 
     FastAPI adds a `: ping` comment every 15 s while idle and the no-buffering headers.
-    Background tasks run after the stream ends, and not at all if the client disconnects.
+    Follow-up work is spawned once the stream has ended (not at all if the client disconnects).
+    Not as BackgroundTasks: those run before the generation slot is freed (app.core.background),
+    so the user's next message would be 409 until they end. Neither needs the slot: each has
+    its own session, and the summarizer saves by compare-and-set (save_summary).
     """
     async for event in reply.events():
         yield _sse(event)
+    if reply.saved_answer is not None and indexer is not None:
+        # A failure only leaves the answer for the backfill CLI.
+        jobs.spawn(indexer.run(reply.saved_answer))
     if reply.summary_due:
-        background.add_task(summarizer.run, reply.user_id, reply.conversation_id)
+        jobs.spawn(summarizer.run(reply.user_id, reply.conversation_id))
 
 
 @manage_router.patch(

@@ -89,6 +89,12 @@ class Settings(BaseSettings):
     # cuts the rest (ai.google.dev/gemini-api/docs/embeddings, checked 2026-11-02); 16000
     # chars stay under it even at 2 chars/token (Cyrillic), app.services.tokens says ~5300.
     conversation_index_max_chars: int = Field(default=16000, ge=200)
+    # GET /conversations/search keeps index rows within this cosine distance of the query.
+    # Provisional, to be calibrated on real searches: on the cached gemini-embedding-2/768
+    # vectors of the prompt eval (2026-11-02), hair questions were 0.24..0.37 from the nearest
+    # KB chunk (a long text, like a "question + answer" row), small talk ("hallo", "ok",
+    # "Привет! Как у тебя дела?") 0.435..0.48 -> 0.40 (= KB_MIN_SIMILARITY 0.60).
+    conversation_search_max_distance: float = Field(default=0.40, gt=0, le=2)
     kb_top_k: int = 4
     # Cosine similarity a chunk needs to reach the context. scripts/rag_eval.py (2026-10-21,
     # gemini-embedding-2/768): off-topic best 0.53, weakest right hit 0.64 -> 0.60.

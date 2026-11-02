@@ -2,17 +2,19 @@
 
 Backfill across all users on purpose (like app.db.repositories.retention): the rows carry
 user_id and conversation_id of their answer, and the question is looked up in the same
-conversation of the same user. Searches (later) must filter by user_id (rule 5).
+conversation of the same user. Searches (app.db.repositories.conversation_search) filter by
+user_id (rule 5).
 """
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import func, or_, select, true, tuple_
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
 from app.db.models import Message, MessageEmbedding, MessageRole
@@ -120,3 +122,17 @@ class SqlMessageEmbeddingRepository:
             )
         await self._session.commit()
         return len(values)
+
+
+def sql_message_embedding_repositories(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> Callable[[], AbstractAsyncContextManager[SqlMessageEmbeddingRepository]]:
+    """A repository on its own session per use: for background tasks, after the request's
+    session is closed."""
+
+    @asynccontextmanager
+    async def open_repository() -> AsyncIterator[SqlMessageEmbeddingRepository]:
+        async with sessionmaker() as session:
+            yield SqlMessageEmbeddingRepository(session)
+
+    return open_repository

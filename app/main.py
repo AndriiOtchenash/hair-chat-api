@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, FastAPI
 
 from app.api import consents, conversations, health, me
 from app.core.auth0_mgmt import get_auth0_management
+from app.core.background import get_background_jobs
 from app.core.chat import check_deployed_config, close_llm, get_moderator
 from app.core.config import get_settings
 from app.core.consents import require_consents
@@ -36,6 +37,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     lag_monitor = start_loop_monitor()
     yield
     await stop_loop_monitor(lag_monitor)
+    await get_background_jobs().aclose()  # before the embedder and the engine they use
     await close_llm()
     await get_engine().dispose()
     if (verifier := get_token_verifier()) is not None:

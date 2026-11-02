@@ -1,8 +1,10 @@
 """Rolling summary: folds the oldest unsummarized messages into conversations.summary.
 
 Runs after an answer whose context had to leave messages out (Context.needs_summary): as a
-FastAPI background task after the SSE stream, or inline in the CLI. Uses the chain's last link
-(the cheap model) directly, without fallback. Best effort: a failure keeps the old summary, and
+background job (app.core.background) after the SSE stream, or inline in the CLI. It does not
+hold the conversation's generation slot: save_summary is a compare-and-set, and a reply built
+meanwhile just uses the previous summary. Uses the chain's last link (the cheap model) directly,
+without fallback. Best effort: a failure keeps the old summary, and
 the context builder then simply leaves the oldest messages out. Never logs summary or messages.
 """
 
