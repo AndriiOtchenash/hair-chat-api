@@ -17,7 +17,10 @@ from app.db.repositories.conversations import (
 )
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
-from app.db.repositories.message_embeddings import sql_message_embedding_repositories
+from app.db.repositories.message_embeddings import (
+    SmallTalk,
+    sql_message_embedding_repositories,
+)
 from app.db.session import get_session, get_sessionmaker
 from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
 from app.llm.registry import build_llm, build_providers
@@ -133,7 +136,10 @@ def get_answer_indexer(
         ),
         embedder,
         max_chars=settings.conversation_index_max_chars,
-        min_answer_chars=settings.conversation_index_min_answer_chars,
+        small_talk=SmallTalk(
+            settings.conversation_index_min_answer_chars,
+            settings.conversation_index_max_small_talk_question_chars,
+        ),
         timeout=settings.embedding_timeout_s,
     )
 

@@ -6,6 +6,7 @@ The formats themselves are tested in test_conversation_index.py.
 import uuid
 
 from app.cli.search_probe import Pair, gap, probe, render
+from app.db.repositories.message_embeddings import SmallTalk
 from app.rag.conversation_index import index_text, query_text
 from tests.llm_fakes import FakeEmbedder
 
@@ -48,13 +49,13 @@ async def test_b_leaves_out_small_talk_and_pairs_show_the_winner_inside() -> Non
     conv = uuid.uuid4()
     hallo = pair("Перхоть", "hallo", "Здравствуйте!", [1.0, 0.0], conv)
     real = pair("Перхоть", "Что делать с перхотью на коже головы?", "ж" * 50, [0.6, 0.8], conv)
-    other = pair("Сушка", "Как сушить?", "ж" * 50, [0.0, 1.0])
+    other = pair("Сушка", "Как сушить волосы феном?", "ж" * 10, [0.0, 1.0])  # long question
     embedder = FakeEmbedder(
         vectors={query_text("перхоть"): [1.0, 0.0], b(real): [0.9, 0.1], b(other): [0.1, 0.9]}
     )
 
     results = await probe(
-        [hallo, real, other], ["перхоть"], embedder, max_chars=1000, min_answer_chars=20
+        [hallo, real, other], ["перхоть"], embedder, max_chars=1000, small_talk=SmallTalk(20, 16)
     )
 
     assert [h.pair for h in results[("перхоть", "A")]] == [hallo, real, other]  # as stored

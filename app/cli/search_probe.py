@@ -35,11 +35,11 @@ from sqlalchemy.orm import aliased
 
 from app.core.config import get_settings
 from app.db.models import Conversation, Message, MessageEmbedding, MessageRole
+from app.db.repositories.message_embeddings import NO_SMALL_TALK, SmallTalk
 from app.db.session import get_engine, get_sessionmaker
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
     index_text,
-    is_small_talk,
     query_text,
 )
 from app.rag.embeddings import Embedder, EmbeddingUnavailable, OpenAICompatibleEmbedder
@@ -149,12 +149,12 @@ async def probe(
     embedder: Embedder,
     *,
     max_chars: int,
-    min_answer_chars: int = 0,
+    small_talk: SmallTalk = NO_SMALL_TALK,
 ) -> dict[tuple[str, str], list[Hit]]:
     """(query, mode) -> every pair, best first (render picks the best per conversation); B
     without small talk. Two embeddings calls in parallel: queries and B documents (each split
     into batches of 100 by the embedder)."""
-    current = [p for p in pairs if not is_small_talk(p.answer, min_answer_chars)]
+    current = [p for p in pairs if not small_talk.matches(p.answer, p.question)]
     query_vectors, docs_b = await asyncio.gather(
         embedder.embed([query_text(q) for q in queries]),
         embedder.embed([index_text(p.question, p.answer, max_chars=max_chars) for p in current]),
@@ -223,6 +223,10 @@ async def run(
     if settings.gemini_api_key is None:
         print("GEMINI_API_KEY is not set", file=sys.stderr)
         return 2
+    chatter = SmallTalk(
+        settings.conversation_index_min_answer_chars,
+        settings.conversation_index_max_small_talk_question_chars,
+    )
     embedder = OpenAICompatibleEmbedder(
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
@@ -241,7 +245,7 @@ async def run(
             queries,
             embedder,
             max_chars=settings.conversation_index_max_chars,
-            min_answer_chars=settings.conversation_index_min_answer_chars,
+            small_talk=chatter,
         )
     except EmbeddingUnavailable as exc:
         print(f"embeddings unavailable ({exc.code})", file=sys.stderr)
@@ -251,8 +255,7 @@ async def run(
         await get_engine().dispose()
     unit = "conversation (best pair)" if per_conversation else "pair"
     formats = Counter(p.index_format or "stale/1" for p in pairs)
-    min_chars = settings.conversation_index_min_answer_chars
-    small_talk = sum(is_small_talk(p.answer, min_chars) for p in pairs)
+    small_talk = sum(chatter.matches(p.answer, p.question) for p in pairs)
     versions = ", ".join(f"{fmt}: {n}" for fmt, n in sorted(formats.items()))
     print(
         f"{len(pairs)} pairs, model {settings.embedding_model}, stored formats {versions} "

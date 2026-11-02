@@ -170,11 +170,14 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   app/rag/conversation_index.py (search_probe uses them too). Format change = new version:
   every row of another version (or NULL: before the column) is re-embedded by the next index
   run; the search does not filter on it.
-- Small talk is not indexed: answer shorter than CONVERSATION_INDEX_MIN_ANSWER_CHARS (200,
-  stripped; measured lengths in config.py). `pending` never returns such an answer unless it
-  still has a row (older format, or a threshold raised since): the run deletes that row
-  (`drop`) and counts `skipped_small_talk`. So skipped small talk is not read again by every
-  backfill, and a threshold change heals the index both ways.
+- Small talk is not indexed (`SmallTalk` in app/db/repositories/message_embeddings.py, one rule
+  as `matches` and `sql`): answer shorter than CONVERSATION_INDEX_MIN_ANSWER_CHARS (200) to a
+  question of at most CONVERSATION_INDEX_MAX_SMALL_TALK_QUESTION_CHARS (16), both stripped;
+  measured lengths in config.py. A short clarifying answer to a real question is kept.
+  `pending` never returns small talk unless it still has a row (older format, or thresholds
+  changed since): the run deletes that row (`drop`, which checks the rule again in SQL) and
+  counts `skipped_small_talk`. So skipped small talk is not read again by every backfill, and
+  a threshold change heals the index both ways.
 - Skipped too (read again by every run): no question before the answer, question moderation
   `action == "block"` (never saved today, a guard only), users without every valid consent
   (version == CONSENT_VERSION, like require_consents; `skipped_no_consent`): nothing of theirs

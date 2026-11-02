@@ -10,9 +10,13 @@ greeting ("hallo") in a conversation about dandruff beat the real question there
 Every row stores the model and CONVERSATION_INDEX_FORMAT_VERSION: a row of another model or
 format version (NULL: before the column, or marked stale by a rename before format 3) counts as
 missing and is rebuilt. One embedding model for the whole index (rule 4).
-Small talk is not indexed: an answer shorter than CONVERSATION_INDEX_MIN_ANSWER_CHARS (a
-greeting, "ok", "thanks") is never pending, and a row it still has (older format, or a higher
-threshold since) is deleted by the next run and counted as skipped_small_talk.
+Small talk is not indexed (SmallTalk): an answer shorter than
+CONVERSATION_INDEX_MIN_ANSWER_CHARS to a question of at most
+CONVERSATION_INDEX_MAX_SMALL_TALK_QUESTION_CHARS ("hallo" -> a greeting, "ok", "thanks"). A short
+answer to a longer question stays: the prompt asks for clarifying questions, and the user's
+question may be the most telling one of the conversation. Such a pair is never pending, and a
+row it still has (older format, or other thresholds since) is deleted by the next run and
+counted as skipped_small_talk.
 Skipped too, and seen by every run: answers with no user message before them, those whose
 question moderation blocked (ChatService never saves a blocked message, ADR 0004, so this only
 guards a future change), and users without every valid consent (the chat would not serve them
@@ -31,7 +35,11 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from app.db.repositories.message_embeddings import PendingAnswer
+from app.db.repositories.message_embeddings import (
+    NO_SMALL_TALK,
+    PendingAnswer,
+    SmallTalk,
+)
 from app.rag.embeddings import MAX_BATCH, Embedder, EmbeddingUnavailable
 from app.services.moderation_policy import ModerationAction
 
@@ -63,10 +71,10 @@ class MessageEmbeddingRepository(Protocol):
         limit: int,
         user_id: uuid.UUID | None = None,
         conversation_id: uuid.UUID | None = None,
-        min_answer_chars: int = 0,
+        small_talk: SmallTalk = NO_SMALL_TALK,
     ) -> Sequence[PendingAnswer]: ...
 
-    async def drop(self, message_ids: Sequence[uuid.UUID]) -> int: ...
+    async def drop(self, message_ids: Sequence[uuid.UUID], small_talk: SmallTalk) -> int: ...
 
     async def save(
         self,
@@ -86,7 +94,7 @@ MessageEmbeddingRepositoryFactory = Callable[
 class IndexReport:
     seen: int = 0
     indexed: int = 0  # in a dry run: would be indexed
-    skipped_small_talk: int = 0  # rows of short answers deleted (in a dry run: would be)
+    skipped_small_talk: int = 0  # rows of small-talk pairs deleted (in a dry run: would be)
     skipped_blocked: int = 0
     skipped_no_question: int = 0
     skipped_no_consent: int = 0
@@ -116,12 +124,6 @@ def pair_text(question: str, answer: str, *, max_chars: int) -> str:
     return f"{QUESTION_PREFIX}{question}{ANSWER_PREFIX}{answer}"
 
 
-def is_small_talk(answer: str, min_answer_chars: int) -> bool:
-    """Too short to be worth a vector (a greeting, "ok"); the backfill's SQL
-    (SqlMessageEmbeddingRepository.pending) decides the same."""
-    return len(answer.strip()) < min_answer_chars
-
-
 def index_text(question: str, answer: str, *, max_chars: int) -> str:
     """The text embedded for one answer (format 3), at most `max_chars` long."""
     pair = pair_text(question, answer, max_chars=max_chars - len(DOCUMENT_PREFIX))
@@ -138,7 +140,7 @@ async def index_conversations(
     embedder: Embedder,
     *,
     max_chars: int,
-    min_answer_chars: int = 0,
+    small_talk: SmallTalk = NO_SMALL_TALK,
     batch_size: int = MAX_BATCH,
     limit: int | None = None,
     dry_run: bool = False,
@@ -148,8 +150,8 @@ async def index_conversations(
     """Embed the answers the index lacks, `batch_size` per embeddings call and transaction, so
     a failure keeps the batches already written and a re-run continues. `limit`: answers to
     look at in this run (skipped ones count too). `user_id` + `conversation_id`: one
-    conversation only (ConversationIndexer). `min_answer_chars`: shorter answers are small
-    talk, their leftover rows are deleted. Raises EmbeddingUnavailable."""
+    conversation only (ConversationIndexer). `small_talk`: such pairs are not indexed,
+    their leftover rows are deleted. Raises EmbeddingUnavailable."""
     report = IndexReport()
     after: uuid.UUID | None = None
     version = CONVERSATION_INDEX_FORMAT_VERSION
@@ -164,17 +166,17 @@ async def index_conversations(
             limit=size,
             user_id=user_id,
             conversation_id=conversation_id,
-            min_answer_chars=min_answer_chars,
+            small_talk=small_talk,
         )
         if not batch:
             break
         after = batch[-1].message_id
         report.seen += len(batch)
         todo: list[PendingAnswer] = []
-        small_talk: list[uuid.UUID] = []
+        chatter: list[uuid.UUID] = []
         for answer in batch:
             if answer.small_talk:
-                small_talk.append(answer.message_id)
+                chatter.append(answer.message_id)
             elif not answer.consented:
                 report.skipped_no_consent += 1
             elif answer.question is None:
@@ -185,10 +187,10 @@ async def index_conversations(
                 todo.append(answer)
         if dry_run:
             report.indexed += len(todo)
-            report.skipped_small_talk += len(small_talk)
+            report.skipped_small_talk += len(chatter)
             continue
-        if small_talk:
-            report.skipped_small_talk += await repo.drop(small_talk)
+        if chatter:
+            report.skipped_small_talk += await repo.drop(chatter, small_talk)
         if not todo:
             continue
         vectors = await embedder.embed(
@@ -219,13 +221,13 @@ class ConversationIndexer:
         embedder: Embedder,
         *,
         max_chars: int,
-        min_answer_chars: int,
+        small_talk: SmallTalk,
         timeout: float | None,
     ) -> None:
         self._repositories = repositories
         self._embedder = embedder
         self._max_chars = max_chars
-        self._min_answer_chars = min_answer_chars
+        self._small_talk = small_talk
         self._timeout = timeout
 
     async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
@@ -237,7 +239,7 @@ class ConversationIndexer:
                     repo,
                     self._embedder,
                     max_chars=self._max_chars,
-                    min_answer_chars=self._min_answer_chars,
+                    small_talk=self._small_talk,
                     user_id=user_id,
                     conversation_id=conversation_id,
                 )

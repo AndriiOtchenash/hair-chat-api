@@ -11,19 +11,20 @@ import pytest
 from app.cli import index_conversations as cli
 from app.core.config import Settings
 from app.db.base import new_id
-from app.db.repositories.message_embeddings import PendingAnswer
+from app.db.repositories.message_embeddings import NO_SMALL_TALK, PendingAnswer, SmallTalk
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
     ConversationIndexer,
     index_conversations,
     index_text,
-    is_small_talk,
     pair_text,
     query_text,
 )
 from app.rag.embeddings import EmbeddingUnavailable
 from tests.llm_fakes import FakeEmbedder
 
+SMALL_TALK = SmallTalk(min_answer_chars=200, max_question_chars=16)
+POSTPARTUM = "Волосы выпадают три месяца после родов, что делать?"
 ALLOWED = {"provider": "openai", "model": "m", "flagged": False, "action": "allow"}
 BLOCKED = {"provider": "openai", "model": "m", "flagged": True, "action": "block"}
 SOFT = {"provider": "openai", "model": "m", "flagged": True, "action": "soft"}
@@ -52,7 +53,7 @@ def answer(
 class MemoryRepo:
     """pending() = answers without a vector of `model` and `index_format` (None = stale), by id
     after `after`, of one conversation if given, like the SQL; small talk (shorter than
-    `min_answer_chars`, stripped) only while it has a row, marked `small_talk`."""
+    SmallTalk.matches) only while it has a row, marked `small_talk`; drop() re-checks it."""
 
     def __init__(self, answers: Sequence[PendingAnswer]) -> None:
         self.answers = sorted(answers, key=lambda a: a.message_id)
@@ -70,12 +71,12 @@ class MemoryRepo:
         limit: int,
         user_id: uuid.UUID | None = None,
         conversation_id: uuid.UUID | None = None,
-        min_answer_chars: int = 0,
+        small_talk: SmallTalk = NO_SMALL_TALK,
     ) -> list[PendingAnswer]:
         found = []
         scope = (user_id, conversation_id)
         for a in self.answers:
-            small = len(a.answer.strip()) < min_answer_chars
+            small = small_talk.matches(a.answer, a.question)
             wanted = (
                 a.message_id in self.rows
                 if small
@@ -103,8 +104,9 @@ class MemoryRepo:
         self.saves.append(len(alive))
         return len(alive)
 
-    async def drop(self, message_ids: Sequence[uuid.UUID]) -> int:
-        there = [m for m in message_ids if m in self.rows]
+    async def drop(self, message_ids: Sequence[uuid.UUID], small_talk: SmallTalk) -> int:
+        chatter = {a.message_id for a in self.answers if small_talk.matches(a.answer, a.question)}
+        there = [m for m in message_ids if m in self.rows and m in chatter]
         for m in there:
             del self.rows[m]
         return len(there)
@@ -156,13 +158,35 @@ def test_index_text_cuts_the_answer_to_the_limit() -> None:
 
 
 @pytest.mark.parametrize(
-    ("text", "small"),
-    [("ж" * 199, True), ("ж" * 200, False), (f"  {'ж' * 199}\n ", True), ("", True)],
-    ids=["one-below", "at-threshold", "whitespace-not-counted", "empty"],
+    ("text", "question", "small"),
+    [
+        ("ж" * 199, "hallo", True),
+        ("ж" * 200, "hallo", False),
+        (f"  {'ж' * 199}\n ", "hallo", True),
+        ("", "ok", True),
+        ("ж" * 199, "щ" * 16, True),
+        ("ж" * 199, "щ" * 17, False),
+        ("ж" * 199, f" {'щ' * 16}\n", True),
+        ("ж" * 199, None, True),
+        ("Прядями? Есть зуд?", POSTPARTUM, False),
+    ],
+    ids=[
+        "answer-one-below",
+        "answer-at-threshold",
+        "answer-whitespace-not-counted",
+        "empty-answer",
+        "question-at-threshold",
+        "question-one-above",
+        "question-whitespace-not-counted",
+        "no-question",
+        "clarifying-answer-to-a-real-question",
+    ],
 )
-def test_small_talk_is_shorter_than_the_threshold(text: str, small: bool) -> None:
-    assert is_small_talk(text, 200) is small
-    assert is_small_talk(text, 0) is False
+def test_small_talk_is_a_short_answer_to_a_short_question(
+    text: str, question: str | None, small: bool
+) -> None:
+    assert SMALL_TALK.matches(text, question) is small
+    assert NO_SMALL_TALK.matches(text, question) is False
 
 
 async def test_indexes_pairs_and_skips_blocked_and_questionless_answers() -> None:
@@ -230,12 +254,12 @@ async def test_small_talk_is_not_indexed_and_its_old_rows_are_dropped() -> None:
     embedder = FakeEmbedder()
 
     dry = await index_conversations(
-        repo, embedder, max_chars=1000, min_answer_chars=200, dry_run=True
+        repo, embedder, max_chars=1000, small_talk=SMALL_TALK, dry_run=True
     )
     assert (dry.indexed, dry.skipped_small_talk) == (1, 1)
     assert v2_greeting.message_id in repo.rows and embedder.calls == 0
 
-    report = await index_conversations(repo, embedder, max_chars=1000, min_answer_chars=200)
+    report = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
 
     assert (report.seen, report.indexed, report.skipped_small_talk) == (2, 1, 1)
     assert set(repo.rows) == {long_enough.message_id}
@@ -243,22 +267,47 @@ async def test_small_talk_is_not_indexed_and_its_old_rows_are_dropped() -> None:
     assert "skipped small talk 1" in report.summary()
 
     # Not pending any more: the next run reads nothing.
-    again = await index_conversations(repo, embedder, max_chars=1000, min_answer_chars=200)
+    again = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
     assert (again.seen, again.skipped_small_talk) == (0, 0)
 
 
+async def test_a_clarifying_answer_to_a_real_question_is_indexed_and_kept() -> None:
+    clarifying = answer("Прядями? Есть зуд?", question=POSTPARTUM)
+    greeting = answer("Здравствуйте!", question="hallo")
+    repo = MemoryRepo([clarifying, greeting])
+    repo.rows = {m.message_id: ("fake-embedding", "2") for m in (clarifying, greeting)}
+    embedder = FakeEmbedder()
+
+    report = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
+
+    assert (report.indexed, report.skipped_small_talk) == (1, 1)
+    assert repo.rows == {
+        clarifying.message_id: ("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)
+    }
+    assert embedder.embedded == [index_text(POSTPARTUM, "Прядями? Есть зуд?", max_chars=1000)]
+    # drop() checks the rule again: a real pair is never deleted by a wrong id.
+    assert await repo.drop([clarifying.message_id], SMALL_TALK) == 0
+
+
 async def test_a_threshold_change_heals_the_index_both_ways() -> None:
-    short, medium = answer("ж" * 50), answer("ж" * 150)
+    short = answer("ж" * 50, question="hallo")
+    medium = answer("ж" * 150, question="спасибо")
     repo = MemoryRepo([short, medium])
 
-    await index_conversations(repo, FakeEmbedder(), max_chars=1000, min_answer_chars=100)
+    await index_conversations(repo, FakeEmbedder(), max_chars=1000, small_talk=SmallTalk(100, 16))
     assert set(repo.rows) == {medium.message_id}
 
-    raised = await index_conversations(repo, FakeEmbedder(), max_chars=1000, min_answer_chars=200)
+    raised = await index_conversations(repo, FakeEmbedder(), max_chars=1000, small_talk=SMALL_TALK)
     assert (raised.skipped_small_talk, set(repo.rows)) == (1, set())
 
-    lowered = await index_conversations(repo, FakeEmbedder(), max_chars=1000, min_answer_chars=0)
-    assert (lowered.indexed, set(repo.rows)) == (2, {short.message_id, medium.message_id})
+    shorter_questions = SmallTalk(200, 5)  # "спасибо" (7) is no longer small talk
+    again = await index_conversations(
+        repo, FakeEmbedder(), max_chars=1000, small_talk=shorter_questions
+    )
+    assert (again.indexed, set(repo.rows)) == (1, {medium.message_id})
+
+    lowered = await index_conversations(repo, FakeEmbedder(), max_chars=1000)
+    assert (lowered.indexed, set(repo.rows)) == (1, {short.message_id, medium.message_id})
 
 
 async def test_users_without_consents_are_skipped_and_counted() -> None:
@@ -364,7 +413,7 @@ def indexer(
         yield repo
 
     return ConversationIndexer(
-        repositories, embedder, max_chars=1000, min_answer_chars=10, timeout=timeout
+        repositories, embedder, max_chars=1000, small_talk=SmallTalk(10, 16), timeout=timeout
     )
 
 
@@ -415,7 +464,7 @@ async def test_conversation_indexer_failure_is_a_warning_without_text_and_never_
 
 @pytest.mark.parametrize(
     "saved",
-    [answer(question=None), answer(moderation=BLOCKED), answer("Привет!")],
+    [answer(question=None), answer(moderation=BLOCKED), answer("Привет!", question="hallo")],
     ids=["no-question", "blocked-question", "small-talk"],
 )
 async def test_conversation_indexer_skips_what_the_backfill_skips(saved: PendingAnswer) -> None:

@@ -21,7 +21,12 @@ from app.db.models import (
 )
 from app.db.repositories.consents import SqlConsentRepository
 from app.db.repositories.conversations import SqlConversationRepository
-from app.db.repositories.message_embeddings import PendingAnswer, SqlMessageEmbeddingRepository
+from app.db.repositories.message_embeddings import (
+    NO_SMALL_TALK,
+    PendingAnswer,
+    SmallTalk,
+    SqlMessageEmbeddingRepository,
+)
 from app.db.session import get_sessionmaker
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
@@ -34,6 +39,7 @@ from tests.llm_fakes import FakeEmbedder
 T0 = datetime(2026, 11, 1, tzinfo=UTC)
 VERSION = "test-v1"  # consents of this version count as valid here
 FORMAT = CONVERSATION_INDEX_FORMAT_VERSION
+SMALL_TALK = SmallTalk(min_answer_chars=200, max_question_chars=16)
 
 
 def repository(session: AsyncSession) -> SqlMessageEmbeddingRepository:
@@ -94,7 +100,7 @@ def a(content: str) -> tuple[MessageRole, str, None]:
 
 
 async def pending_rows(
-    model: str = "fake-embedding", min_answer_chars: int = 0, **scope: uuid.UUID
+    model: str = "fake-embedding", small_talk: SmallTalk = NO_SMALL_TALK, **scope: uuid.UUID
 ) -> list[PendingAnswer]:
     async with get_sessionmaker()() as session:
         return await repository(session).pending(
@@ -102,7 +108,7 @@ async def pending_rows(
             index_format=FORMAT,
             after=None,
             limit=100,
-            min_answer_chars=min_answer_chars,
+            small_talk=small_talk,
             **scope,
         )
 
@@ -111,10 +117,10 @@ async def pending(model: str = "fake-embedding") -> dict[uuid.UUID, str | None]:
     return {row.message_id: row.question for row in await pending_rows(model)}
 
 
-async def run(embedder: FakeEmbedder, min_answer_chars: int = 0) -> IndexReport:
+async def run(embedder: FakeEmbedder, small_talk: SmallTalk = NO_SMALL_TALK) -> IndexReport:
     async with get_sessionmaker()() as session:
         return await index_conversations(
-            repository(session), embedder, max_chars=1000, min_answer_chars=min_answer_chars
+            repository(session), embedder, max_chars=1000, small_talk=small_talk
         )
 
 
@@ -260,7 +266,7 @@ async def test_small_talk_is_pending_only_while_it_has_a_row(clean: None) -> Non
     await set_format(v2_greeting[1].id, "2")
     await set_format(long_enough[1].id, "2")
 
-    rows = {r.message_id: r for r in await pending_rows(min_answer_chars=200)}
+    rows = {r.message_id: r for r in await pending_rows(small_talk=SMALL_TALK)}
     # short has a current row: pending, to be dropped; the v2 greeting too.
     assert {m: r.small_talk for m, r in rows.items()} == {
         long_enough[1].id: False,
@@ -269,16 +275,65 @@ async def test_small_talk_is_pending_only_while_it_has_a_row(clean: None) -> Non
     }
 
     embedder = FakeEmbedder()
-    report = await run(embedder, min_answer_chars=200)
+    report = await run(embedder, small_talk=SMALL_TALK)
 
     assert (report.indexed, report.skipped_small_talk) == (1, 2)
     assert set(await stored()) == {long_enough[1].id}
     assert not any("hallo" in t for t in embedder.embedded)
     # No row and short: never pending again, the next run reads nothing.
-    assert await pending_rows(min_answer_chars=200) == []
-    assert (await run(FakeEmbedder(), min_answer_chars=200)).seen == 0
+    assert await pending_rows(small_talk=SMALL_TALK) == []
+    assert (await run(FakeEmbedder(), small_talk=SMALL_TALK)).seen == 0
     # A lower threshold brings them back.
     assert set(await pending()) == {short[1].id, v2_greeting[1].id}
+
+
+async def test_the_question_decides_whether_a_short_answer_is_small_talk(clean: None) -> None:
+    clarifying = await conversation(
+        u("Волосы выпадают три месяца после родов, что делать?"), a("Прядями? Есть зуд?")
+    )
+    at_limit = await conversation(u(" " + "щ" * 16 + "\n"), a("Ок."))  # stripped: 16
+    above_limit = await conversation(u("щ" * 17), a("Ок."))
+    # The question is the latest user message before the answer, not the first one.
+    later_greeting = await conversation(
+        u("Волосы выпадают три месяца после родов, что делать?"),
+        a("ж" * 300),
+        u("спасибо"),
+        a("Пожалуйста!"),
+    )
+
+    rows = {r.message_id: r.small_talk for r in await pending_rows(small_talk=SMALL_TALK)}
+
+    # Without a row small talk is not pending at all.
+    assert rows == {
+        clarifying[1].id: False,
+        above_limit[1].id: False,
+        later_greeting[1].id: False,
+    }
+    assert at_limit[1].id not in rows and later_greeting[3].id not in rows
+
+    embedder = FakeEmbedder()
+    report = await run(embedder, SMALL_TALK)
+    assert report.indexed == 3
+    assert {
+        "title: none | text: Вопрос: Волосы выпадают три месяца после родов, что делать?\n"
+        "Ответ: Прядями? Есть зуд?"
+    } <= set(embedder.embedded)
+
+
+async def test_drop_deletes_only_rows_that_are_small_talk(clean: None) -> None:
+    clarifying = await conversation(
+        u("Волосы выпадают три месяца после родов, что делать?"), a("Прядями? Есть зуд?")
+    )
+    greeting = await conversation(u("hallo"), a("Здравствуйте!"))
+    await run(FakeEmbedder())  # both indexed: no small-talk rule yet
+
+    async with get_sessionmaker()() as session:
+        dropped = await repository(session).drop(
+            [clarifying[1].id, greeting[1].id, uuid.uuid4()], SMALL_TALK
+        )
+
+    assert dropped == 1
+    assert set(await stored()) == {clarifying[1].id}
 
 
 async def test_a_rename_does_not_touch_the_index(clean: None) -> None:

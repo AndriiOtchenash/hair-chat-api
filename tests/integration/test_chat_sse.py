@@ -41,7 +41,10 @@ from app.db.repositories.conversation_search import SqlConversationSearchReposit
 from app.db.repositories.conversations import SqlConversationRepository
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
-from app.db.repositories.message_embeddings import sql_message_embedding_repositories
+from app.db.repositories.message_embeddings import (
+    NO_SMALL_TALK,
+    sql_message_embedding_repositories,
+)
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
@@ -109,7 +112,7 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         embedder,
         max_chars=16000,
         # Scripted answers are short; the small-talk cut is tested in test_message_embeddings.
-        min_answer_chars=0,
+        small_talk=NO_SMALL_TALK,
         timeout=2,
     )
     app.dependency_overrides[get_answer_indexer] = lambda: indexer
