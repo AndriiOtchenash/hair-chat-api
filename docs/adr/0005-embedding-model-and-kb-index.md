@@ -44,3 +44,8 @@ a vector of model B searched against an index of model A returns noise, not an e
   re-choosing `KB_MIN_SIMILARITY`.
 - `done.sources` lists only articles whose passages actually reached the context (not those
   dropped by the token budget).
+- 2026-11-02 14:05–14:27 UTC, Gemini incident: `first_token_timeout` on flash-lite and
+  embeddings timeouts. Measured from the staging VM afterwards: p50 0.33 s, p99 0.38 s,
+  max 0.41 s (n=40, 2 texts per call), so `EMBEDDING_TIMEOUT_S=3` stays, with no retries and no
+  warm-up. Diagnosis: the `embed_query:` and `reply timings` logs (INFO, app.*) and
+  `python -m app.cli.rag_report`.

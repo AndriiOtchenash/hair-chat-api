@@ -73,9 +73,7 @@ No threshold gets fastText to zero: "Haarausfall, was tun?" comes out as English
 German message would get an English answer and no note. lingua stays.
 
 ### Cold start
-Measured in the codespace on the prod virtualenvs (`uv sync --no-dev`), median of 7 runs; the
-branch is not deployed, so no Fly machine start times yet (check `fly logs` after the first
-staging deploy).
+Measured in the codespace on the prod virtualenvs (`uv sync --no-dev`), median of 7 runs.
 
 | | develop | this branch |
 |---|---|---|
@@ -85,6 +83,13 @@ staging deploy).
 | first detection (loads the 15 models) | — | +12 ms, +37 MB RSS |
 
 The cost is the image pull on a fresh machine (+163 MB compressed), not process start.
+
+Staging, measured 2026-11-02 (shared-cpu-1x / 512 MB, fra, `auto_stop_machines = "stop"`, with
+lingua):
+- Firecracker VM start: 653–749 ms;
+- machine reachable: 3.4–5.2 s (4 wake-ups: 3.37, 4.37, 4.40 and 5.22 s);
+- uvicorn import + startup on Fly ~3–4 s (vs 1.55 s in the codespace: slower CPU);
+- peak uvicorn RSS after the first detection: 140 MiB (VmHWM), over 3× headroom to 512 MB.
 
 lingua only answers with a language it was given, so "other" needs other languages to win:
 with uk/pl/en/ru/de alone, Czech came out as English (0.96). The detector knows German, French,
