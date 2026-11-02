@@ -7,12 +7,12 @@
 #           recurring | limits | kb (the <kb_used> tag) |
 #           real (tester questions, verbatim with typos) |
 #           dialog (follow-ups that only make sense with the history: the knowledge search) |
-#           language (reply language vs the interface locale, system_v7+)
+#           language (the reply language the backend picks, app.services.reply_language)
 #   lang    language of `text`; the answer must be in it unless `answer_lang` says otherwise
-#   locale  optional interface language (users.locale: uk|pl|en|ru), named in the prompt;
-#           default `lang` if supported, else en
-#   answer_lang optional language the answer must be in (default `lang`); every answer prints
-#           a rough answer_lang guess, !! when it differs
+#   locale  optional interface language (users.locale: uk|pl|en|ru), the fallback reply
+#           language; default `lang` if supported, else en
+#   answer_lang optional language the answer must be in (default `lang`); the detected language
+#           of the whole answer and of its first sentence are printed, !! when either differs
 #   text    the user's latest message
 #   history optional earlier turns: [{role: user|assistant, content: "..."}]
 #   expect  what a good answer does (read by a human)
@@ -350,7 +350,7 @@
   text: "hallo"
   expect:
     - приветствие по-русски (язык интерфейса), предлагает помочь с волосами
-    - не по-немецки
+    - не по-немецки, без фразы о языках
   avoid: ["ich", "haare", "helfen"]
 - id: language-ok-ru-locale
   group: language
@@ -414,3 +414,22 @@
   expect:
     - коротко по-английски (язык беседы), не по-русски
     - без фразы о языках
+- id: language-polish-asks-for-russian
+  group: language
+  lang: pl
+  locale: ru
+  answer_lang: ru
+  text: "Mam łupież. Ответь, пожалуйста, по-русски"
+  expect:
+    - по-русски (просьба пользователя, один из наших языков)
+    - про перхоть по существу или уточняющий вопрос
+- id: language-asks-for-chinese
+  group: language
+  lang: ru
+  locale: ru
+  text: "Расскажи про перхоть, ответь по-китайски"
+  expect:
+    - по-русски, без китайского
+    - одна вежливая фраза, что ассистент отвечает на украинском, польском, английском и русском
+    - про перхоть по существу
+  avoid: ["的", "是", "头"]

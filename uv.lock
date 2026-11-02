@@ -341,6 +341,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "httpx2" },
+    { name = "lingua-language-detector" },
     { name = "openai" },
     { name = "pgvector" },
     { name = "pydantic-settings" },
@@ -369,6 +370,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.143.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx2", specifier = ">=2.13.1" },
+    { name = "lingua-language-detector", specifier = ">=2.2.0" },
     { name = "openai", specifier = ">=3.31.0" },
     { name = "pgvector", specifier = ">=0.5.1" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
@@ -543,6 +545,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/8f/347d4677eefb57cd9f8e01d95a1dcee9a91b4e44e664173c32ff6f3752e5/librt-0.16.0-cp312-cp312-win32.whl", hash = "sha256:c17194318e4c0c0348b36f36c2ec7534436fe0a4c15582403162a4f08c80797a", size = 106158, upload-time = "2026-09-29T00:53:02.031Z" },
     { url = "https://files.pythonhosted.org/packages/f0/2c/5193dc81127cd5ddfad031391b046bf32dda219b38463ab872407ca30646/librt-0.16.0-cp312-cp312-win_amd64.whl", hash = "sha256:25a58a19ea8d83b68209f04912df765e9260635ef77646542ed4b4abe6bc7940", size = 126176, upload-time = "2026-09-29T00:53:03.445Z" },
     { url = "https://files.pythonhosted.org/packages/ff/3d/9668a400c8dd81d162eba38b33fa49fa6205f1a64493570a13fbb815c3ee/librt-0.16.0-cp312-cp312-win_arm64.whl", hash = "sha256:f7be7cf555bc30ec12622e9447299cc4a9b8ff307548b634794353db0c2065dc", size = 116572, upload-time = "2026-09-29T00:53:04.815Z" },
+]
+
+[[package]]
+name = "lingua-language-detector"
+version = "2.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c7/c5/69636ba575cca9f507dd08ffdd4a2d084fdb193aa8e4246a5335bc077678/lingua_language_detector-2.2.0-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:df29270e5eef3c597e725e11eee778b7111412faab466d390d22ab1d5293bbb8", size = 170204877, upload-time = "2026-03-09T14:24:06.223Z" },
+    { url = "https://files.pythonhosted.org/packages/29/05/32568a1afe29e8d2060e4ffefd9d1a67aa2e423db3ab4abbf4f604c81b39/lingua_language_detector-2.2.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:2fe367f7c112a0445218407e259338a88af770d5c84a550c20ebe11d5053f03d", size = 172495668, upload-time = "2026-03-09T14:24:18.193Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/64/b6212bc0eff72d76dd04649c13452318eb2abeafc397ac597242e47e3e07/lingua_language_detector-2.2.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9ac7453c08ab9699706a92f15480ae3d4b66761c15e1577a1ba31d1635780f3a", size = 170325432, upload-time = "2026-03-09T14:24:29.41Z" },
+    { url = "https://files.pythonhosted.org/packages/44/a0/7322a0c50db8f82836ef40b14986dfcfad17bd837bfa5782562fec143bf0/lingua_language_detector-2.2.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:63d99c7570ba09525f1702e4e4b2362f8f1f7e0a0fba93a3a53d3f322e00659d", size = 170332900, upload-time = "2026-03-09T14:24:40.088Z" },
+    { url = "https://files.pythonhosted.org/packages/47/b5/e6d09c3cf08580088cc85807b1b28ef8b77d8c62d50ed56144a565205787/lingua_language_detector-2.2.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:cd54fe6505b671c0d1e33bf0436e8e9308e8802112eb5ba6fb37d2c5459ab685", size = 170500781, upload-time = "2026-03-09T14:24:51.478Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/f2/ef84cc7f57854838f9b64f1b8aae07ee56827b5538b9609acb72aa6832e5/lingua_language_detector-2.2.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:362fbbc21da68c778f3521f42309d1ed6f54d4bd554a5701bf165419be9cc64b", size = 170586077, upload-time = "2026-03-09T14:25:04.48Z" },
+    { url = "https://files.pythonhosted.org/packages/97/48/bb581e0deda48169a11d25467d9fbe3ef4792b4d5363144bbea08caa9dd2/lingua_language_detector-2.2.0-cp312-cp312-win_amd64.whl", hash = "sha256:98baee0c51e31d0b54a92a4795aca6ca7069de9b99dc783e3456a91abd2ff692", size = 170065705, upload-time = "2026-03-09T14:25:16.796Z" },
+    { url = "https://files.pythonhosted.org/packages/45/a8/197f06b3d2da6ffb580d20e0b46181ef6d34fd750c7930ec04b322767cfb/lingua_language_detector-2.2.0-cp312-cp312-win_arm64.whl", hash = "sha256:581bfb3405dd99863b04753812021f2554545c4c2783d0faa41af44535c759a1", size = 169977215, upload-time = "2026-03-09T14:25:31.373Z" },
 ]
 
 [[package]]

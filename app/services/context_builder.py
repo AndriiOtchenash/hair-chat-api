@@ -2,7 +2,7 @@
 
 One system message, then the history, ending with the user's new message:
 
-    system prompt (never cut), naming the user's interface language (users.locale)
+    system prompt (never cut)
     <moderation_signal>     only when moderation marked the new message "soft" (never cut)
     <knowledge_status>      only when the knowledge-base search failed (never cut)
     <profile>               ProfileSource   (empty until stage 2)
@@ -10,6 +10,9 @@ One system message, then the history, ending with the user's new message:
     <conversation_summary>  conversations.summary (rolling summary, see summarizer.py)
     messages after summary_upto_message_id, as many as fit, newest first
     the new user message (always)
+
+The system message ends with the reply-language directive (never cut): the backend picks the
+language, see app.services.reply_language.
 
 Profile, knowledge and summary are data, wrapped by `wrap_data` so the model can tell them from
 instructions (the system prompt says so too). The moderation signal is our own text, not the
@@ -36,6 +39,12 @@ from app.rag.retriever import (
     Source,
 )
 from app.services.prompts import PromptProvider, SystemPrompt
+from app.services.reply_language import (
+    ReplyLanguage,
+    directive,
+    reply_lang_of,
+    resolve_reply_lang,
+)
 from app.services.tokens import message_tokens
 
 logger = logging.getLogger(__name__)
@@ -61,7 +70,7 @@ SUMMARY_NOTE = "Reference data: summary of the earlier part of this conversation
 SIGNAL_NOTE = "From our moderation check of the latest message, not written by the user."
 # ADR 0004: a self-harm flag does not block, the model answers with care instead.
 SELF_HARM_SIGNAL = (
-    "Possible crisis signal. Answer gently, in the user's language, without moralizing. "
+    "Possible crisis signal. Answer gently, without moralizing. "
     "Gently suggest reaching out for support (someone they trust or a help line). "
     "If there is a hair-care question, still answer it."
 )
@@ -103,6 +112,7 @@ class Context:
     # context (not dropped by the budget); the answer's <kb_used> tag picks from these.
     passages: tuple[Source, ...] = ()
     retrieval: Retrieval = Retrieval(RetrievalStatus.DISABLED)
+    reply_language: ReplyLanguage = ReplyLanguage(Locale.EN)
 
     @property
     def sources(self) -> tuple[Source, ...]:
@@ -124,7 +134,8 @@ class ContextBuilder(Protocol):
 
         `query` is the new message's embedding, made in advance (ChatService.reply); QueryFailed
         (embeddings down: the model is told) or None (no embedder) = no knowledge base.
-        `locale` is the user's interface language, named in the prompt (SystemPrompt.render)."""
+        `locale` is the user's interface language, the fallback reply language
+        (app.services.reply_language)."""
         ...
 
 
@@ -208,6 +219,7 @@ class TokenBudgetContextBuilder:
         scanned_all = len(history) <= HISTORY_SCAN_LIMIT
         turns = [m for m in history[:HISTORY_SCAN_LIMIT] if m.role in _TURN_ROLES]
         newest, older = (turns[0], turns[1:]) if turns else (None, [])
+        reply_language = _reply_language(newest, older, locale)
 
         summary = conversation.summary if conversation else None
         knowledge, retrieval = await self._search(user_id, newest, query)
@@ -215,14 +227,14 @@ class TokenBudgetContextBuilder:
         if retrieval.status is RetrievalStatus.ERROR:
             head.append(DataBlock("knowledge_status", KB_UNAVAILABLE_SIGNAL, KB_STATUS_NOTE))
         blocks = await self._blocks(user_id, knowledge.text if knowledge else None, summary)
-        system = system_message(prompt, [*head, *blocks], locale)
+        system = system_message(prompt, [*head, *blocks], reply_language)
         fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         for tag in _DROP_ORDER:
             if fixed <= budget_tokens:
                 break
             if any(b.tag == tag for b in blocks):
                 blocks = [b for b in blocks if b.tag != tag]
-                system = system_message(prompt, [*head, *blocks], locale)
+                system = system_message(prompt, [*head, *blocks], reply_language)
                 fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         if fixed > budget_tokens:
             logger.warning(
@@ -257,6 +269,7 @@ class TokenBudgetContextBuilder:
             needs_summary=left_out,
             passages=kept_knowledge.passages if kept_knowledge else (),
             retrieval=retrieval,
+            reply_language=reply_language,
         )
 
     async def _search(
@@ -285,12 +298,21 @@ class TokenBudgetContextBuilder:
         ]
 
 
-def system_message(prompt: SystemPrompt, blocks: list[DataBlock], locale: Locale) -> str:
-    """The prompt (with the interface language), then the data blocks; the prompt's knowledge
-    reminder right after <knowledge>."""
-    parts = [prompt.render(locale)]
+def _reply_language(newest: Message | None, older: list[Message], locale: Locale) -> ReplyLanguage:
+    if newest is None:
+        return ReplyLanguage(locale)
+    last_answer = next((m for m in older if m.role is MessageRole.ASSISTANT), None)
+    last_lang = reply_lang_of(last_answer.content) if last_answer else None
+    return resolve_reply_lang(newest.content, last_lang, locale)
+
+
+def system_message(prompt: SystemPrompt, blocks: list[DataBlock], reply: ReplyLanguage) -> str:
+    """The prompt, then the data blocks (the prompt's knowledge reminder right after
+    <knowledge>), then the reply-language directive, last."""
+    parts = [prompt.text]
     for block in blocks:
         parts.append(wrap_data(block.tag, block.text, block.note))
         if block.tag == "knowledge" and prompt.knowledge_reminder:
             parts.append(prompt.knowledge_reminder)
+    parts.append(directive(reply))
     return "\n\n".join(parts)

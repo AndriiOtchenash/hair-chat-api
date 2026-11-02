@@ -8,6 +8,7 @@ from app.llm.base import LLMProvider, ProviderHTTPError, StreamEnd
 from app.llm.registry import MODELS
 from app.services.context_builder import system_message
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider
+from app.services.reply_language import ReplyLanguage
 from scripts import latency_probe
 from tests.llm_fakes import FakeLLMProvider, Scenario, fail_before_first, hang, success
 
@@ -47,7 +48,10 @@ async def test_sends_the_real_prompt_and_question_and_prints_timings_and_stats()
     assert provider.calls == 2
     system, question = provider.received[0]
     prompt = await FilePromptProvider(PROMPT_VERSION).get_active()
-    assert system == {"role": "system", "content": system_message(prompt, [], Locale.RU)}
+    assert system == {
+        "role": "system",
+        "content": system_message(prompt, [], ReplyLanguage(Locale.RU)),
+    }
     assert question == {"role": "user", "content": latency_probe.DEFAULT_QUESTION}
     assert "#1  ttft" in out and "tokens_out 42" in out and "#2  ttft" in out
     assert "2/2 ok, 0 errors" in out

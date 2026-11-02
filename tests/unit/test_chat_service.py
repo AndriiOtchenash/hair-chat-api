@@ -30,6 +30,7 @@ from app.services.context_builder import (
     TokenBudgetContextBuilder,
 )
 from app.services.prompts import FilePromptProvider, PromptProvider
+from app.services.reply_language import ReplyLanguage, directive
 from tests.fakes import FakeConversationRepository, StaticPrompt
 from tests.llm_fakes import (
     FakeEmbedder,
@@ -112,7 +113,7 @@ async def test_success_saves_both_messages_and_ends_with_done() -> None:
     assert (assistant.provider, assistant.model) == ("gemini", "flash")
 
 
-async def test_the_reply_names_the_given_interface_language_in_the_prompt() -> None:
+async def test_a_short_first_message_is_answered_in_the_given_interface_language() -> None:
     provider = FakeLLMProvider("gemini", "flash").script(success("Witaj!"))
     world = World(provider)
     conversation_id = await world.conversation()
@@ -120,9 +121,7 @@ async def test_the_reply_names_the_given_interface_language_in_the_prompt() -> N
     async with world.chat.reply(USER, conversation_id, "hallo", locale=Locale.PL) as reply:
         [event async for event in reply.events()]
 
-    system = " ".join(provider.received[0][0]["content"].split())
-    assert "interface language is Polish." in system
-    assert "otherwise reply in Polish." in system
+    assert provider.received[0][0]["content"].endswith(directive(ReplyLanguage(Locale.PL)))
 
 
 async def test_first_message_sets_title_to_60_chars_later_ones_do_not() -> None:
