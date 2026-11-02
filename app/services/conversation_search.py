@@ -2,7 +2,9 @@
 
 Semantic first: the query is embedded (chat embedder: EMBEDDING_TIMEOUT_S, no retries) and
 compared with message_embeddings (app.rag.conversation_index) of this user and of the current
-EMBEDDING_MODEL, kept within CONVERSATION_SEARCH_MAX_DISTANCE. When embeddings are down, too
+EMBEDDING_MODEL, in the index's query format (`query_text`). Kept: within
+CONVERSATION_SEARCH_MAX_DISTANCE, and within CONVERSATION_SEARCH_MAX_GAP of the best hit's score
+(a lone right answer drops the near-misses below it). When embeddings are down, too
 slow or not configured (dev), the search falls back to a case-insensitive substring match over
 the user's own messages (mode "text"), with the same result shape and `score` null.
 One result per conversation, its best match. Logs: mode, result count, ms; never the query.
@@ -19,6 +21,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from app.db.repositories.conversation_search import SearchRow
+from app.rag.conversation_index import query_text
 from app.rag.embeddings import Embedder, EmbeddingUnavailable
 
 logger = logging.getLogger(__name__)
@@ -105,12 +108,14 @@ class ConversationSearch:
         embedder: Embedder | None,
         *,
         max_distance: float,
+        max_gap: float,
         timeout: float,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._repo = repo
         self._embedder = embedder  # None: no GEMINI_API_KEY (dev), text search only
         self._max_distance = max_distance
+        self._max_gap = max_gap
         self._timeout = timeout
         self._clock = clock
 
@@ -131,7 +136,10 @@ class ConversationSearch:
             )
             result = SearchResult(
                 SearchMode.SEMANTIC,
-                tuple(_hit(row, SearchMode.SEMANTIC, snippet(row.question)) for row in rows),
+                tuple(
+                    _hit(row, SearchMode.SEMANTIC, snippet(row.question))
+                    for row in within_gap(rows, self._max_gap)
+                ),
             )
         else:
             rows = await self._repo.containing(user_id, query, limit=limit)
@@ -153,7 +161,7 @@ class ConversationSearch:
             return None
         try:
             async with asyncio.timeout(self._timeout):
-                [vector] = await self._embedder.embed([query])
+                [vector] = await self._embedder.embed([query_text(query)])
         except EmbeddingUnavailable as exc:
             log = logger.error if exc.misconfigured else logger.warning
             log("conversation search: embeddings unavailable, text search: code=%s", exc.code)
@@ -162,6 +170,15 @@ class ConversationSearch:
             logger.warning("conversation search: embeddings unavailable, text search: code=timeout")
             return None
         return vector
+
+
+def within_gap(rows: Sequence[SearchRow], max_gap: float) -> list[SearchRow]:
+    """`rows` closest first: those whose distance is within `max_gap` of the first one."""
+    if not rows or rows[0].distance is None:
+        return list(rows)
+    best = rows[0].distance
+    # The epsilon keeps a hit exactly at the gap despite float rounding.
+    return [r for r in rows if r.distance is not None and r.distance - best <= max_gap + 1e-9]
 
 
 def _hit(row: SearchRow, mode: SearchMode, text: str) -> SearchHit:

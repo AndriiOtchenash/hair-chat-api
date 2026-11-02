@@ -156,30 +156,47 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
   threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
 
-## Conversation search (iteration 2 of 3: index + backfill + chat hook + API)
+## Conversation search (iteration 2 of 3: index + backfill + chat hook + API, format 2)
 - `message_embeddings`: one row per answer (PK message_id, FK CASCADE to messages, plus
   denormalized user_id / conversation_id, both CASCADE and indexed), vector(768) +
-  embedding_model. No HNSW: search is exact within one user_id (rule 5).
-- Text = "Вопрос: <latest user message before the answer>\nОтвет: <answer>", cut to
-  CONVERSATION_INDEX_MAX_CHARS (16000; gemini-embedding-2 takes 8192 tokens and silently cuts
-  the rest): the question is kept, the answer is cut. Skipped: no question before the answer,
-  question moderation `action == "block"` (never saved today, a guard only). Soft questions are
-  indexed.
-- Chat hook: after `done`, `send_message` spawns `AnswerIndexer.run(reply.saved_answer)` on
-  `app.core.background.BackgroundJobs` (see "Background work" above). Own session via
-  `sql_message_embedding_repositories`, chat embedder (EMBEDDING_TIMEOUT_S, no retries). Failure = WARNING with message id + code, never
-  raised; no embedder (dev) or a client disconnect = not indexed. The backfill picks those up.
-- `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row or a
-  row of another model, keyset batches of 100 (one embeddings call + one transaction each),
-  ingest's timeout/retries; counts only in the output. Not in the export (derived, like retrieval).
+  embedding_model + index_format. No HNSW: search is exact within one user_id (rule 5).
+- Text (format 2, `CONVERSATION_INDEX_FORMAT_VERSION`) = gemini-embedding-2's asymmetric
+  document format: "title: <conversation title | none> | text: Вопрос: <latest user message
+  before the answer>\nОтвет: <answer>" (`index_text`), cut to CONVERSATION_INDEX_MAX_CHARS
+  (16000; gemini-embedding-2 takes 8192 tokens and silently cuts the rest): title and question
+  kept, the answer cut. The search embeds `query_text(q)` = "task: search result | query: q".
+  Both live in app/rag/conversation_index.py (search_probe uses them too). Format change = new
+  version: every row of another version, or stale (index_format NULL: before the column or
+  renamed since), is re-embedded by the next index run; the search does not filter on it.
+- Skipped: no question before the answer, question moderation `action == "block"` (never saved
+  today, a guard only), users without every valid consent (version == CONSENT_VERSION, like
+  require_consents; `skipped_no_consent`): nothing of theirs goes to the embeddings API. Soft
+  questions are indexed.
+- `ConversationIndexer.run(user_id, conversation_id)` (background, `BackgroundJobs.spawn`)
+  indexes what one conversation lacks, title read from the DB. After `done` in `send_message`:
+  chat embedder, whole run within EMBEDDING_TIMEOUT_S. After `PATCH /conversations/{id}` (the
+  rename marks the conversation's rows stale in its transaction): own embedder with
+  INGEST_TIMEOUT_S per request, no retries. Own session via `sql_message_embedding_repositories`.
+  Failure = WARNING with conversation id + code, never raised; no embedder (dev) or a client
+  disconnect = not indexed. The backfill picks those up.
+- Known limit (MVP, accepted): a rename while an answer of that conversation is being indexed
+  may leave that one pair with the old title in its vector (no lock between them).
+- `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row,
+  a row of another model or format, or a stale one; keyset batches of 100 (one embeddings call
+  + one transaction each), ingest's timeout/retries; counts only in the output. Run it after
+  every deploy that bumps the format. Not in the export (derived, like retrieval).
 - `GET /conversations/search?q=&limit=` (CONSENTED; q 2..500 chars after strip, limit 1..20,
   default 10, else 422 validation_error): `{mode, items: [{conversation_id, title, message_id,
   snippet, created_at, score, mode}]}`, best hit per conversation. message_id / snippet /
   created_at are the user's question (snippet <= 200 chars). `semantic`: cosine distance <=
-  CONVERSATION_SEARCH_MAX_DISTANCE (0.40, provisional), user_id + embedding_model filtered,
-  score = 1 - distance, best first. Embeddings down / too slow / no key -> `text`: ILIKE over the
-  user's own role=user messages (% _ \ escaped), newest first, score null. Logs mode, count, ms;
-  never q.
+  CONVERSATION_SEARCH_MAX_DISTANCE (0.40) and score >= top1 - CONVERSATION_SEARCH_MAX_GAP
+  (0.05), both provisional (staging numbers in config.py); user_id + embedding_model filtered,
+  score = 1 - distance, best first. Embeddings down / too slow / no key -> `text`: ILIKE over
+  the user's own role=user messages (% _ \ escaped), newest first, score null. Logs mode,
+  count, ms; never q.
+- `uv run python -m app.cli.search_probe USER_ID "q" ... [--top N] [--all-pairs]`: read-only
+  experiment, modes A (stored vectors), B (pairs re-embedded now), C (question only), with the
+  top1-top2 gap; prints titles and queries, operator's own data only.
 
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
@@ -256,6 +273,7 @@ uv run python -m scripts.rag_eval                   # RAG eval set, real embeddi
 uv run python -m scripts.prompt_eval                # prompt eval, real LLM chain, prints answers
 uv run python -m app.cli.rag_report [--days 7]      # KB use of recent answers (DATABASE_URL)
 uv run python -m app.cli.index_conversations [--dry-run] [--limit N]  # backfill conversation index
+uv run python -m app.cli.search_probe USER_ID "q" ...  # conversation search calibration, real API
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.

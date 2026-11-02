@@ -14,6 +14,7 @@ from app.core.chat import (
     get_chat_service,
     get_conversation_search,
     get_conversation_service,
+    get_rename_indexer,
     get_summarizer,
 )
 from app.core.errors import api_error
@@ -21,7 +22,7 @@ from app.core.security import CurrentUser
 from app.db.models import MessageRole
 from app.db.pagination import Cursor, InvalidCursor
 from app.llm.base import Restart, Token
-from app.rag.conversation_index import AnswerIndexer
+from app.rag.conversation_index import ConversationIndexer
 from app.services.chat_service import (
     ChatDone,
     ChatError,
@@ -267,7 +268,7 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
 async def send_message(
     reply: Annotated[Reply, Depends(start_reply)],
     summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
-    indexer: Annotated[AnswerIndexer | None, Depends(get_answer_indexer)],
+    indexer: Annotated[ConversationIndexer | None, Depends(get_answer_indexer)],
     jobs: Annotated[BackgroundJobs, Depends(get_background_jobs)],
 ) -> AsyncIterable[ServerSentEvent]:
     """Streams the answer: safety_notice? token* (restart token*)* then done, or error.
@@ -282,9 +283,9 @@ async def send_message(
     """
     async for event in reply.events():
         yield _sse(event)
-    if reply.saved_answer is not None and indexer is not None:
+    if reply.saved_answer_id is not None and indexer is not None:
         # A failure only leaves the answer for the backfill CLI.
-        jobs.spawn(indexer.run(reply.saved_answer))
+        jobs.spawn(indexer.run(reply.user_id, reply.conversation_id))
     if reply.summary_due:
         jobs.spawn(summarizer.run(reply.user_id, reply.conversation_id))
 
@@ -293,13 +294,25 @@ async def send_message(
     "/{conversation_id}", responses={404: {"description": "Missing or someone else's"}}
 )
 async def rename_conversation(
-    conversation_id: uuid.UUID, body: RenameRequest, user: CurrentUser, conversations: Conversations
+    conversation_id: uuid.UUID,
+    body: RenameRequest,
+    user: CurrentUser,
+    conversations: Conversations,
+    indexer: Annotated[ConversationIndexer | None, Depends(get_rename_indexer)],
+    jobs: Annotated[BackgroundJobs, Depends(get_background_jobs)],
 ) -> ConversationOut:
-    """The title is kept: a later first message no longer replaces it."""
+    """The title is kept: a later first message no longer replaces it.
+
+    The title is in the conversation's search vectors: they are marked stale with the rename
+    and re-embedded in the background, unless the user lacks a consent (then nothing is
+    sent to the embeddings API, ever, until they grant them again).
+    """
     try:
         conversation = await conversations.rename(user.id, conversation_id, body.title)
     except ConversationNotFound:
         raise _not_found() from None
+    if indexer is not None:
+        jobs.spawn(indexer.run(user.id, conversation_id))
     return ConversationOut.model_validate(conversation)
 
 

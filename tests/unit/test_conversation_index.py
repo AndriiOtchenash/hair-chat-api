@@ -4,6 +4,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -11,7 +12,15 @@ from app.cli import index_conversations as cli
 from app.core.config import Settings
 from app.db.base import new_id
 from app.db.repositories.message_embeddings import PendingAnswer
-from app.rag.conversation_index import AnswerIndexer, index_conversations, pair_text
+from app.rag.conversation_index import (
+    CONVERSATION_INDEX_FORMAT_VERSION,
+    ConversationIndexer,
+    document_text,
+    index_conversations,
+    index_text,
+    pair_text,
+    query_text,
+)
 from app.rag.embeddings import EmbeddingUnavailable
 from tests.llm_fakes import FakeEmbedder
 
@@ -24,38 +33,79 @@ def answer(
     text: str = "Мойте мягким шампунем.",
     question: str | None = "Как часто мыть голову?",
     moderation: dict[str, object] | None = ALLOWED,
+    *,
+    title: str | None = "Мытьё головы",
+    consented: bool = True,
+    user_id: uuid.UUID | None = None,
+    conversation_id: uuid.UUID | None = None,
 ) -> PendingAnswer:
-    return PendingAnswer(new_id(), uuid.uuid4(), uuid.uuid4(), text, question, moderation)
+    return PendingAnswer(
+        new_id(),
+        user_id or uuid.uuid4(),
+        conversation_id or uuid.uuid4(),
+        text,
+        question,
+        moderation,
+        title,
+        consented,
+    )
 
 
 class MemoryRepo:
-    """pending() = answers without a vector of `model`, by id after `after`, like the SQL."""
+    """pending() = answers without a vector of `model` and `index_format` (None = stale), by id
+    after `after`, of one conversation if given, like the SQL."""
 
     def __init__(self, answers: Sequence[PendingAnswer]) -> None:
         self.answers = sorted(answers, key=lambda a: a.message_id)
-        self.rows: dict[uuid.UUID, str] = {}  # message_id -> embedding_model
+        # message_id -> (embedding_model, index_format)
+        self.rows: dict[uuid.UUID, tuple[str, str | None]] = {}
         self.deleted: set[uuid.UUID] = set()
         self.saves: list[int] = []
 
     async def pending(
-        self, *, model: str, after: uuid.UUID | None, limit: int
+        self,
+        *,
+        model: str,
+        index_format: str,
+        after: uuid.UUID | None,
+        limit: int,
+        user_id: uuid.UUID | None = None,
+        conversation_id: uuid.UUID | None = None,
     ) -> list[PendingAnswer]:
         return [
             a
             for a in self.answers
-            if self.rows.get(a.message_id) != model
+            if self.rows.get(a.message_id) != (model, index_format)
             and (after is None or a.message_id > after)
+            and (user_id is None or (a.user_id, a.conversation_id) == (user_id, conversation_id))
             and a.message_id not in self.deleted
         ][:limit]
 
     async def save(
-        self, rows: Sequence[tuple[PendingAnswer, Sequence[float]]], *, model: str
+        self,
+        rows: Sequence[tuple[PendingAnswer, Sequence[float]]],
+        *,
+        model: str,
+        index_format: str,
     ) -> int:
         alive = [a for a, _ in rows if a.message_id not in self.deleted]
         for a in alive:
-            self.rows[a.message_id] = model
+            self.rows[a.message_id] = (model, index_format)
         self.saves.append(len(alive))
         return len(alive)
+
+    def models(self) -> set[str]:
+        return {model for model, _ in self.rows.values()}
+
+    def rename(self, conversation_id: uuid.UUID, title: str) -> None:
+        """Like SqlConversationRepository.rename: new title, its rows marked stale."""
+        self.answers = [
+            replace(a, title=title) if a.conversation_id == conversation_id else a
+            for a in self.answers
+        ]
+        for a in self.answers:
+            if a.conversation_id == conversation_id and a.message_id in self.rows:
+                self.rows[a.message_id] = (self.rows[a.message_id][0], None)
 
 
 def test_pair_text_is_question_then_answer() -> None:
@@ -82,6 +132,39 @@ def test_pair_text_is_cut_to_the_limit(
     assert text == f"Вопрос: {'щ' * kept_question}\nОтвет: {'ж' * kept_answer}"
 
 
+def test_query_format() -> None:
+    assert query_text("  перхоть ") == "task: search result | query: перхоть"
+
+
+def test_document_format() -> None:
+    assert document_text("Сухие кончики", " Вопрос: что делать? ") == (
+        "title: Сухие кончики | text: Вопрос: что делать?"
+    )
+
+
+@pytest.mark.parametrize("title", [None, "", "  \n "])
+def test_document_without_a_title_says_none(title: str | None) -> None:
+    assert document_text(title, "x") == "title: none | text: x"
+
+
+def test_a_title_is_kept_on_one_line() -> None:
+    assert document_text(" Сухие\n кончики ", "x") == "title: Сухие кончики | text: x"
+
+
+def test_index_text_is_the_titled_pair() -> None:
+    assert index_text("Мытьё", "Как часто?", "Раз в два дня.", max_chars=1000) == (
+        "title: Мытьё | text: Вопрос: Как часто?\nОтвет: Раз в два дня."
+    )
+
+
+def test_index_text_keeps_the_title_and_cuts_the_answer_to_the_limit() -> None:
+    title = "т" * 120  # MAX_TITLE_CHARS of a rename
+    text = index_text(title, "щ" * 4000, "ж" * 20000, max_chars=16000)
+
+    assert len(text) == 16000
+    assert text.startswith(f"title: {title} | text: Вопрос: {'щ' * 4000}\nОтвет: ж")
+
+
 async def test_indexes_pairs_and_skips_blocked_and_questionless_answers() -> None:
     ok, soft, blocked, orphan, unmoderated = (
         answer(),
@@ -102,8 +185,8 @@ async def test_indexes_pairs_and_skips_blocked_and_questionless_answers() -> Non
         1,
     )
     assert set(repo.rows) == {ok.message_id, soft.message_id, unmoderated.message_id}
-    assert set(repo.rows.values()) == {"fake-embedding"}
-    assert pair_text(ok.question or "", ok.answer, max_chars=1000) in embedder.embedded
+    assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
+    assert index_text(ok.title, ok.question or "", ok.answer, max_chars=1000) in embedder.embedded
     assert not any("запрещённое" in t for t in embedder.embedded)
 
 
@@ -117,7 +200,37 @@ async def test_rerun_embeds_nothing_and_a_model_change_rebuilds_everything() -> 
 
     report = await index_conversations(repo, FakeEmbedder("new-model"), max_chars=1000)
     assert report.indexed == 3
-    assert set(repo.rows.values()) == {"new-model"}
+    assert repo.models() == {"new-model"}
+
+
+async def test_rows_of_another_format_version_or_stale_are_rebuilt() -> None:
+    old, stale, current = answer(), answer(), answer()
+    repo = MemoryRepo([old, stale, current])
+    repo.rows = {
+        old.message_id: ("fake-embedding", "1"),
+        stale.message_id: ("fake-embedding", None),  # before the column, or renamed since
+        current.message_id: ("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION),
+    }
+    embedder = FakeEmbedder()
+
+    report = await index_conversations(repo, embedder, max_chars=1000)
+
+    assert report.indexed == 2
+    assert len(embedder.embedded) == 2
+    assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
+
+
+async def test_users_without_consents_are_skipped_and_counted() -> None:
+    consented, revoked = answer(), answer(text="Секретный ответ", consented=False)
+    repo = MemoryRepo([consented, revoked])
+    embedder = FakeEmbedder()
+
+    report = await index_conversations(repo, embedder, max_chars=1000)
+
+    assert (report.seen, report.indexed, report.skipped_no_consent) == (2, 1, 1)
+    assert set(repo.rows) == {consented.message_id}
+    assert not any("Секретный" in t for t in embedder.embedded)
+    assert "skipped without consent 1" in report.summary()
 
 
 async def test_batches_and_limit() -> None:
@@ -155,10 +268,14 @@ async def test_answers_deleted_meanwhile_are_counted_as_gone() -> None:
 
     class DeletingRepo(MemoryRepo):
         async def save(
-            self, rows: Sequence[tuple[PendingAnswer, Sequence[float]]], *, model: str
+            self,
+            rows: Sequence[tuple[PendingAnswer, Sequence[float]]],
+            *,
+            model: str,
+            index_format: str,
         ) -> int:
             self.deleted.add(deleted.message_id)
-            return await super().save(rows, model=model)
+            return await super().save(rows, model=model, index_format=index_format)
 
     repo = DeletingRepo([kept, deleted])
     report = await index_conversations(repo, FakeEmbedder(), max_chars=1000)
@@ -184,32 +301,76 @@ def test_a_whole_question_is_kept_at_the_real_limit() -> None:
     assert text.startswith(f"Вопрос: {question}\nОтвет: ж")
 
 
-# --- AnswerIndexer: one answer right after the chat saved it ---
+# --- ConversationIndexer: one conversation, after a chat answer or a rename ---
 
 
 class BrokenRepo(MemoryRepo):
     async def save(
-        self, rows: Sequence[tuple[PendingAnswer, Sequence[float]]], *, model: str
+        self,
+        rows: Sequence[tuple[PendingAnswer, Sequence[float]]],
+        *,
+        model: str,
+        index_format: str,
     ) -> int:
         raise ConnectionResetError("secret vector 0.1, 0.2 and text")
 
 
-def indexer(repo: MemoryRepo, embedder: FakeEmbedder, timeout: float = 1.0) -> AnswerIndexer:
+def indexer(
+    repo: MemoryRepo, embedder: FakeEmbedder, timeout: float | None = 1.0
+) -> ConversationIndexer:
     @asynccontextmanager
     async def repositories() -> AsyncIterator[MemoryRepo]:
         yield repo
 
-    return AnswerIndexer(repositories, embedder, max_chars=1000, timeout=timeout)
+    return ConversationIndexer(repositories, embedder, max_chars=1000, timeout=timeout)
 
 
-async def test_answer_indexer_writes_the_pair() -> None:
-    saved = answer()
-    repo, embedder = MemoryRepo([saved]), FakeEmbedder()
+async def test_conversation_indexer_writes_what_that_conversation_lacks_only() -> None:
+    user, conv = uuid.uuid4(), uuid.uuid4()
+    earlier, saved = (
+        answer(user_id=user, conversation_id=conv),
+        answer(user_id=user, conversation_id=conv),
+    )
+    elsewhere = answer(user_id=user)
+    repo, embedder = MemoryRepo([earlier, saved, elsewhere]), FakeEmbedder()
 
-    await indexer(repo, embedder).run(saved)
+    await indexer(repo, embedder).run(user, conv)
 
-    assert repo.rows == {saved.message_id: "fake-embedding"}
-    assert embedder.embedded == [pair_text(saved.question or "", saved.answer, max_chars=1000)]
+    assert set(repo.rows) == {earlier.message_id, saved.message_id}
+    assert embedder.embedded == [
+        index_text(a.title, a.question or "", a.answer, max_chars=1000) for a in (earlier, saved)
+    ]
+
+
+async def test_a_rename_re_embeds_the_conversation_with_its_new_title() -> None:
+    user, conv = uuid.uuid4(), uuid.uuid4()
+    pairs = [answer(user_id=user, conversation_id=conv, title="Старое") for _ in range(2)]
+    other = answer(title="Другая")
+    repo = MemoryRepo([*pairs, other])
+    await index_conversations(repo, FakeEmbedder(), max_chars=1000)
+
+    repo.rename(conv, "Новое название")
+    embedder = FakeEmbedder()
+    await indexer(repo, embedder, timeout=None).run(user, conv)
+
+    assert len(embedder.embedded) == 2
+    assert all(t.startswith("title: Новое название | text: ") for t in embedder.embedded)
+    assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
+
+
+async def test_a_rename_without_consents_embeds_nothing() -> None:
+    user, conv = uuid.uuid4(), uuid.uuid4()
+    pair = answer(user_id=user, conversation_id=conv)
+    repo = MemoryRepo([pair])
+    await index_conversations(repo, FakeEmbedder(), max_chars=1000)
+    repo.rename(conv, "Новое")
+    repo.answers = [replace(a, consented=False) for a in repo.answers]  # consents revoked
+    embedder = FakeEmbedder()
+
+    await indexer(repo, embedder).run(user, conv)
+
+    assert embedder.calls == 0
+    assert repo.rows[pair.message_id] == ("fake-embedding", None)  # stale, still searchable
 
 
 @pytest.mark.parametrize(
@@ -221,22 +382,22 @@ async def test_answer_indexer_writes_the_pair() -> None:
     ],
     ids=["embeddings-down", "embeddings-too-slow", "db-error"],
 )
-async def test_answer_indexer_failure_is_a_warning_without_text_and_never_raises(
+async def test_conversation_indexer_failure_is_a_warning_without_text_and_never_raises(
     embedder: FakeEmbedder,
     repo_class: type[MemoryRepo],
     code: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    saved = answer(text="Секретный ответ", question="Секретный вопрос")
+    saved = answer(text="Секретный ответ", question="Секретный вопрос", title="Секретная")
     repo = repo_class([saved])
 
     with caplog.at_level(logging.INFO, logger="app"):
-        await indexer(repo, embedder, timeout=0.05).run(saved)
+        await indexer(repo, embedder, timeout=0.05).run(saved.user_id, saved.conversation_id)
 
     assert repo.rows == {}  # left for the backfill CLI
     [record] = [r for r in caplog.records if r.name == "app.rag.conversation_index"]
     assert record.levelno == logging.WARNING
-    assert code in record.getMessage() and str(saved.message_id) in record.getMessage()
+    assert code in record.getMessage() and str(saved.conversation_id) in record.getMessage()
     assert "Секрет" not in caplog.text and "secret" not in caplog.text
 
 
@@ -245,10 +406,10 @@ async def test_answer_indexer_failure_is_a_warning_without_text_and_never_raises
     [answer(question=None), answer(moderation=BLOCKED)],
     ids=["no-question", "blocked-question"],
 )
-async def test_answer_indexer_skips_what_the_backfill_skips(saved: PendingAnswer) -> None:
+async def test_conversation_indexer_skips_what_the_backfill_skips(saved: PendingAnswer) -> None:
     repo, embedder = MemoryRepo([saved]), FakeEmbedder()
 
-    await indexer(repo, embedder).run(saved)
+    await indexer(repo, embedder).run(saved.user_id, saved.conversation_id)
 
     assert embedder.calls == 0 and repo.rows == {}
 
