@@ -108,6 +108,8 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         ),
         embedder,
         max_chars=16000,
+        # Scripted answers are short; the small-talk cut is tested in test_message_embeddings.
+        min_answer_chars=0,
         timeout=2,
     )
     app.dependency_overrides[get_answer_indexer] = lambda: indexer
@@ -580,8 +582,7 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
     live: Live,
 ) -> None:
     question = f"Как часто мыть жирные корни? {uuid.uuid4()}"
-    # The first message titles the conversation; that title is in the indexed text.
-    document = index_text(question[:60], question, "Раз в два дня.", max_chars=16000)
+    document = index_text(question, "Раз в два дня.", max_chars=16000)
     live.embedder.vectors[document] = live.embedder.vectors[query_text("жирные корни")] = (
         text_vector("жирные корни")
     )

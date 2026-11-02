@@ -3,12 +3,14 @@
     uv run python -m app.cli.index_conversations [--dry-run] [--limit N]
 
 Embeds every answer that has no row in message_embeddings, or one of another EMBEDDING_MODEL
-or CONVERSATION_INDEX_FORMAT_VERSION, or one marked stale by a rename, in batches (one
-embeddings call and one transaction each), with the ingest CLI's longer timeout and retries,
+or CONVERSATION_INDEX_FORMAT_VERSION (or NULL), in batches (one embeddings call and one
+transaction each), with the ingest CLI's longer timeout and retries,
 not the chat's. A failure keeps what is written; re-run to continue. Users without every valid
 consent (CONSENT_VERSION) are skipped and counted: nothing of theirs is sent to the embeddings
-API. Reads DATABASE_URL and GEMINI_API_KEY like the app. Counts only in the output and the
-log: no message text, no user ids (like app.cli.rag_report).
+API. Small talk (answers shorter than CONVERSATION_INDEX_MIN_ANSWER_CHARS) is not indexed:
+rows such answers still have are deleted and counted. Reads DATABASE_URL and GEMINI_API_KEY
+like the app. Counts only in the output and the log: no message text, no user ids (like
+app.cli.rag_report).
 """
 
 import argparse
@@ -47,6 +49,7 @@ async def run(*, dry_run: bool, limit: int | None) -> int:
                 SqlMessageEmbeddingRepository(session, consent_version=settings.consent_version),
                 embedder,
                 max_chars=settings.conversation_index_max_chars,
+                min_answer_chars=settings.conversation_index_min_answer_chars,
                 limit=limit,
                 dry_run=dry_run,
             )

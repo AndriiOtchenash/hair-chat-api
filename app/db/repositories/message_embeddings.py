@@ -2,7 +2,7 @@
 
 Backfill across all users on purpose (like app.db.repositories.retention), or one conversation of
 one user (ConversationIndexer): the rows carry user_id and conversation_id of their answer, and
-the question and title are looked up in the same conversation of the same user. Searches
+the question is looked up in the same conversation of the same user. Searches
 (app.db.repositories.conversation_search) filter by user_id (rule 5).
 """
 
@@ -12,7 +12,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import and_, distinct, func, or_, select, true, tuple_
+from sqlalchemy import and_, delete, distinct, func, or_, select, true, tuple_
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
@@ -29,8 +29,8 @@ from app.db.models import (
 
 @dataclass(frozen=True, slots=True)
 class PendingAnswer:
-    """An answer without a current vector (model and format), with the user message before it
-    and its conversation's title."""
+    """An answer without a current vector (model and format), with the user message before it;
+    or a small-talk answer that still has a row (to be deleted)."""
 
     message_id: uuid.UUID
     user_id: uuid.UUID
@@ -38,10 +38,11 @@ class PendingAnswer:
     answer: str
     question: str | None  # None: no user message before the answer in its conversation
     question_moderation: dict[str, Any] | None
-    title: str | None
     # The user has every consent of the current version (CONSENT_VERSION), like
     # require_consents: without them nothing of theirs is embedded.
     consented: bool
+    # Shorter than min_answer_chars (stripped): not indexed, its row (if any) is deleted.
+    small_talk: bool = False
 
 
 class SqlMessageEmbeddingRepository:
@@ -58,11 +59,16 @@ class SqlMessageEmbeddingRepository:
         limit: int,
         user_id: uuid.UUID | None = None,
         conversation_id: uuid.UUID | None = None,
+        min_answer_chars: int = 0,
     ) -> list[PendingAnswer]:
         """Answers with no row in message_embeddings or a row of another model or format
         (NULL = stale), by id (UUID v7, so oldest first) after `after`: keyset paging, so
         skipped answers are not read again within one run. `user_id` + `conversation_id`
-        limit it to one conversation of that user."""
+        limit it to one conversation of that user.
+
+        An answer shorter than `min_answer_chars` (whitespace stripped) is small talk: it comes
+        only while it still has a row (any model or format), for `drop`; without one it is
+        never pending, so the backfill does not read it again on every run."""
         if (user_id is None) != (conversation_id is None):
             raise ValueError("user_id and conversation_id go together")
         question = aliased(Message)
@@ -87,6 +93,13 @@ class SqlMessageEmbeddingRepository:
             )
             .scalar_subquery()
         ) == len(ConsentType)
+        # btrim strips spaces only by default; these are what str.strip() strips in practice.
+        small_talk = func.char_length(func.btrim(Message.content, " \t\r\n")) < min_answer_chars
+        outdated = or_(
+            MessageEmbedding.message_id.is_(None),
+            MessageEmbedding.embedding_model != model,
+            MessageEmbedding.index_format.is_distinct_from(index_format),
+        )
         query = (
             select(
                 Message.id,
@@ -95,8 +108,8 @@ class SqlMessageEmbeddingRepository:
                 Message.content,
                 previous.c.content,
                 previous.c.moderation,
-                Conversation.title,
                 consented,
+                small_talk,
             )
             .join(
                 Conversation,
@@ -110,9 +123,8 @@ class SqlMessageEmbeddingRepository:
             .where(
                 Message.role == MessageRole.ASSISTANT,
                 or_(
-                    MessageEmbedding.message_id.is_(None),
-                    MessageEmbedding.embedding_model != model,
-                    MessageEmbedding.index_format.is_distinct_from(index_format),
+                    and_(~small_talk, outdated),
+                    and_(small_talk, MessageEmbedding.message_id.is_not(None)),
                 ),
             )
             .order_by(Message.id)
@@ -174,6 +186,20 @@ class SqlMessageEmbeddingRepository:
             )
         await self._session.commit()
         return len(values)
+
+    async def drop(self, message_ids: Sequence[uuid.UUID]) -> int:
+        """Delete the rows of these answers (small talk) in one transaction; returns how many
+        there were."""
+        if not message_ids:
+            return 0
+        deleted = await self._session.scalars(
+            delete(MessageEmbedding)
+            .where(MessageEmbedding.message_id.in_(message_ids))
+            .returning(MessageEmbedding.message_id)
+        )
+        count = len(deleted.all())
+        await self._session.commit()
+        return count
 
 
 def sql_message_embedding_repositories(

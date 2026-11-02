@@ -3,26 +3,21 @@
     uv run python -m app.cli.search_probe USER_ID "query" ["query" ...] [--top N]
         [--all-pairs | --pairs]
 
-Compares, in memory, cosine scores of one user's indexed answers (message_embeddings) in four
-modes:
+Compares, in memory, cosine scores of one user's indexed answers (message_embeddings) in two
+modes, the query in the index's query format ("task: search result | query: ..."):
 
-    A  the stored vectors as they are, the query in the index's query format: what the search
-       does (rows of an older format, see the version counts printed first, score lower);
-    B  the pairs re-embedded now in the index's document format (app.rag.conversation_index:
-       "title: <conversation title | none> | text: Вопрос: ...\\nОтвет: ..."), the query in
-       the query format ("task: search result | query: ..."); with an up-to-date index B = A;
-    C  the user's question only in the document format, the query in the query format;
-    D  like B, but always without the title ("title: none | text: Вопрос: ...\nОтвет: ..."):
-       in B the title fills short pairs ("hallo" + a greeting), so in a conversation about
-       dandruff the greeting may beat the real question and the hit links to it.
+    A  the stored vectors as they are: what the search does now (rows of an older format, see
+       the version counts printed first, may score differently);
+    B  the pairs re-embedded now in the index's current format (app.rag.conversation_index),
+       without the small talk it no longer indexes: what the search does after the backfill.
 
-Format 2 of the index came out of this probe (asymmetric prefixes, ai.google.dev/gemini-api/
-docs/embeddings; C, question only, was worse than B on short queries). Three embeddings calls
-in parallel (batches of 100).
+Formats 2 and 3 of the index came out of this probe (asymmetric prefixes; then no title,
+which filled short pairs so that a greeting beat the real question in its conversation). Two
+embeddings calls in parallel (batches of 100).
 Like the API, the best hit per conversation is shown unless --all-pairs; --pairs adds, under
 each conversation, its best 3 pairs (question[:40] | score): which pair wins inside it. The
-output prints
-conversation titles and the queries: a dev tool for the operator's own data, not for logs.
+output prints conversation titles, questions and the queries: a dev tool for the operator's own
+data, not for logs.
 """
 
 import argparse
@@ -43,14 +38,14 @@ from app.db.models import Conversation, Message, MessageEmbedding, MessageRole
 from app.db.session import get_engine, get_sessionmaker
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
-    document_text,
     index_text,
+    is_small_talk,
     query_text,
 )
 from app.rag.embeddings import Embedder, EmbeddingUnavailable, OpenAICompatibleEmbedder
 from app.rag.ingest import INGEST_RETRIES, INGEST_TIMEOUT_S
 
-MODES = ("A", "B", "C", "D")
+MODES = ("A", "B")
 PAIRS_PER_CONVERSATION = 3
 SNIPPET_CHARS = 40
 
@@ -154,34 +149,22 @@ async def probe(
     embedder: Embedder,
     *,
     max_chars: int,
+    min_answer_chars: int = 0,
 ) -> dict[tuple[str, str], list[Hit]]:
-    """(query, mode) -> every pair, best first (render picks the best per conversation).
-    Four embeddings calls in parallel: queries, B, C and D documents (each split into batches
-    of 100 by the embedder)."""
-    query_vectors, docs_b, docs_c, docs_d = await asyncio.gather(
+    """(query, mode) -> every pair, best first (render picks the best per conversation); B
+    without small talk. Two embeddings calls in parallel: queries and B documents (each split
+    into batches of 100 by the embedder)."""
+    current = [p for p in pairs if not is_small_talk(p.answer, min_answer_chars)]
+    query_vectors, docs_b = await asyncio.gather(
         embedder.embed([query_text(q) for q in queries]),
-        embedder.embed(
-            [index_text(p.title, p.question, p.answer, max_chars=max_chars) for p in pairs]
-        ),
-        embedder.embed([document_text(p.title, p.question) for p in pairs]),
-        embedder.embed([untitled_text(p, max_chars=max_chars) for p in pairs]),
+        embedder.embed([index_text(p.question, p.answer, max_chars=max_chars) for p in current]),
     )
     stored = [p.vector for p in pairs]
     results: dict[tuple[str, str], list[Hit]] = {}
-    for i, query in enumerate(queries):
-        for mode, docs, qv in (
-            ("A", stored, query_vectors[i]),
-            ("B", docs_b, query_vectors[i]),
-            ("C", docs_c, query_vectors[i]),
-            ("D", docs_d, query_vectors[i]),
-        ):
-            results[(query, mode)] = rank(pairs, docs, qv, per_conversation=False)
+    for query, qv in zip(queries, query_vectors, strict=True):
+        results[(query, "A")] = rank(pairs, stored, qv, per_conversation=False)
+        results[(query, "B")] = rank(current, docs_b, qv, per_conversation=False)
     return results
-
-
-def untitled_text(pair: Pair, *, max_chars: int) -> str:
-    """Mode D: the index's document format with the title always "none"."""
-    return index_text(None, pair.question, pair.answer, max_chars=max_chars)
 
 
 def snippet(text: str) -> str:
@@ -254,7 +237,11 @@ async def run(
             print(f"no indexed answers of model {settings.embedding_model} for this user")
             return 1
         results = await probe(
-            pairs, queries, embedder, max_chars=settings.conversation_index_max_chars
+            pairs,
+            queries,
+            embedder,
+            max_chars=settings.conversation_index_max_chars,
+            min_answer_chars=settings.conversation_index_min_answer_chars,
         )
     except EmbeddingUnavailable as exc:
         print(f"embeddings unavailable ({exc.code})", file=sys.stderr)
@@ -264,10 +251,13 @@ async def run(
         await get_engine().dispose()
     unit = "conversation (best pair)" if per_conversation else "pair"
     formats = Counter(p.index_format or "stale/1" for p in pairs)
+    min_chars = settings.conversation_index_min_answer_chars
+    small_talk = sum(is_small_talk(p.answer, min_chars) for p in pairs)
     versions = ", ".join(f"{fmt}: {n}" for fmt, n in sorted(formats.items()))
     print(
         f"{len(pairs)} pairs, model {settings.embedding_model}, stored formats {versions} "
-        f"(current {CONVERSATION_INDEX_FORMAT_VERSION}), one row per {unit}\n"
+        f"(current {CONVERSATION_INDEX_FORMAT_VERSION}), "
+        f"small talk not in B {small_talk}, one row per {unit}\n"
     )
     print(render(results, queries, top=top, per_conversation=per_conversation, pairs=show_pairs))
     return 0

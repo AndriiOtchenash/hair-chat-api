@@ -6,7 +6,7 @@ from typing import Any, Protocol
 from sqlalchemy import delete, exists, func, insert, select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db.models import Conversation, LLMCall, Message, MessageEmbedding, MessageRole
+from app.db.models import Conversation, LLMCall, Message, MessageRole
 from app.db.pagination import Cursor, Page
 
 TITLE_MAX_CHARS = 60
@@ -157,17 +157,6 @@ class SqlConversationRepository:
             .values(title=title)
             .returning(Conversation)
         )
-        if conversation is not None:
-            # The title is part of every vector of the conversation (app.rag.conversation_index):
-            # its rows stay searchable but are re-embedded by the next index run.
-            await self._session.execute(
-                update(MessageEmbedding)
-                .where(
-                    MessageEmbedding.conversation_id == conversation_id,
-                    MessageEmbedding.user_id == user_id,
-                )
-                .values(index_format=None)
-            )
         await self._session.commit()
         return conversation
 

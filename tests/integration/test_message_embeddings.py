@@ -1,6 +1,6 @@
-"""Conversation index against real Postgres: which answers are pending, the question and title
-each gets, consents, writes and re-embedding (model, format, rename), cascades. Fake embeddings
-only (rule 1)."""
+"""Conversation index against real Postgres: which answers are pending, the question each gets,
+consents, small talk, writes and re-embedding (model, format), a rename leaving the index alone,
+cascades. Fake embeddings only (rule 1)."""
 
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -25,6 +25,7 @@ from app.db.repositories.message_embeddings import PendingAnswer, SqlMessageEmbe
 from app.db.session import get_sessionmaker
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
+    IndexReport,
     index_conversations,
     index_text,
 )
@@ -92,10 +93,17 @@ def a(content: str) -> tuple[MessageRole, str, None]:
     return (MessageRole.ASSISTANT, content, None)
 
 
-async def pending_rows(model: str = "fake-embedding", **scope: uuid.UUID) -> list[PendingAnswer]:
+async def pending_rows(
+    model: str = "fake-embedding", min_answer_chars: int = 0, **scope: uuid.UUID
+) -> list[PendingAnswer]:
     async with get_sessionmaker()() as session:
         return await repository(session).pending(
-            model=model, index_format=FORMAT, after=None, limit=100, **scope
+            model=model,
+            index_format=FORMAT,
+            after=None,
+            limit=100,
+            min_answer_chars=min_answer_chars,
+            **scope,
         )
 
 
@@ -103,9 +111,11 @@ async def pending(model: str = "fake-embedding") -> dict[uuid.UUID, str | None]:
     return {row.message_id: row.question for row in await pending_rows(model)}
 
 
-async def run(embedder: FakeEmbedder) -> None:
+async def run(embedder: FakeEmbedder, min_answer_chars: int = 0) -> IndexReport:
     async with get_sessionmaker()() as session:
-        await index_conversations(repository(session), embedder, max_chars=1000)
+        return await index_conversations(
+            repository(session), embedder, max_chars=1000, min_answer_chars=min_answer_chars
+        )
 
 
 async def stored() -> dict[uuid.UUID, MessageEmbedding]:
@@ -182,9 +192,7 @@ async def test_save_leaves_out_answers_deleted_after_pending(clean: None) -> Non
     assert await stored() == {}
 
 
-async def test_pending_carries_the_title_and_whether_the_user_has_every_consent(
-    clean: None,
-) -> None:
+async def test_pending_carries_whether_the_user_has_every_consent(clean: None) -> None:
     full = await conversation(u("Q"), a("A"), title="Мытьё")
     partial = await conversation(u("Q"), a("A"), consents=[ConsentType.AGE_18])
     revoked = await conversation(u("Q"), a("A"))
@@ -200,8 +208,7 @@ async def test_pending_carries_the_title_and_whether_the_user_has_every_consent(
 
     rows = {row.message_id: row for row in await pending_rows()}
 
-    assert (rows[full[1].id].title, rows[full[1].id].consented) == ("Мытьё", True)
-    assert rows[partial[1].id].title is None
+    assert rows[full[1].id].consented
     assert not rows[partial[1].id].consented
     assert not rows[revoked[1].id].consented
     assert not rows[outdated[1].id].consented
@@ -210,79 +217,90 @@ async def test_pending_carries_the_title_and_whether_the_user_has_every_consent(
     assert set(await stored()) == {full[1].id}
 
 
-async def test_the_index_embeds_the_titled_pair_and_stores_the_format(clean: None) -> None:
+async def test_the_index_embeds_the_untitled_pair_and_stores_the_format(clean: None) -> None:
     messages = await conversation(u("Как часто?"), a("Раз в два дня."), title="Мытьё")
     embedder = FakeEmbedder()
 
     await run(embedder)
 
-    assert embedder.embedded == [
-        index_text("Мытьё", "Как часто?", "Раз в два дня.", max_chars=1000)
-    ]
-    assert (await stored())[messages[1].id].index_format == FORMAT
+    assert embedder.embedded == [index_text("Как часто?", "Раз в два дня.", max_chars=1000)]
+    assert embedder.embedded[0].startswith("title: none | ")
+    assert (await stored())[messages[1].id].index_format == FORMAT == "3"
 
 
-async def test_rows_of_another_format_or_stale_are_pending_again(clean: None) -> None:
-    one = await conversation(u("Q"), a("A"))
-    two = await conversation(u("Q"), a("A"))
-    await run(FakeEmbedder())
-    assert await pending() == {}
-
+async def set_format(message_id: uuid.UUID, index_format: str | None) -> None:
     async with get_sessionmaker()() as session:
         await session.execute(
             update(MessageEmbedding)
-            .where(MessageEmbedding.message_id == one[1].id)
-            .values(index_format="1")
-        )
-        await session.execute(
-            update(MessageEmbedding)
-            .where(MessageEmbedding.message_id == two[1].id)
-            .values(index_format=None)
+            .where(MessageEmbedding.message_id == message_id)
+            .values(index_format=index_format)
         )
         await session.commit()
 
-    assert set(await pending()) == {one[1].id, two[1].id}
+
+async def test_rows_of_another_format_or_stale_are_pending_again(clean: None) -> None:
+    v1, v2, stale = [await conversation(u("Q"), a("A")) for _ in range(3)]
+    await run(FakeEmbedder())
+    assert await pending() == {}
+
+    await set_format(v1[1].id, "1")
+    await set_format(v2[1].id, "2")  # titled, before format 3
+    await set_format(stale[1].id, None)
+
+    assert set(await pending()) == {v1[1].id, v2[1].id, stale[1].id}
     await run(FakeEmbedder())
     assert {r.index_format for r in (await stored()).values()} == {FORMAT}
 
 
-async def test_a_rename_marks_only_that_conversations_rows_stale(clean: None) -> None:
+async def test_small_talk_is_pending_only_while_it_has_a_row(clean: None) -> None:
+    long_enough = await conversation(u("Что с перхотью?"), a("ж" * 200))
+    short = await conversation(u("hallo"), a(" " + "ж" * 199 + "\n\t"))  # stripped: 199
+    v2_greeting = await conversation(u("hallo"), a("Здравствуйте!"))
+    await run(FakeEmbedder())  # everything indexed, as before format 3
+    await set_format(v2_greeting[1].id, "2")
+    await set_format(long_enough[1].id, "2")
+
+    rows = {r.message_id: r for r in await pending_rows(min_answer_chars=200)}
+    # short has a current row: pending, to be dropped; the v2 greeting too.
+    assert {m: r.small_talk for m, r in rows.items()} == {
+        long_enough[1].id: False,
+        short[1].id: True,
+        v2_greeting[1].id: True,
+    }
+
+    embedder = FakeEmbedder()
+    report = await run(embedder, min_answer_chars=200)
+
+    assert (report.indexed, report.skipped_small_talk) == (1, 2)
+    assert set(await stored()) == {long_enough[1].id}
+    assert not any("hallo" in t for t in embedder.embedded)
+    # No row and short: never pending again, the next run reads nothing.
+    assert await pending_rows(min_answer_chars=200) == []
+    assert (await run(FakeEmbedder(), min_answer_chars=200)).seen == 0
+    # A lower threshold brings them back.
+    assert set(await pending()) == {short[1].id, v2_greeting[1].id}
+
+
+async def test_a_rename_does_not_touch_the_index(clean: None) -> None:
     renamed = await conversation(u("Q1"), a("A1"), u("Q2"), a("A2"), title="Старое")
     user_id = renamed[0].user_id
-    other_of_same_user = await conversation(u("Q"), a("A"), user_id=user_id)
     await run(FakeEmbedder())
+    before = {
+        m: (list(r.embedding), r.embedding_model, r.index_format, r.created_at)
+        for m, r in (await stored()).items()
+    }
 
     async with get_sessionmaker()() as session:
         await SqlConversationRepository(session).rename(
             user_id, renamed[0].conversation_id, "Новое"
         )
 
-    rows = await stored()
-    assert rows[renamed[1].id].index_format is None
-    assert rows[renamed[3].id].index_format is None
-    assert rows[other_of_same_user[1].id].index_format == FORMAT
-    # Still searchable meanwhile: the vector stays, only its format is unknown.
-    assert len(rows) == 3
-
-    scoped = await pending_rows(user_id=user_id, conversation_id=renamed[0].conversation_id)
-    assert {r.message_id for r in scoped} == {renamed[1].id, renamed[3].id}
-    assert {r.title for r in scoped} == {"Новое"}
-
-
-async def test_someone_elses_rename_marks_nothing(clean: None) -> None:
-    mine = await conversation(u("Q"), a("A"), title="Моё")
-    stranger = await conversation(u("Q"), a("A"))
-    await run(FakeEmbedder())
-
-    async with get_sessionmaker()() as session:
-        assert (
-            await SqlConversationRepository(session).rename(
-                stranger[0].user_id, mine[0].conversation_id, "Чужое"
-            )
-            is None
-        )
-
-    assert (await stored())[mine[1].id].index_format == FORMAT
+    after = {
+        m: (list(r.embedding), r.embedding_model, r.index_format, r.created_at)
+        for m, r in (await stored()).items()
+    }
+    assert after == before and len(after) == 2
+    assert await pending_rows(user_id=user_id, conversation_id=renamed[0].conversation_id) == []
 
 
 async def test_the_conversation_scope_is_one_conversation_of_that_user(clean: None) -> None:

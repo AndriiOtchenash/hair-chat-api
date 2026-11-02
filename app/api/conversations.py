@@ -14,7 +14,6 @@ from app.core.chat import (
     get_chat_service,
     get_conversation_search,
     get_conversation_service,
-    get_rename_indexer,
     get_summarizer,
 )
 from app.core.errors import api_error
@@ -298,21 +297,15 @@ async def rename_conversation(
     body: RenameRequest,
     user: CurrentUser,
     conversations: Conversations,
-    indexer: Annotated[ConversationIndexer | None, Depends(get_rename_indexer)],
-    jobs: Annotated[BackgroundJobs, Depends(get_background_jobs)],
 ) -> ConversationOut:
     """The title is kept: a later first message no longer replaces it.
 
-    The title is in the conversation's search vectors: they are marked stale with the rename
-    and re-embedded in the background, unless the user lacks a consent (then nothing is
-    sent to the embeddings API, ever, until they grant them again).
+    The search index does not hold the title (app.rag.conversation_index), so it is untouched.
     """
     try:
         conversation = await conversations.rename(user.id, conversation_id, body.title)
     except ConversationNotFound:
         raise _not_found() from None
-    if indexer is not None:
-        jobs.spawn(indexer.run(user.id, conversation_id))
     return ConversationOut.model_validate(conversation)
 
 

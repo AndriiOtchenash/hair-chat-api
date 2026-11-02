@@ -24,7 +24,6 @@ from app.llm.registry import build_llm, build_providers
 from app.llm.resilient import ResilientLLM
 from app.rag.conversation_index import ConversationIndexer
 from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
-from app.rag.ingest import INGEST_TIMEOUT_S
 from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, RagKnowledge, RagQueryEmbedder
 from app.services.chat_service import ChatService, ConversationLocks, ConversationService
 from app.services.context_builder import TokenBudgetContextBuilder
@@ -74,16 +73,16 @@ def get_moderator() -> Moderator:
     return build_moderator(get_settings())
 
 
-def build_embedder(settings: Settings, timeout: float | None = None) -> Embedder | None:
-    """None without GEMINI_API_KEY: replies go without the knowledge base. `timeout` per
-    request, default EMBEDDING_TIMEOUT_S; never retries."""
+def build_embedder(settings: Settings) -> Embedder | None:
+    """None without GEMINI_API_KEY: replies go without the knowledge base. EMBEDDING_TIMEOUT_S
+    per request; never retries."""
     if settings.gemini_api_key is None:
         return None
     return OpenAICompatibleEmbedder(
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
         api_key=settings.gemini_api_key.get_secret_value(),
-        timeout=settings.embedding_timeout_s if timeout is None else timeout,
+        timeout=settings.embedding_timeout_s,
     )
 
 
@@ -134,31 +133,8 @@ def get_answer_indexer(
         ),
         embedder,
         max_chars=settings.conversation_index_max_chars,
+        min_answer_chars=settings.conversation_index_min_answer_chars,
         timeout=settings.embedding_timeout_s,
-    )
-
-
-@lru_cache
-def get_reindex_embedder() -> Embedder | None:
-    """For re-embedding a whole conversation (a rename): up to 100 long pairs per request, so
-    the ingest's per-request timeout instead of the chat's, still without retries."""
-    return build_embedder(get_settings(), timeout=INGEST_TIMEOUT_S)
-
-
-def get_rename_indexer(
-    embedder: Annotated[Embedder | None, Depends(get_reindex_embedder)],
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> ConversationIndexer | None:
-    """After a rename (the title is in every vector). None without an embedder (dev)."""
-    if embedder is None:
-        return None
-    return ConversationIndexer(
-        sql_message_embedding_repositories(
-            get_sessionmaker(), consent_version=settings.consent_version
-        ),
-        embedder,
-        max_chars=settings.conversation_index_max_chars,
-        timeout=None,
     )
 
 

@@ -89,6 +89,14 @@ class Settings(BaseSettings):
     # cuts the rest (ai.google.dev/gemini-api/docs/embeddings, checked 2026-11-02); 16000
     # chars stay under it even at 2 chars/token (Cyrillic), app.services.tokens says ~5300.
     conversation_index_max_chars: int = Field(default=16000, ge=200)
+    # Answers shorter than this (stripped) are small talk and not indexed (format 3). Answer
+    # lengths of the real chain, system_v8, our prompt eval (2026-11-02, 40 cases): greetings
+    # and acknowledgements 71 ("hallo"), 116 ("ok"), 118, 172 ("thanks"); then a gap up to
+    # 318 (small talk turned to hair care); off-topic 335..470; real questions 391 and up
+    # (most 650..1700). 200 drops every short acknowledgement seen, with room for longer
+    # ones, and keeps as many as possible of the short clarifying-question answers the
+    # prompt asks for (none in the eval, so unmeasured). 0 = index everything.
+    conversation_index_min_answer_chars: int = Field(default=200, ge=0)
     # GET /conversations/search keeps index rows within this cosine distance of the query
     # (score = 1 - distance >= 0.60). Provisional. search_probe on staging (2026-11-02, 6 pairs,
     # format 2 = asymmetric prefixes): right top1 0.657..0.781, noise (top2+ where one answer
