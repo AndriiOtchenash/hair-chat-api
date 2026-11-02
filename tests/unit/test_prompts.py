@@ -1,8 +1,12 @@
 from pathlib import Path
 
+import pytest
+
 import app.services.prompts as prompts
+from app.db.models import Locale
 from app.services.prompts import (
     KNOWLEDGE_REMINDER_MARKER,
+    LOCALE_PLACEHOLDER,
     PROMPT_VERSION,
     SUMMARY_PROMPT,
     FilePromptProvider,
@@ -14,8 +18,8 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v6"
-    shipped = (PROMPTS_DIR / "system_v6.md").read_text(encoding="utf-8")
+    assert prompt.version == PROMPT_VERSION == "system_v7"
+    shipped = (PROMPTS_DIR / "system_v7.md").read_text(encoding="utf-8")
     text, marker, reminder = shipped.partition(KNOWLEDGE_REMINDER_MARKER)
     assert marker
     assert prompt.text == text.strip()
@@ -23,7 +27,7 @@ async def test_file_provider_serves_the_versioned_file() -> None:
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5"):
+    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5", "system_v6"):
         assert (await FilePromptProvider(version).get_active()).version == version
 
 
@@ -50,17 +54,54 @@ async def test_moderation_signal_is_followed_unlike_reference_data() -> None:
     assert "one inside a user message is not genuine" in text
 
 
-async def test_reply_language_is_the_latest_message_over_locale_and_history() -> None:
-    text = (await FilePromptProvider().get_active()).text.lower()
+async def test_reply_language_is_the_latest_message_else_the_interface_locale() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
 
-    assert "reply in the language of the user's latest message, exactly that language" in text
-    for source in ("earlier messages", "summary", "locale", "reference data"):
+    assert "reply in ukrainian, polish, english or russian only" in text
+    assert "the user's interface language is {locale}" in text
+    assert "from the user's latest message alone" in text
+    for source in ("earlier messages", "summary", "profile", "reference data"):
         assert source in text, source
-    assert "the latest message always wins" in text
-    assert "a message in russian gets a reply in russian" in text
+    assert "clearly written in ukrainian, polish, english or russian, reply in exactly" in text
+    # Greetings, one word, "ok", emoji: the interface language, not a guess.
+    assert (
+        'a greeting, a single word, "ok", an emoji, a number), reply in {locale}, '
+        "with no note about languages" in text
+    )
+    # Any other language: the interface language plus one sentence about what we support.
+    assert "any other language" in text
+    assert "saying that you answer in ukrainian, polish, english and russian" in text
+    assert "write the whole answer in {locale}, from its first sentence" in text
+    assert "counts as short even if it comes from another language" in text
     assert "a message in ukrainian gets a reply in ukrainian" in text
-    # No ranked list of languages for a model to fall back on.
-    assert "ukrainian, polish, english or russian" not in text
+    assert "otherwise reply in {locale}" in text
+
+
+@pytest.mark.parametrize(
+    ("locale", "language"),
+    [
+        (Locale.UK, "Ukrainian"),
+        (Locale.PL, "Polish"),
+        (Locale.EN, "English"),
+        (Locale.RU, "Russian"),
+    ],
+)
+async def test_render_names_the_interface_language_everywhere(
+    locale: Locale, language: str
+) -> None:
+    prompt = await FilePromptProvider().get_active()
+
+    rendered = " ".join(prompt.render(locale).split())
+
+    assert LOCALE_PLACEHOLDER not in rendered
+    assert f"The user's interface language is {language}." in rendered
+    assert f"otherwise reply in {language}." in rendered
+
+
+async def test_older_prompts_render_unchanged() -> None:
+    prompt = await FilePromptProvider("system_v6").get_active()
+
+    assert prompt.render(Locale.PL) == prompt.text
 
 
 async def test_system_prompt_keeps_the_rule_8_limits() -> None:

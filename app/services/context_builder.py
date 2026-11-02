@@ -2,7 +2,7 @@
 
 One system message, then the history, ending with the user's new message:
 
-    system prompt (never cut)
+    system prompt (never cut), naming the user's interface language (users.locale)
     <moderation_signal>     only when moderation marked the new message "soft" (never cut)
     <knowledge_status>      only when the knowledge-base search failed (never cut)
     <profile>               ProfileSource   (empty until stage 2)
@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from app.db.models import Message, MessageRole
+from app.db.models import Locale, Message, MessageRole
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import ChatMessage
 from app.rag.retriever import (
@@ -117,11 +117,14 @@ class ContextBuilder(Protocol):
         conversation_id: uuid.UUID,
         budget_tokens: int,
         query: QueryResult = None,
+        *,
+        locale: Locale,
     ) -> Context:
         """Full context within `budget_tokens`, ending with the user's new message.
 
         `query` is the new message's embedding, made in advance (ChatService.reply); QueryFailed
-        (embeddings down: the model is told) or None (no embedder) = no knowledge base."""
+        (embeddings down: the model is told) or None (no embedder) = no knowledge base.
+        `locale` is the user's interface language, named in the prompt (SystemPrompt.render)."""
         ...
 
 
@@ -189,6 +192,8 @@ class TokenBudgetContextBuilder:
         conversation_id: uuid.UUID,
         budget_tokens: int,
         query: QueryResult = None,
+        *,
+        locale: Locale,
     ) -> Context:
         prompt = await self._prompts.get_active()
         conversation = await self._repo.get(user_id, conversation_id)
@@ -210,14 +215,14 @@ class TokenBudgetContextBuilder:
         if retrieval.status is RetrievalStatus.ERROR:
             head.append(DataBlock("knowledge_status", KB_UNAVAILABLE_SIGNAL, KB_STATUS_NOTE))
         blocks = await self._blocks(user_id, knowledge.text if knowledge else None, summary)
-        system = system_message(prompt, [*head, *blocks])
+        system = system_message(prompt, [*head, *blocks], locale)
         fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         for tag in _DROP_ORDER:
             if fixed <= budget_tokens:
                 break
             if any(b.tag == tag for b in blocks):
                 blocks = [b for b in blocks if b.tag != tag]
-                system = system_message(prompt, [*head, *blocks])
+                system = system_message(prompt, [*head, *blocks], locale)
                 fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
         if fixed > budget_tokens:
             logger.warning(
@@ -280,9 +285,10 @@ class TokenBudgetContextBuilder:
         ]
 
 
-def system_message(prompt: SystemPrompt, blocks: list[DataBlock]) -> str:
-    """The prompt, then the data blocks; the prompt's knowledge reminder right after <knowledge>."""
-    parts = [prompt.text]
+def system_message(prompt: SystemPrompt, blocks: list[DataBlock], locale: Locale) -> str:
+    """The prompt (with the interface language), then the data blocks; the prompt's knowledge
+    reminder right after <knowledge>."""
+    parts = [prompt.render(locale)]
     for block in blocks:
         parts.append(wrap_data(block.tag, block.text, block.note))
         if block.tag == "knowledge" and prompt.knowledge_reminder:

@@ -4,6 +4,7 @@ from collections.abc import Sequence
 import pytest
 
 from app.core.config import Settings
+from app.db.models import Locale
 from app.llm.base import ProviderHTTPError
 from app.llm.resilient import ResilientLLM
 from app.rag.retriever import Knowledge, Source
@@ -21,6 +22,7 @@ GROUPS = {
     "kb",
     "real",
     "dialog",
+    "language",
 }
 
 
@@ -77,15 +79,57 @@ async def test_sends_the_prompt_history_and_question_and_prints_the_answer() -> 
     prompt = await FilePromptProvider().get_active()
     assert provider.received == [
         [
-            {"role": "system", "content": prompt.text},
+            {"role": "system", "content": prompt.render(Locale.RU)},
             *history,
             {"role": "user", "content": "Я заболела, что делать с записью?"},
         ]
     ]
-    assert "[off_topic] c1 (ru)" in out
+    assert "[off_topic] c1 (ru, locale ru)" in out
+    assert "answer_lang: ru (expected ru)" in out
     assert "  - сочувствует" in out
     assert "A (gemini:flash, 2 words):\nСочувствую. Позвоните." in out
     assert "\n!! " not in out
+
+
+def test_language_cases_set_the_interface_locale_and_the_answer_language() -> None:
+    cases = {c.id: c for c in prompt_eval.load(prompt_eval.DEFAULT_FILE)}
+
+    hallo = cases["language-hallo-ru-locale"]
+    assert (hallo.lang, hallo.interface, hallo.expected_lang) == ("de", Locale.RU, "ru")
+    polish = cases["language-polish-dandruff"]
+    assert (polish.interface, polish.expected_lang) == (Locale.RU, "pl")
+    # No locale: the case's own language if we support it, else en (the users.locale default).
+    assert case(lang="uk").interface is Locale.UK
+    assert case(lang="de").interface is Locale.EN
+
+
+@pytest.mark.parametrize(
+    ("text", "lang"),
+    [
+        ("Здравствуйте! Чем помочь с волосами?", "ru"),
+        ("Вітаю! Чим допомогти з волоссям?", "uk"),
+        ("Łupież to częsty problem, użyj łagodnego szamponu.", "pl"),
+        ("Hallo! Ich helfe Ihnen gern mit Ihren Haaren und der Kopfhaut.", "de"),
+        ("Hello! How can I help with your hair?", "en"),
+        ("👍", "?"),
+    ],
+)
+def test_detect_lang_tells_our_languages_and_german_apart(text: str, lang: str) -> None:
+    assert prompt_eval.detect_lang(text) == lang
+
+
+async def test_the_interface_locale_goes_into_the_prompt_and_a_wrong_language_is_flagged() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(
+        success("Hallo! Ich helfe gern mit Haaren.")
+    )
+
+    code, out = await run(provider, case(text="hallo", lang="de", locale="ru", answer_lang="ru"))
+
+    assert code == 0
+    system = " ".join(provider.received[0][0]["content"].split())
+    assert "The user's interface language is Russian." in system
+    assert "{locale}" not in system
+    assert "!! answer in de, expected ru" in out
 
 
 async def test_flags_avoided_phrases_case_insensitively() -> None:
@@ -120,7 +164,7 @@ async def test_the_kb_used_tag_is_cut_out_and_checked_against_the_case() -> None
     )
 
     assert code == 0
-    assert "A (gemini:flash, 1 words):\nПривет!\nkb_used: 1\n" in out
+    assert "A (gemini:flash, 1 words):\nПривет!\nanswer_lang: ru (expected ru)\nkb_used: 1\n" in out
     assert "!! has a <kb_used> tag" in out
     assert "!! has no <kb_used> tag" not in out
     assert "2 answers, 1 with !! flags, 0 errors" in out

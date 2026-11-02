@@ -12,6 +12,9 @@ the passage numbers of its <kb_used> tag (cut out of the answer as the chat does
 that would go under it, `!!` for every `avoid` substring found in it and `!!` when the tag is
 there or missing against the case's `kb_used`. A case that expects the tag but got no passages
 is marked `??` instead: its answer says nothing about the prompt.
+Every answer gets `answer_lang` (a rough script/letter guess, `detect_lang`), flagged `!!` when it
+differs from the case's `answer_lang` (default: its `lang`). The prompt names the case's
+`locale` as the interface language (default: `lang` if we support it, else en, like users.locale).
 The system message is built like the chat builds it: the prompt file, then the <knowledge> block
 from the docs/kb articles (embedded in memory by the same loader, chunker and RagKnowledge as
 scripts.rag_eval) followed by the prompt's knowledge reminder, then the case's history and the
@@ -26,6 +29,7 @@ No database: llm_calls are not recorded. Exit code 1 only if the chain fails on 
 
 import argparse
 import asyncio
+import re
 import sys
 import uuid
 from collections.abc import Callable, Sequence
@@ -36,6 +40,7 @@ from typing import Any, Literal, TextIO
 import yaml
 
 from app.core.config import Settings, get_settings
+from app.db.models import Locale
 from app.db.repositories.kb import KBRepository
 from app.db.repositories.llm_calls import LLMCallRecord
 from app.llm.base import (
@@ -83,6 +88,44 @@ class Case:
     summary: str | None = None
     # Articles whose passages the search must find for `text`; !! when one is missing.
     kb_slugs: tuple[str, ...] = ()
+    # The user's interface language (users.locale); None = `lang` if supported, else en.
+    locale: str | None = None
+    # Language the answer must be in; None = `lang`.
+    answer_lang: str | None = None
+
+    @property
+    def interface(self) -> Locale:
+        if self.locale is not None:
+            return Locale(self.locale)
+        return Locale(self.lang) if self.lang in set(Locale) else Locale.EN
+
+    @property
+    def expected_lang(self) -> str:
+        return self.answer_lang or self.lang
+
+
+_WORD = re.compile(r"[^\W\d_]+")
+_GERMAN = {"ich", "und", "die", "der", "das", "nicht", "ist", "sie", "mit", "haare", "für"}
+
+
+def detect_lang(text: str) -> str:
+    """Rough guess for the eval report: uk | ru | pl | de | en, or ? for no letters.
+
+    Cyrillic: і/ї/є/ґ vs ы/э/ъ/ё. Latin: Polish diacritics, German umlauts or common words."""
+    words = _WORD.findall(text.lower())
+    letters = "".join(words)
+    cyrillic = sum("а" <= ch <= "я" or ch in "ёіїєґ" for ch in letters)
+    if not letters:
+        return "?"
+    if cyrillic * 2 >= len(letters):
+        uk = sum(ch in "іїєґ" for ch in letters)
+        ru = sum(ch in "ыэъё" for ch in letters)
+        return "uk" if uk > ru else "ru"
+    if sum(ch in "ąęłśżźćń" for ch in letters) >= 2:
+        return "pl"
+    if sum(ch in "äöüß" for ch in letters) >= 2 or sum(w in _GERMAN for w in words) >= 2:
+        return "de"
+    return "en"
 
 
 def _dialog(case: Case, *, summary: bool = True) -> str | None:
@@ -130,6 +173,7 @@ class Answer:
     error: str | None = None
     kb_ids: tuple[int, ...] = ()
     sources: tuple[str, ...] = ()
+    lang: str = "?"  # detect_lang of the answer
     flagged: list[str] = field(default_factory=list)
     # The case cannot be judged, e.g. it expects a <kb_used> tag but got no passages.
     unsure: list[str] = field(default_factory=list)
@@ -165,6 +209,8 @@ def load(path: Path) -> list[Case]:
             kb_used=r.get("kb_used"),
             summary=r.get("summary"),
             kb_slugs=tuple(r.get("kb_slugs") or ()),
+            locale=r.get("locale"),
+            answer_lang=r.get("answer_lang"),
         )
         for r in rows
     ]
@@ -175,7 +221,7 @@ def messages(prompt: SystemPrompt, case: Case, knowledge: Knowledge | None) -> l
     blocks = [DataBlock("knowledge", knowledge.text, KNOWLEDGE_NOTE)] if knowledge else []
     if case.summary:
         blocks.append(DataBlock("conversation_summary", case.summary, SUMMARY_NOTE))
-    system = system_message(prompt, blocks)
+    system = system_message(prompt, blocks, case.interface)
     question: ChatMessage = {"role": "user", "content": case.text}
     turns: list[ChatMessage] = [
         {"role": t["role"], "content": defuse_tags(t["content"])} for t in [*case.history, question]
@@ -265,6 +311,9 @@ async def answer(
     result.sources = tuple(s.slug for s in used_sources(tag.ids, passages))
     lowered = result.text.lower()
     result.flagged = [f"contains {a!r}" for a in case.avoid if a.lower() in lowered]
+    result.lang = detect_lang(result.text)
+    if result.text and result.lang != case.expected_lang:
+        result.flagged.append(f"answer in {result.lang}, expected {case.expected_lang}")
     if case.kb_used and knowledge is None:
         # No passages to rely on: a missing tag is right, so it tells nothing about the prompt.
         result.unsure.append("no kb context")
@@ -275,7 +324,7 @@ async def answer(
 
 def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
     print(RULE, file=out)
-    print(f"[{case.group}] {case.id} ({case.lang})", file=out)
+    print(f"[{case.group}] {case.id} ({case.lang}, locale {case.interface})", file=out)
     for turn in case.history:
         print(f"  {turn['role']}: {turn['content']}", file=out)
     print(f"Q: {case.text}", file=out)
@@ -293,6 +342,7 @@ def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
         notes.append("truncated")
     print(f"A ({', '.join(notes)}):", file=out)
     print(result.text, file=out)
+    print(f"answer_lang: {result.lang} (expected {case.expected_lang})", file=out)
     print(f"kb_used: {', '.join(map(str, result.kb_ids)) or '-'}", file=out)
     print(f"sources: {', '.join(result.sources) or '-'}", file=out)
     for flag in result.flagged:

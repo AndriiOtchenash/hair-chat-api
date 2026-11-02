@@ -83,6 +83,10 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   our tags inside any data or message turn are defused by `defuse_tags`, so text can never open
   or close a block such as `<moderation_signal>`),
   then as many recent messages as fit, then the new message. The prompt is never cut.
+- Reply language (system_v7+): the latest message if clearly uk/pl/en/ru; short/ambiguous ->
+  the interface language; any other language -> interface language + one sentence on the
+  supported languages. users.locale is passed explicitly (`ChatService.reply(..., locale=)` ->
+  `ContextBuilder.build(locale=)`) and fills the prompt's `{locale}` (`SystemPrompt.render`).
 - Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
   `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).
 - Messages that do not fit are folded into `conversations.summary` after the answer (background
@@ -97,6 +101,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `kb_used: true|false` flags a tag that is missing / unexpected; `??` when a kb case got no
   passages, `kb_context:` shows them or the embeddings error). Cases may carry `history`,
   `summary` (conversations.summary) and `kb_slugs` (articles the search must find, `!!` if not).
+  `locale` sets the interface language (default `lang`), `answer_lang` the expected reply
+  language (default `lang`); every answer prints a rough `answer_lang`, `!!` on a mismatch.
   `--retrieval-only --query last|user3|summary|chat ...` = embeddings only, no LLM: kb_context
   per search-query variant (`chat`, the default = what the chat does). Eval vectors are cached
   in .cache/embeddings.json (git-ignored, key = sha256 of model+dimensions+text).

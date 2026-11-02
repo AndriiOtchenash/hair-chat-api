@@ -1,6 +1,6 @@
 import uuid
 
-from app.db.models import Conversation, Message
+from app.db.models import Conversation, Locale, Message
 from app.rag.retriever import (
     Knowledge,
     QueryEmbedding,
@@ -94,10 +94,11 @@ class Dialog:
         knowledge: StaticKnowledge | None = None,
         user: uuid.UUID = USER,
         query: QueryResult = None,
+        locale: Locale = Locale.EN,
     ) -> Context:
         assert self.conversation is not None
         builder = TokenBudgetContextBuilder(self.repo, prompt or StaticPrompt(), profile, knowledge)
-        return await builder.build(user, self.conversation.id, budget, query)
+        return await builder.build(user, self.conversation.id, budget, query, locale=locale)
 
 
 def contents(context: Context) -> list[str]:
@@ -391,3 +392,14 @@ async def test_no_knowledge_block_means_no_reminder() -> None:
 
     for context in (dropped, none_found):
         assert "REMINDER" not in context.messages[0]["content"]
+
+
+async def test_the_prompt_names_the_users_interface_language() -> None:
+    dialog = Dialog()
+    await dialog.start()
+    await dialog.turns("hallo")
+    prompt = StaticPrompt("Interface: {locale}. Otherwise reply in {locale}.")
+
+    context = await dialog.build(6000, prompt=prompt, locale=Locale.PL)
+
+    assert context.messages[0]["content"] == "Interface: Polish. Otherwise reply in Polish."

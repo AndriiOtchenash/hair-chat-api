@@ -3,6 +3,7 @@ import io
 import pytest
 
 from app.core.config import Settings
+from app.db.models import Locale
 from app.llm.base import LLMProvider, ProviderHTTPError, StreamEnd
 from app.llm.registry import MODELS
 from app.services.context_builder import system_message
@@ -46,7 +47,7 @@ async def test_sends_the_real_prompt_and_question_and_prints_timings_and_stats()
     assert provider.calls == 2
     system, question = provider.received[0]
     prompt = await FilePromptProvider(PROMPT_VERSION).get_active()
-    assert system == {"role": "system", "content": system_message(prompt, [])}
+    assert system == {"role": "system", "content": system_message(prompt, [], Locale.RU)}
     assert question == {"role": "user", "content": latency_probe.DEFAULT_QUESTION}
     assert "#1  ttft" in out and "tokens_out 42" in out and "#2  ttft" in out
     assert "2/2 ok, 0 errors" in out

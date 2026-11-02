@@ -7,7 +7,7 @@ import pytest
 from app.cli import chat as chat_cli
 from app.cli.chat import converse
 from app.core.config import Settings
-from app.db.models import MessageRole
+from app.db.models import Locale, MessageRole
 from app.llm.base import ProviderHTTPError, StreamBroken
 from tests.fakes import StaticPrompt
 from tests.llm_fakes import (
@@ -30,7 +30,7 @@ async def lines(*items: str) -> AsyncIterator[str]:
 async def run(world: World, *inputs: str) -> tuple[uuid.UUID, str]:
     conversation_id = await world.conversation()
     out = io.StringIO()
-    await converse(world.chat, USER, conversation_id, lines(*inputs), out)
+    await converse(world.chat, USER, conversation_id, lines(*inputs), out, locale=Locale.EN)
     return conversation_id, out.getvalue()
 
 
@@ -99,7 +99,15 @@ async def test_summarizer_runs_after_an_answer_whose_context_overflowed() -> Non
     conversation_id = await world.conversation()
     out = io.StringIO()
 
-    await converse(world.chat, USER, conversation_id, lines(MESSAGE, MESSAGE), out, summarizer)
+    await converse(
+        world.chat,
+        USER,
+        conversation_id,
+        lines(MESSAGE, MESSAGE),
+        out,
+        summarizer,
+        locale=Locale.EN,
+    )
 
     # The first answer had everything in context; the second had to leave messages out.
     assert summarizer.runs == [conversation_id]
