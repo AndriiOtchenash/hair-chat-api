@@ -10,6 +10,7 @@ from app.core.chat import check_deployed_config, close_llm, get_moderator
 from app.core.config import get_settings
 from app.core.consents import require_consents
 from app.core.errors import install_error_handlers
+from app.core.logging import configure_logging
 from app.core.loop_monitor import start_loop_monitor, stop_loop_monitor
 from app.core.security import current_user, get_token_verifier
 from app.db.session import get_engine
@@ -44,6 +45,8 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    # Before anything logs: uvicorn sets up only its own loggers, app.* would hit lastResort.
+    configure_logging(get_settings().log_level)
     # No Swagger OAuth2 redirect page: tokens are pasted into "Authorize" as plain Bearer.
     app = FastAPI(title="hair-chat-api", lifespan=lifespan, swagger_ui_oauth2_redirect_url=None)
     install_error_handlers(app)

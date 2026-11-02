@@ -1,3 +1,4 @@
+import logging
 from enum import StrEnum
 from functools import lru_cache
 from typing import Self
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
     )
 
     env: Env = Env.DEV
+    # Level of the `app` logger (app.core.logging); uvicorn's own loggers are not touched.
+    log_level: str = "INFO"
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/hair_chat"
     # Per statement and per connect: a pooled connection that died during a Fly suspend hangs
     # instead of failing; past this it is dropped and the pool reconnects (app/db/session.py).
@@ -100,6 +103,14 @@ class Settings(BaseSettings):
         if self.kb_include_drafts is None:
             return self.env is Env.DEV
         return self.kb_include_drafts
+
+    @field_validator("log_level")
+    @classmethod
+    def _standard_log_level(cls, value: str) -> str:
+        level = value.strip().upper()
+        if level not in logging.getLevelNamesMapping() or level == "NOTSET":
+            raise ValueError("LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
+        return level
 
     @field_validator("database_url")
     @classmethod
