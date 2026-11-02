@@ -6,7 +6,7 @@ from collections.abc import Sequence
 import pytest
 
 from app.db.models import MessageRole
-from app.db.repositories.kb import KBHit
+from app.db.repositories.kb import KBHit, KBRepository
 from app.llm.base import ProviderHTTPError, ProviderTimeout, Restart, StreamBroken, Token
 from app.llm.moderation import ModerationResult, ModerationUnavailable, Moderator, NoopModerator
 from app.llm.resilient import ResilientLLM
@@ -24,6 +24,7 @@ from app.services.chat_service import (
     SafetyNotice,
 )
 from app.services.context_builder import (
+    KB_UNAVAILABLE_SIGNAL,
     KNOWLEDGE_NOTE,
     KnowledgeSource,
     TokenBudgetContextBuilder,
@@ -529,9 +530,18 @@ class OneArticleKB:
         return [KBHit("Перхоть › Уход\nМягкий шампунь.", "Перхоть", "dandruff", None, 0.8)]
 
 
-def rag_world(embedder: FakeEmbedder, moderator: Moderator | None = None) -> World:
+class EmptyKB:
+    async def search(
+        self, vector: Sequence[float], *, model: str, include_drafts: bool, limit: int
+    ) -> list[KBHit]:
+        return []
+
+
+def rag_world(
+    embedder: FakeEmbedder, moderator: Moderator | None = None, kb: KBRepository | None = None
+) -> World:
     knowledge = RagKnowledge(
-        OneArticleKB(), top_k=4, min_similarity=0.6, max_tokens=1500, include_drafts=False
+        kb or OneArticleKB(), top_k=4, min_similarity=0.6, max_tokens=1500, include_drafts=False
     )
     return World(
         moderator=moderator,
@@ -560,6 +570,11 @@ async def test_done_lists_the_articles_the_answer_says_it_used() -> None:
         MessageRole.ASSISTANT,
         "Мойте мягким шампунем.",
     )
+    assert world.repo.of(conversation_id)[-1].retrieval == {
+        "status": "ok",
+        "passages": 1,
+        "kb_used": [1],
+    }
 
 
 async def test_no_tag_means_no_sources_even_with_knowledge_in_the_context() -> None:
@@ -587,6 +602,11 @@ async def test_tag_ids_that_are_invalid_or_out_of_range_are_ignored() -> None:
     assert isinstance(done, ChatDone)
     assert done.sources == (Source("Перхоть", "dandruff", None),)  # only [1] exists
     assert roles_and_texts(world, conversation_id)[-1][1] == "Ответ."
+    assert world.repo.of(conversation_id)[-1].retrieval == {
+        "status": "ok",
+        "passages": 1,
+        "kb_used": [1],
+    }
 
 
 async def test_a_tag_without_valid_ids_gives_no_sources() -> None:
@@ -641,10 +661,11 @@ async def test_restart_drops_the_tag_state_of_the_failed_provider() -> None:
 
 
 @pytest.mark.parametrize("embedder", [FakeEmbedder(fail=True), FakeEmbedder(hang=True)])
-async def test_embeddings_down_answer_goes_without_knowledge(
+async def test_embeddings_down_answer_goes_without_knowledge_and_the_model_is_told(
     embedder: FakeEmbedder, caplog: pytest.LogCaptureFixture
 ) -> None:
     world = rag_world(embedder)
+    world.providers[0].script(success("Общий совет."))
     conversation_id = await world.conversation()
 
     with caplog.at_level(logging.WARNING):
@@ -653,9 +674,47 @@ async def test_embeddings_down_answer_goes_without_knowledge(
     done = events[-1]
     assert isinstance(done, ChatDone)
     assert done.sources == ()
-    assert KNOWLEDGE_NOTE not in world.providers[0].received[0][0]["content"]
+    system = world.providers[0].received[0][0]["content"]
+    assert KNOWLEDGE_NOTE not in system
+    assert KB_UNAVAILABLE_SIGNAL in system
+    # The note is for the model only: not streamed, not saved.
+    assert [e.text for e in events if isinstance(e, Token)] == ["Общий совет."]
+    answer = world.repo.of(conversation_id)[-1]
+    assert answer.content == "Общий совет."
+    assert answer.retrieval == {"status": "error", "passages": 0, "kb_used": [], "error": "timeout"}
     assert "embeddings unavailable" in caplog.text
     assert "перхот" not in caplog.text
+
+
+async def test_nothing_found_is_empty_retrieval_without_the_unavailable_note() -> None:
+    world = rag_world(FakeEmbedder(), kb=EmptyKB())
+    conversation_id = await world.conversation()
+
+    events = await world.send(conversation_id, "Как ухаживать за кожаной курткой?")
+
+    assert isinstance(events[-1], ChatDone)
+    system = world.providers[0].received[0][0]["content"]
+    assert KNOWLEDGE_NOTE not in system
+    assert KB_UNAVAILABLE_SIGNAL not in system
+    assert world.repo.of(conversation_id)[-1].retrieval == {
+        "status": "empty",
+        "passages": 0,
+        "kb_used": [],
+    }
+
+
+async def test_without_an_embedder_retrieval_is_disabled() -> None:
+    world = World()
+    conversation_id = await world.conversation()
+
+    await world.send(conversation_id)
+
+    assert world.repo.of(conversation_id)[-1].retrieval == {
+        "status": "disabled",
+        "passages": 0,
+        "kb_used": [],
+    }
+    assert KB_UNAVAILABLE_SIGNAL not in world.providers[0].received[0][0]["content"]
 
 
 class WaitsForEmbedding:

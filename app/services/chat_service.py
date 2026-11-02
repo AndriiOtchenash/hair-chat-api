@@ -25,7 +25,8 @@ from app.rag.retriever import (
     DIALOG_USER_MESSAGES,
     NoQueryEmbedder,
     QueryEmbedder,
-    QueryEmbedding,
+    QueryResult,
+    Retrieval,
     Source,
     dialog_query,
 )
@@ -105,6 +106,20 @@ SELF_HARM_NOTICE = SafetyNotice("self_harm")
 ChatEvent = SafetyNotice | Token | Restart | ChatDone | ChatError
 
 
+def retrieval_record(retrieval: Retrieval, passages: int, kb_used: set[int]) -> dict[str, Any]:
+    """messages.retrieval of an answer (scripts.rag_report reads it): the search status, the
+    number of passages in its <knowledge> block, the passage numbers its <kb_used> tag named
+    (out-of-range ones dropped) and the error code. Never message text (rule 6, GDPR)."""
+    record: dict[str, Any] = {
+        "status": retrieval.status.value,
+        "passages": passages,
+        "kb_used": sorted(i for i in kb_used if 1 <= i <= passages),
+    }
+    if retrieval.error is not None:
+        record["error"] = retrieval.error
+    return record
+
+
 class Reply:
     def __init__(
         self,
@@ -113,7 +128,7 @@ class Reply:
         conversation_id: uuid.UUID,
         user_message_id: uuid.UUID,
         safety_notice: SafetyNotice | None = None,
-        query: QueryEmbedding | None = None,
+        query: QueryResult = None,
     ) -> None:
         self._service = service
         self._query = query
@@ -181,7 +196,12 @@ class Reply:
                                 answer.append(rest)
                                 yield Token(rest, event.provider, event.model)
                             sources = used_sources(tag.ids, context.passages)
-                            done = await self._save(event, "".join(answer), context, sources)
+                            retrieval = retrieval_record(
+                                context.retrieval, len(context.passages), tag.ids
+                            )
+                            done = await self._save(
+                                event, "".join(answer), context, sources, retrieval
+                            )
                             self.summary_due = context.needs_summary
                             yield done
         except AllProvidersDown:
@@ -206,7 +226,12 @@ class Reply:
             yield ChatError("internal_error", "Something went wrong, please try again")
 
     async def _save(
-        self, done: Done, answer: str, context: Context, sources: tuple[Source, ...]
+        self,
+        done: Done,
+        answer: str,
+        context: Context,
+        sources: tuple[Source, ...],
+        retrieval: dict[str, Any],
     ) -> ChatDone:
         message = await self._service.repo.add_assistant_message(
             self.user_id,
@@ -217,10 +242,12 @@ class Reply:
             tokens_in=done.tokens_in,
             tokens_out=done.tokens_out,
             llm_call_ids=done.call_ids,
+            retrieval=retrieval,
         )
         logger.info(
             "chat reply saved: conversation=%s message=%s provider=%s model=%s prompt=%s "
-            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s passages=%d sources=%d",
+            "context_tokens=%d tokens_in=%s tokens_out=%s truncated=%s retrieval=%s passages=%d "
+            "sources=%d",
             self.conversation_id,
             message.id,
             done.provider,
@@ -230,6 +257,7 @@ class Reply:
             done.tokens_in,
             done.tokens_out,
             done.truncated,
+            context.retrieval.status,
             len(context.passages),
             len(sources),
         )

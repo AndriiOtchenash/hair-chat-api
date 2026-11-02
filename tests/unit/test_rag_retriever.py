@@ -10,6 +10,7 @@ from app.rag.embeddings import EmbeddingUnavailable
 from app.rag.retriever import (
     SUMMARY_QUERY_MAX_TOKENS,
     QueryEmbedding,
+    QueryFailed,
     RagKnowledge,
     RagQueryEmbedder,
     Source,
@@ -141,13 +142,13 @@ async def test_query_embedder_returns_the_vector_and_model() -> None:
     assert query == QueryEmbedding([0.6, 0.8], "fake-embedding")
 
 
-async def test_embeddings_down_means_none_and_a_warning_without_the_text(
+async def test_embeddings_down_means_a_failed_query_and_a_warning_without_the_text(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
         query = await RagQueryEmbedder(FakeEmbedder(fail=True)).embed_query("секретный вопрос")
 
-    assert query is None
+    assert query == QueryFailed("timeout")
     assert "embeddings unavailable" in caplog.text
     assert "секретный вопрос" not in caplog.text
 
@@ -160,7 +161,7 @@ async def test_misconfigured_embeddings_are_logged_as_error(
     with caplog.at_level(logging.WARNING):
         query = await RagQueryEmbedder(FakeEmbedder(error=error)).embed_query("вопрос")
 
-    assert query is None
+    assert query == QueryFailed("BadRequestError:400:location_unsupported")
     [record] = caplog.records
     assert record.levelno == logging.ERROR
     assert "location_unsupported" in record.getMessage()

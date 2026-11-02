@@ -4,6 +4,7 @@ One system message, then the history, ending with the user's new message:
 
     system prompt (never cut)
     <moderation_signal>     only when moderation marked the new message "soft" (never cut)
+    <knowledge_status>      only when the knowledge-base search failed (never cut)
     <profile>               ProfileSource   (empty until stage 2)
     <knowledge>             KnowledgeSource (RAG: app.rag.retriever.RagKnowledge)
     <conversation_summary>  conversations.summary (rolling summary, see summarizer.py)
@@ -12,8 +13,8 @@ One system message, then the history, ending with the user's new message:
 
 Profile, knowledge and summary are data, wrapped by `wrap_data` so the model can tell them from
 instructions (the system prompt says so too). The moderation signal is our own text, not the
-user's, wrapped the same way. Our tags are defused in every message turn too, so a message
-cannot fake a block such as <moderation_signal>.
+user's, wrapped the same way, as is the knowledge-status note. Our tags are defused in every
+message turn too, so a message cannot fake a block such as <moderation_signal>.
 """
 
 import logging
@@ -25,7 +26,15 @@ from typing import Literal, Protocol
 from app.db.models import Message, MessageRole
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import ChatMessage
-from app.rag.retriever import Knowledge, QueryEmbedding, Source
+from app.rag.retriever import (
+    Knowledge,
+    QueryEmbedding,
+    QueryFailed,
+    QueryResult,
+    Retrieval,
+    RetrievalStatus,
+    Source,
+)
 from app.services.prompts import PromptProvider, SystemPrompt
 from app.services.tokens import message_tokens
 
@@ -36,6 +45,7 @@ HISTORY_SCAN_LIMIT = 200
 
 DATA_TAGS = (
     "moderation_signal",
+    "knowledge_status",
     "profile",
     "knowledge",
     "conversation_summary",
@@ -54,6 +64,13 @@ SELF_HARM_SIGNAL = (
     "Possible crisis signal. Answer gently, in the user's language, without moralizing. "
     "Gently suggest reaching out for support (someone they trust or a help line). "
     "If there is a hair-care question, still answer it."
+)
+KB_STATUS_NOTE = "From our system, not written by the user. Never mention it to the user."
+# Embeddings down (RetrievalStatus.ERROR): no <knowledge> this time, so the model must not sound
+# as sure as with reviewed articles behind it.
+KB_UNAVAILABLE_SIGNAL = (
+    "The knowledge base is unavailable right now. Give only general hair-care recommendations, "
+    "be more cautious than usual, and suggest seeing a trichologist for anything specific."
 )
 
 _TURN_ROLES: dict[MessageRole, Literal["user", "assistant"]] = {
@@ -85,6 +102,7 @@ class Context:
     # The article of each numbered <knowledge> passage [1]..[n], if the block made it into the
     # context (not dropped by the budget); the answer's <kb_used> tag picks from these.
     passages: tuple[Source, ...] = ()
+    retrieval: Retrieval = Retrieval(RetrievalStatus.DISABLED)
 
     @property
     def sources(self) -> tuple[Source, ...]:
@@ -98,12 +116,12 @@ class ContextBuilder(Protocol):
         user_id: uuid.UUID,
         conversation_id: uuid.UUID,
         budget_tokens: int,
-        query: QueryEmbedding | None = None,
+        query: QueryResult = None,
     ) -> Context:
         """Full context within `budget_tokens`, ending with the user's new message.
 
-        `query` is the new message's embedding, made in advance (ChatService.reply); None = no
-        knowledge base for this reply."""
+        `query` is the new message's embedding, made in advance (ChatService.reply); QueryFailed
+        (embeddings down: the model is told) or None (no embedder) = no knowledge base."""
         ...
 
 
@@ -170,7 +188,7 @@ class TokenBudgetContextBuilder:
         user_id: uuid.UUID,
         conversation_id: uuid.UUID,
         budget_tokens: int,
-        query: QueryEmbedding | None = None,
+        query: QueryResult = None,
     ) -> Context:
         prompt = await self._prompts.get_active()
         conversation = await self._repo.get(user_id, conversation_id)
@@ -186,11 +204,11 @@ class TokenBudgetContextBuilder:
         turns = [m for m in history[:HISTORY_SCAN_LIMIT] if m.role in _TURN_ROLES]
         newest, older = (turns[0], turns[1:]) if turns else (None, [])
 
-        head = _signal(newest)
         summary = conversation.summary if conversation else None
-        knowledge = (
-            await self._knowledge.knowledge(user_id, newest.content, query) if newest else None
-        )
+        knowledge, retrieval = await self._search(user_id, newest, query)
+        head = _signal(newest)
+        if retrieval.status is RetrievalStatus.ERROR:
+            head.append(DataBlock("knowledge_status", KB_UNAVAILABLE_SIGNAL, KB_STATUS_NOTE))
         blocks = await self._blocks(user_id, knowledge.text if knowledge else None, summary)
         system = system_message(prompt, [*head, *blocks])
         fixed = message_tokens(system) + (message_tokens(newest.content) if newest else 0)
@@ -233,7 +251,20 @@ class TokenBudgetContextBuilder:
             prompt_version=prompt.version,
             needs_summary=left_out,
             passages=kept_knowledge.passages if kept_knowledge else (),
+            retrieval=retrieval,
         )
+
+    async def _search(
+        self, user_id: uuid.UUID, newest: Message | None, query: QueryResult
+    ) -> tuple[Knowledge | None, Retrieval]:
+        if isinstance(query, QueryFailed):
+            return None, Retrieval(RetrievalStatus.ERROR, query.code)
+        knowledge = (
+            await self._knowledge.knowledge(user_id, newest.content, query) if newest else None
+        )
+        if knowledge is not None:
+            return knowledge, Retrieval(RetrievalStatus.OK)
+        return None, Retrieval(RetrievalStatus.EMPTY if query else RetrievalStatus.DISABLED)
 
     async def _blocks(
         self, user_id: uuid.UUID, knowledge: str | None, summary: str | None

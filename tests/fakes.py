@@ -233,6 +233,7 @@ class FakeConversationRepository:
         tokens_in: int | None,
         tokens_out: int | None,
         llm_call_ids: Sequence[uuid.UUID],
+        retrieval: dict[str, Any] | None = None,
     ) -> Message:
         conversation = self._owned(user_id, conversation_id)
         assert conversation is not None
@@ -244,6 +245,7 @@ class FakeConversationRepository:
             model=model,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            retrieval=retrieval,
         )
         for call_id in llm_call_ids:
             self.linked_calls.setdefault(call_id, message.id)
