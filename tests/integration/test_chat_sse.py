@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 import fastapi.routing
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from app.core.background import BackgroundJobs, get_background_jobs
 from app.core.chat import (
     get_answer_indexer,
     get_conversation_locks,
@@ -23,6 +25,7 @@ from app.core.chat import (
     get_llm,
     get_moderator,
     get_query_embedder,
+    get_summarizer,
 )
 from app.core.config import get_settings
 from app.core.security import get_token_verifier
@@ -38,7 +41,10 @@ from app.db.repositories.conversation_search import SqlConversationSearchReposit
 from app.db.repositories.conversations import SqlConversationRepository
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
-from app.db.repositories.message_embeddings import sql_message_embedding_repositories
+from app.db.repositories.message_embeddings import (
+    PendingAnswer,
+    sql_message_embedding_repositories,
+)
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
@@ -72,6 +78,9 @@ class Live:
     client: AsyncClient
     locks: ConversationLocks
     moderator: FakeModerator
+    app: FastAPI
+    # Follow-up work (index, summary) after a stream: `await live.jobs.join()` to wait for it.
+    jobs: BackgroundJobs
     primary: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("gemini", "flash"))
     backup: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("groq", "oss"))
 
@@ -91,6 +100,8 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
     # Never the real embeddings API (rule 1), even with GEMINI_API_KEY in the environment.
     query_embedder = RagQueryEmbedder(FakeEmbedder())
     app.dependency_overrides[get_query_embedder] = lambda: query_embedder
+    jobs = BackgroundJobs()
+    app.dependency_overrides[get_background_jobs] = lambda: jobs
     indexer = AnswerIndexer(
         sql_message_embedding_repositories(get_sessionmaker()),
         FakeEmbedder(),
@@ -122,9 +133,10 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         pytest.fail("uvicorn did not start")
     port = server.servers[0].sockets[0].getsockname()[1]
     async with AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as client:
-        yield Live(client, locks, moderator, *providers)
+        yield Live(client, locks, moderator, app, jobs, *providers)
     server.should_exit = True
     await task
+    await jobs.aclose()  # before app_settings_env disposes the engine
     await verifier.aclose()
 
 
@@ -480,16 +492,13 @@ async def summary_of(conversation_id: str) -> tuple[str | None, uuid.UUID | None
         return conversation.summary, conversation.summary_upto_message_id
 
 
-async def test_long_conversation_is_summarized_after_the_answer_and_fits_the_budget(
-    live: Live,
-) -> None:
-    headers = await consented_user(live)
-    conversation_id = await new_conversation(live, headers)
+async def fill_conversation(conversation_id: str) -> None:
+    """40 messages of ~270 tokens: ~10.8K, well over the 6000 budget."""
     async with get_sessionmaker()() as session:
         conversation = await session.get(Conversation, uuid.UUID(conversation_id))
         assert conversation is not None
         repo = SqlConversationRepository(session)
-        for i in range(20):  # 40 messages of ~270 tokens: ~10.8K, well over 6000
+        for i in range(20):
             await repo.add_user_message(conversation.user_id, conversation.id, f"q{i:02d} " * 200)
             await repo.add_assistant_message(
                 conversation.user_id,
@@ -501,15 +510,20 @@ async def test_long_conversation_is_summarized_after_the_answer_and_fits_the_bud
                 tokens_out=None,
                 llm_call_ids=(),
             )
+
+
+async def test_long_conversation_is_summarized_after_the_answer_and_fits_the_budget(
+    live: Live,
+) -> None:
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    await fill_conversation(conversation_id)
     live.backup.script(success("SUMMARY: oily roots, washes daily."))  # the chain's last link
 
     events = await send(live, headers, conversation_id, "And what about dry ends?")
     assert events[-1].event == "done"
-    for _ in range(200):  # the background task runs after the stream has ended
-        summary, upto = await summary_of(conversation_id)
-        if summary is not None:
-            break
-        await asyncio.sleep(0.02)
+    await live.jobs.join()  # the summary job runs after the stream has ended
+    summary, upto = await summary_of(conversation_id)
     assert summary == "SUMMARY: oily roots, washes daily."
     folded = await stored(conversation_id)
     upto_index = next(i for i, m in enumerate(folded) if m.id == upto)
@@ -570,12 +584,9 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
     events = await send(live, headers, conversation_id, question)
     assert events[-1].event == "done"
     answer_id = uuid.UUID(str(events[-1].data["message_id"]))
-    for _ in range(200):  # the background task runs after the stream has ended
-        async with get_sessionmaker()() as session:
-            row = await session.get(MessageEmbedding, answer_id)
-        if row is not None:
-            break
-        await asyncio.sleep(0.02)
+    await live.jobs.join()  # the index job runs after the stream has ended
+    async with get_sessionmaker()() as session:
+        row = await session.get(MessageEmbedding, answer_id)
     assert row is not None and row.embedding_model == "fake-embedding"
 
     # FakeEmbedder vectors are random per text: the exact pair text is the only close query.
@@ -592,3 +603,67 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
     stranger = await consented_user(live)
     other = await live.client.get("/conversations/search", params={"q": pair}, headers=stranger)
     assert other.json()["items"] == []
+
+
+class BlockingIndexer:
+    """Stands in for AnswerIndexer: blocks on `release` until the test sets it."""
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.indexed: list[str] = []
+
+    async def run(self, answer: PendingAnswer) -> None:
+        self.started.set()
+        await self.release.wait()
+        self.indexed.append(answer.answer)
+
+
+class BlockingSummarizer:
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.started = asyncio.Event()
+        self.runs = 0
+
+    async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
+        self.started.set()
+        await self.release.wait()
+        self.runs += 1
+
+
+async def test_indexing_does_not_hold_the_conversation_for_the_next_message(live: Live) -> None:
+    indexer = BlockingIndexer()
+    live.app.dependency_overrides[get_answer_indexer] = lambda: indexer
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.primary.script(success("a0"), success("a1"))
+
+    first = await send(live, headers, conversation_id, "q0")
+    await indexer.started.wait()  # the index of a0 is running and will not end by itself
+    second = await send(live, headers, conversation_id, "q1")  # asserts 200
+
+    assert [first[-1].event, second[-1].event] == ["done", "done"]
+    assert indexer.indexed == []
+    indexer.release.set()
+    await live.jobs.join()
+    assert indexer.indexed == ["a0", "a1"]
+
+
+async def test_summarizing_does_not_hold_the_conversation_for_the_next_message(
+    live: Live,
+) -> None:
+    summarizer = BlockingSummarizer()
+    live.app.dependency_overrides[get_summarizer] = lambda: summarizer
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    await fill_conversation(conversation_id)  # over the budget: the answer is due a summary
+
+    first = await send(live, headers, conversation_id, "And what about dry ends?")
+    await summarizer.started.wait()  # running and will not end by itself
+    second = await send(live, headers, conversation_id, "Thanks!")  # asserts 200
+
+    assert [first[-1].event, second[-1].event] == ["done", "done"]
+    assert summarizer.runs == 0
+    summarizer.release.set()
+    await live.jobs.join()
+    assert summarizer.runs == 2

@@ -149,7 +149,7 @@ class Reply:
         # summarizer once the answer is delivered (never when the reply failed).
         self.summary_due = False
         # Set with ChatDone: the saved answer and its question, for the conversation index
-        # (app.rag.conversation_index.AnswerIndexer, a background task after the stream).
+        # (app.rag.conversation_index.AnswerIndexer, a background job after the stream).
         self.saved_answer: PendingAnswer | None = None
 
     def events(self) -> AsyncIterator[ChatEvent]:

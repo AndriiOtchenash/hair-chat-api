@@ -124,7 +124,7 @@ def get_answer_indexer(
     """None without an embedder (dev): answers are left for app.cli.index_conversations."""
     if embedder is None:
         return None
-    # Its own sessions: it runs as a background task, after the request session is closed.
+    # Its own sessions: it runs as a background job, after the request session is closed.
     return AnswerIndexer(
         sql_message_embedding_repositories(get_sessionmaker()),
         embedder,
@@ -197,7 +197,7 @@ Budget = Annotated[int, Depends(get_context_budget)]
 
 
 def get_summarizer(llm: LLM, budget: Budget) -> SummaryRunner:
-    # Its own sessions: it runs as a background task, after the request session is closed.
+    # Its own sessions: it runs as a background job, after the request session is closed.
     return Summarizer(
         sql_conversation_repositories(get_sessionmaker()),
         llm.providers[-1],  # the cheapest link of the chain

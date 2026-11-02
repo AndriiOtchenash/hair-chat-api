@@ -4,10 +4,11 @@ from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
+from app.core.background import BackgroundJobs, get_background_jobs
 from app.core.chat import (
     get_answer_indexer,
     get_chat_service,
@@ -265,24 +266,27 @@ def _sse(event: ChatEvent) -> ServerSentEvent:
 )
 async def send_message(
     reply: Annotated[Reply, Depends(start_reply)],
-    background: BackgroundTasks,
     summarizer: Annotated[SummaryRunner, Depends(get_summarizer)],
     indexer: Annotated[AnswerIndexer | None, Depends(get_answer_indexer)],
+    jobs: Annotated[BackgroundJobs, Depends(get_background_jobs)],
 ) -> AsyncIterable[ServerSentEvent]:
     """Streams the answer: safety_notice? token* (restart token*)* then done, or error.
 
     See the SSE contract in CLAUDE.md.
 
     FastAPI adds a `: ping` comment every 15 s while idle and the no-buffering headers.
-    Background tasks run after the stream ends, and not at all if the client disconnects.
+    Follow-up work is spawned once the stream has ended (not at all if the client disconnects).
+    Not as BackgroundTasks: those run before the generation slot is freed (app.core.background),
+    so the user's next message would be 409 until they end. Neither needs the slot: each has
+    its own session, and the summarizer saves by compare-and-set (save_summary).
     """
     async for event in reply.events():
         yield _sse(event)
     if reply.saved_answer is not None and indexer is not None:
-        # Own session, after the stream; a failure only leaves it for the backfill CLI.
-        background.add_task(indexer.run, reply.saved_answer)
+        # A failure only leaves the answer for the backfill CLI.
+        jobs.spawn(indexer.run(reply.saved_answer))
     if reply.summary_due:
-        background.add_task(summarizer.run, reply.user_id, reply.conversation_id)
+        jobs.spawn(summarizer.run(reply.user_id, reply.conversation_id))
 
 
 @manage_router.patch(

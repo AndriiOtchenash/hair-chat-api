@@ -35,7 +35,10 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   codespace has write access to it) and has its own CLAUDE.md. Forwarded ports: 8000 API, 5173 web.
 - Never call China-hosted APIs (DeepSeek, Zhipu, Moonshot, Qwen Singapore) with real user data.
 - Auth: Auth0 JWT validated via JWKS; roles stored in our DB (user / specialist / admin)
-- Background work: FastAPI BackgroundTasks only (no Celery/Redis)
+- Background work: in-process only (no Celery/Redis). After a chat answer (summarizer, conversation
+  index) use `app.core.background.BackgroundJobs.spawn`, never FastAPI BackgroundTasks: those run
+  before yield-dependencies exit, i.e. while `start_reply` holds the generation slot, so the next
+  message would be 409 until they end. Tests wait with `await live.jobs.join()`, no polling.
 - Tests: pytest, pytest-asyncio, testcontainers (pgvector/pgvector image)
 - Lint/types: ruff (lint + format), mypy --strict on app/
 
@@ -96,7 +99,7 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
 - Budget = min(CONTEXT_BUDGET_TOKENS (6000), chain window - CHAT_MAX_ANSWER_TOKENS), estimated by
   `app.services.tokens` (len/3.5 + 15%, no provider tokenizers).
 - Messages that do not fit are folded into `conversations.summary` after the answer (background
-  task; inline in the CLI) by the chain's last link; best effort, never breaks the chat.
+  job; inline in the CLI) by the chain's last link; best effort, never breaks the chat.
 - Prompts are versioned files in app/services/prompts/ (`system_v1.md`): change = new `_vN` file +
   `PROMPT_VERSION`, never edit a shipped one. The system prompt is read through `PromptProvider`
   (FilePromptProvider now; DbPromptProvider with admin-edited versions in 2.7).
@@ -162,9 +165,9 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   the rest): the question is kept, the answer is cut. Skipped: no question before the answer,
   question moderation `action == "block"` (never saved today, a guard only). Soft questions are
   indexed.
-- Chat hook: after `done`, `send_message` adds `AnswerIndexer.run(reply.saved_answer)` as a
-  BackgroundTask (after the stream, own session via `sql_message_embedding_repositories`, chat
-  embedder: EMBEDDING_TIMEOUT_S, no retries). Failure = WARNING with message id + code, never
+- Chat hook: after `done`, `send_message` spawns `AnswerIndexer.run(reply.saved_answer)` on
+  `app.core.background.BackgroundJobs` (see "Background work" above). Own session via
+  `sql_message_embedding_repositories`, chat embedder (EMBEDDING_TIMEOUT_S, no retries). Failure = WARNING with message id + code, never
   raised; no embedder (dev) or a client disconnect = not indexed. The backfill picks those up.
 - `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row or a
   row of another model, keyset batches of 100 (one embeddings call + one transaction each),

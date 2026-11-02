@@ -8,7 +8,7 @@ blocked. ChatService never saves a blocked message (ADR 0004), so the second rul
 against a future change. Soft (self-harm) questions are indexed: they are the user's own data,
 answered and shown in the history like any other.
 Two writers: the backfill (`index_conversations`, app.cli.index_conversations) and the chat
-(`AnswerIndexer`, a background task after each saved answer). The chat's one is best effort: a
+(`AnswerIndexer`, a background job after each saved answer). The chat's one is best effort: a
 failure leaves the answer for the backfill. Logs carry counts, ids and codes, never text (rule 6).
 """
 
@@ -127,7 +127,7 @@ async def index_conversations(
 
 
 class AnswerIndexer:
-    """Indexes one answer right after the chat saved it (a FastAPI background task).
+    """Indexes one answer right after the chat saved it (app.core.background job).
 
     The chat's embedder (EMBEDDING_TIMEOUT_S, no retries) and its own DB session, not the
     request's. Never raises: a failure is a WARNING with a safe code and the answer stays
