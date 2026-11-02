@@ -95,7 +95,11 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   [--link provider:model]` (one chain link, no fallback) over
   tests/prompt_eval/cases.yaml (`expect` for the reader, `avoid` substrings flagged `!!`,
   `kb_used: true|false` flags a tag that is missing / unexpected; `??` when a kb case got no
-  passages, `kb_context:` shows them or the embeddings error).
+  passages, `kb_context:` shows them or the embeddings error). Cases may carry `history`,
+  `summary` (conversations.summary) and `kb_slugs` (articles the search must find, `!!` if not).
+  `--retrieval-only --query last|user3|summary|chat ...` = embeddings only, no LLM: kb_context
+  per search-query variant (`chat`, the default = what the chat does). Eval vectors are cached
+  in .cache/embeddings.json (git-ignored, key = sha256 of model+dimensions+text).
 - The answer never mentions articles / the knowledge base: the client shows `done.sources`.
 
 ## Knowledge base / RAG (ADR 0005)
@@ -108,7 +112,10 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   the search filters on `embedding_model`. No fallback: embeddings down (or > EMBEDDING_TIMEOUT_S)
   -> answer without `<knowledge>` + warning. The query is embedded in parallel with moderation.
 - Search: top KB_TOP_K (4) by cosine distance, then KB_MIN_SIMILARITY (0.60), packed into
-  KB_MAX_TOKENS (1500). Prod: reviewed only (prod refuses KB_INCLUDE_DRAFTS=true); dev: drafts too.
+  KB_MAX_TOKENS (1500). Two searches from the second message on (one embeddings call): the
+  latest message, and `dialog_query` = summary tail (<= 500 tokens) + latest message, else the
+  last 3 user messages; `merge_hits` keeps the latest's best 2, then the dialog's, no duplicates
+  (follow-ups keep the topic, a topic switch keeps the new one). Prod: reviewed only (prod refuses KB_INCLUDE_DRAFTS=true); dev: drafts too.
 - Passages in `<knowledge>` are numbered `[1]..[n]`; the prompt (system_v6+) makes an answer
   that relies on them end with `<kb_used ids="1,3"/>`. `app.services.kb_used.KbUsedFilter` cuts
   the tag out of the stream (holds back a tail that may start it; never sent, never saved).

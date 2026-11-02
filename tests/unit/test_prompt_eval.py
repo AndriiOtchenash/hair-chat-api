@@ -11,7 +11,17 @@ from app.services.prompts import PROMPT_VERSION, FilePromptProvider
 from scripts import prompt_eval
 from tests.llm_fakes import FakeLLMCallRecorder, FakeLLMProvider, fail_before_first, success
 
-GROUPS = {"manual", "off_topic", "educational", "professional", "recurring", "limits", "kb", "real"}
+GROUPS = {
+    "manual",
+    "off_topic",
+    "educational",
+    "professional",
+    "recurring",
+    "limits",
+    "kb",
+    "real",
+    "dialog",
+}
 
 
 def factory(provider: FakeLLMProvider) -> prompt_eval.LLMFactory:
@@ -172,3 +182,63 @@ def test_link_skips_every_other_link_of_the_chain() -> None:
 def test_link_and_skip_cannot_be_combined() -> None:
     with pytest.raises(SystemExit):
         prompt_eval.main(["--link", "groq:openai/gpt-oss-120b", "--skip", "gemini:x"])
+
+
+DIALOG = (
+    {"role": "user", "content": "У меня перхоть, как часто мыть?"},
+    {"role": "assistant", "content": "По мере загрязнения."},
+    {"role": "user", "content": "А если кожа сухая?"},
+    {"role": "assistant", "content": "Мягкие средства."},
+)
+
+
+def test_queries_last_user3_summary_and_chat() -> None:
+    dialog = case(history=({"role": "user", "content": "Привет"}, *DIALOG), text="А шампунь?")
+    user3 = "У меня перхоть, как часто мыть?\nА если кожа сухая?\nА шампунь?"
+
+    assert prompt_eval.QUERIES["last"](dialog) == ("А шампунь?",)
+    assert prompt_eval.QUERIES["user3"](dialog) == (user3,)
+    assert prompt_eval.QUERIES["summary"](dialog) == (user3,)
+    assert prompt_eval.QUERIES["chat"](dialog) == ("А шампунь?", user3)
+    summed = case(history=DIALOG, text="А шампунь?", summary="Кудрявые волосы.")
+    assert prompt_eval.QUERIES["summary"](summed) == ("Кудрявые волосы.\nА шампунь?",)
+    assert prompt_eval.QUERIES["chat"](summed) == ("А шампунь?", "Кудрявые волосы.\nА шампунь?")
+    assert prompt_eval.QUERIES["chat"](case()) == (case().text,)  # no history: one search
+
+
+async def test_the_summary_goes_into_the_system_message_after_knowledge() -> None:
+    prompt = await FilePromptProvider().get_active()
+    knowledge = Knowledge(
+        "[1] Перхоть › Уход\nМягкий шампунь.", (Source("Перхоть", "dandruff", None),)
+    )
+
+    chat = prompt_eval.messages(prompt, case(summary="Кудрявые волосы."), knowledge)
+
+    system = chat[0]["content"]
+    assert system.index("</knowledge>") < system.rindex("<conversation_summary>\n")
+    assert "Кудрявые волосы." in system
+
+
+def test_retrieval_report_flags_a_missing_kb_slug_per_query() -> None:
+    dialog = case(history=DIALOG, text="А шампунь?", kb_slugs=("dandruff",))
+    found = prompt_eval.KbContext(Knowledge("[1] Перхоть", (Source("Перхоть", "dandruff", None),)))
+    off_topic = prompt_eval.KbContext(
+        Knowledge("[1] Шампунь", (Source("Как выбрать шампунь", "choosing-shampoo", None),))
+    )
+    out = io.StringIO()
+
+    flagged = prompt_eval.report_retrieval(dialog, {"last": off_topic, "user3": found}, out)
+
+    assert flagged
+    text = out.getvalue()
+    assert "  user: А если кожа сухая?\n" in text
+    assert "kb_context[last]: 1 — [1] Как выбрать шампунь\n!! [last] missing dandruff\n" in text
+    assert "kb_context[user3]: 1 — [1] Перхоть\n" in text
+    assert "[user3] missing" not in text
+
+
+def test_several_queries_need_retrieval_only() -> None:
+    with pytest.raises(SystemExit):
+        prompt_eval.main(["--query", "last", "--query", "user3"])
+    with pytest.raises(SystemExit):
+        prompt_eval.main(["--retrieval-only", "--no-kb"])
