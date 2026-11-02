@@ -187,3 +187,31 @@ class KBChunk(UUIDPkMixin, TimestampMixin, Base):
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     embedding_model: Mapped[str] = mapped_column(Text)
+
+
+class MessageEmbedding(Base):
+    """Search index over the user's own conversations: one vector per answer, made of the
+    question before it and the answer (app.rag.conversation_index). Derived data: rebuilt by
+    python -m app.cli.index_conversations, never edited by hand.
+    """
+
+    __tablename__ = "message_embeddings"
+
+    # The assistant message; its row goes with it.
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    # Denormalized like messages.user_id: the search filters on it directly (rule 5). Exact
+    # search within one user, so no HNSW index on the vector.
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    # Indexed so the cascade of a conversation delete (retention, DELETE /conversations) does
+    # not scan the whole table per conversation.
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
+    embedding_model: Mapped[str] = mapped_column(Text)
+    # When this vector was made (re-embedding with another model resets it).
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
