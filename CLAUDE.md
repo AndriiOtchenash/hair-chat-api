@@ -229,6 +229,8 @@ uv run python -m app.cli.rag_report [--days 7]      # KB use of recent answers (
   - Work branches → PR into `develop`, **squash** merge.
   - Release: PR `develop` → `main`, **merge commit** (never squash), so main keeps develop's history.
   - `main` deploys to prod; `develop` will deploy to staging (later).
+  - Before every commit run `git branch --show-current`; if it is not the current task's branch,
+    do not commit: stop and report (a human shares the working folder and may switch branches).
 - One checklist item per branch/PR (items 1.1–1.12 in the plan doc).
 - Before coding: restate the item, list files to touch, list tests to add. Wait for "go" if the
   change touches DB schema, auth or the LLM layer.
