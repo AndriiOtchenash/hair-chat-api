@@ -15,13 +15,20 @@ from contextlib import ExitStack, aclosing, asynccontextmanager, contextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from app.db.models import Conversation, Message
+from app.db.models import Conversation, Message, MessageRole
 from app.db.pagination import Cursor, Page
 from app.db.repositories.conversations import ConversationRepository
 from app.llm.base import AllProvidersDown, Done, LLMRequestError, Restart, Token
 from app.llm.moderation import ModerationUnavailable, Moderator
 from app.llm.resilient import ResilientLLM
-from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, QueryEmbedding, Source
+from app.rag.retriever import (
+    DIALOG_USER_MESSAGES,
+    NoQueryEmbedder,
+    QueryEmbedder,
+    QueryEmbedding,
+    Source,
+    dialog_query,
+)
 from app.services.context_builder import Context, ContextBuilder
 from app.services.kb_used import KbUsedFilter, used_sources
 from app.services.moderation_policy import ModerationAction, decide
@@ -251,9 +258,11 @@ class ConversationService:
         await self.require(user_id, conversation_id)
         return await self.repo.list_messages_page(user_id, conversation_id, limit, cursor)
 
-    async def require(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
-        if await self.repo.get(user_id, conversation_id) is None:
+    async def require(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> Conversation:
+        conversation = await self.repo.get(user_id, conversation_id)
+        if conversation is None:
             raise ConversationNotFound()
+        return conversation
 
     async def rename(
         self, user_id: uuid.UUID, conversation_id: uuid.UUID, title: str
@@ -319,11 +328,13 @@ class ChatService:
 
         The slot is held until the block exits, i.e. until the stream ends or is cancelled.
         Moderation runs after the slot is taken, so a busy conversation costs no moderation call.
-        The question is embedded for the knowledge base at the same time as it is moderated.
+        The question (and the dialog query, app.rag.retriever.dialog_query) is embedded for the
+        knowledge base at the same time as it is moderated.
         """
-        await self.conversations.require(user_id, conversation_id)
+        conversation = await self.conversations.require(user_id, conversation_id)
         with self.locks.hold(conversation_id):
-            embedding = asyncio.create_task(self.query_embedder.embed_query(content))
+            dialog = await self._dialog_query(user_id, conversation, content)
+            embedding = asyncio.create_task(self.query_embedder.embed_query(content, dialog))
             try:
                 moderation = await self._moderate(content)
             except BaseException:
@@ -341,6 +352,23 @@ class ChatService:
                 yield reply
             finally:
                 await reply.aclose()
+
+    async def _dialog_query(
+        self, user_id: uuid.UUID, conversation: Conversation, content: str
+    ) -> str | None:
+        """Read before the new message is saved: the summary, else the user's last messages."""
+        if conversation.summary:
+            return dialog_query(content, summary=conversation.summary, earlier_user=())
+        # User and assistant turns alternate; a failed answer leaves two user turns in a row.
+        recent = await self.repo.history(
+            user_id,
+            conversation.id,
+            after=None,
+            limit=2 * (DIALOG_USER_MESSAGES - 1),
+            newest_first=True,
+        )
+        earlier = [m.content for m in reversed(recent) if m.role == MessageRole.USER]
+        return dialog_query(content, summary=None, earlier_user=earlier)
 
     async def _moderate(self, content: str) -> dict[str, Any]:
         """Raises MessageBlocked; otherwise returns what to store in messages.moderation.

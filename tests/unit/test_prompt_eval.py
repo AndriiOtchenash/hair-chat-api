@@ -192,16 +192,18 @@ DIALOG = (
 )
 
 
-def test_queries_last_user3_and_summary() -> None:
+def test_queries_last_user3_summary_and_chat() -> None:
     dialog = case(history=({"role": "user", "content": "Привет"}, *DIALOG), text="А шампунь?")
+    user3 = "У меня перхоть, как часто мыть?\nА если кожа сухая?\nА шампунь?"
 
-    assert prompt_eval.QUERIES["last"](dialog) == "А шампунь?"
-    assert prompt_eval.QUERIES["user3"](dialog) == (
-        "У меня перхоть, как часто мыть?\nА если кожа сухая?\nА шампунь?"
-    )
-    assert prompt_eval.QUERIES["summary"](dialog) == prompt_eval.QUERIES["user3"](dialog)
+    assert prompt_eval.QUERIES["last"](dialog) == ("А шампунь?",)
+    assert prompt_eval.QUERIES["user3"](dialog) == (user3,)
+    assert prompt_eval.QUERIES["summary"](dialog) == (user3,)
+    assert prompt_eval.QUERIES["chat"](dialog) == ("А шампунь?", user3)
     summed = case(history=DIALOG, text="А шампунь?", summary="Кудрявые волосы.")
-    assert prompt_eval.QUERIES["summary"](summed) == "Кудрявые волосы.\nА шампунь?"
+    assert prompt_eval.QUERIES["summary"](summed) == ("Кудрявые волосы.\nА шампунь?",)
+    assert prompt_eval.QUERIES["chat"](summed) == ("А шампунь?", "Кудрявые волосы.\nА шампунь?")
+    assert prompt_eval.QUERIES["chat"](case()) == (case().text,)  # no history: one search
 
 
 async def test_the_summary_goes_into_the_system_message_after_knowledge() -> None:

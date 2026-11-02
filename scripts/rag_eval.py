@@ -10,10 +10,15 @@ RagKnowledge (top-k, threshold, token budget) the chat uses.
 hit@4: the expected article is among the sources that reach the context. False find: an off-topic
 question (expected: null) gets any source. Exit code 1 only on a new miss (no `known_gap`).
 A sweep over thresholds helps to pick KB_MIN_SIMILARITY: the highest hit@4 with no false finds.
+Vectors are cached in .cache/embeddings.json (git-ignored) by a hash of model, dimensions and
+text, shared with scripts.prompt_eval: a rerun embeds only new or changed texts (no 429s from
+re-embedding the whole KB). Delete the file to start over.
 """
 
 import argparse
 import asyncio
+import hashlib
+import json
 import math
 import sys
 import uuid
@@ -28,12 +33,13 @@ from app.core.config import get_settings
 from app.db.repositories.kb import KBHit
 from app.rag.chunker import chunk_markdown
 from app.rag.documents import load_articles
-from app.rag.embeddings import OpenAICompatibleEmbedder
+from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
 from app.rag.retriever import QueryEmbedding, RagKnowledge
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FILE = ROOT / "tests/rag_eval/queries.yaml"
 DEFAULT_KB = ROOT / "docs/kb"
+CACHE_FILE = ROOT / ".cache/embeddings.json"
 SWEEP = [round(0.50 + 0.05 * i, 2) for i in range(7)]  # 0.50 .. 0.80
 TEXT_WIDTH = 60
 EVAL_USER = uuid.UUID(int=0)
@@ -93,7 +99,34 @@ def load(path: Path) -> list[Query]:
     return [Query(r["lang"], r["expected"], r["text"], r.get("known_gap")) for r in rows]
 
 
-async def embed_all(kb_dir: Path, queries: Sequence[str]) -> tuple[MemoryKB, list[QueryEmbedding]]:
+class EmbeddingCache:
+    """Vectors by sha256 of model, dimensions and text, in one JSON file."""
+
+    def __init__(self, path: Path, model: str, dimensions: int) -> None:
+        self._path = path
+        self._prefix = f"{model}\0{dimensions}\0"
+        try:
+            self._vectors: dict[str, list[float]] = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, ValueError):
+            self._vectors = {}
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha256((self._prefix + text).encode()).hexdigest()
+
+    async def embed(self, embedder: Embedder, texts: Sequence[str]) -> list[list[float]]:
+        """Only the texts not in the cache go to `embedder`, in one call; the file is saved."""
+        missing = [t for t in dict.fromkeys(texts) if self._key(t) not in self._vectors]
+        if missing:
+            vectors = await embedder.embed(missing)
+            self._vectors.update((self._key(t), v) for t, v in zip(missing, vectors, strict=True))
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._vectors), encoding="utf-8")
+        return [self._vectors[self._key(t)] for t in texts]
+
+
+async def embed_all(
+    kb_dir: Path, queries: Sequence[str], cache_file: Path = CACHE_FILE
+) -> tuple[MemoryKB, list[QueryEmbedding]]:
     """The KB chunks and the query texts, embedded with the real model (shared with prompt_eval)."""
     settings = get_settings()
     if settings.gemini_api_key is None:
@@ -105,14 +138,16 @@ async def embed_all(kb_dir: Path, queries: Sequence[str]) -> tuple[MemoryKB, lis
         timeout=30,
         max_retries=3,
     )
+    cache = EmbeddingCache(cache_file, embedder.model, settings.embedding_dimensions)
     try:
         chunks = [
             (article, chunk)
             for article in load_articles(kb_dir)
             for chunk in chunk_markdown(article.meta.title, article.body)
         ]
-        chunk_vectors = await embedder.embed([c.text for _, c in chunks])
-        query_vectors = await embedder.embed(list(queries))
+        texts = [c.text for _, c in chunks]
+        vectors = await cache.embed(embedder, [*texts, *queries])
+        chunk_vectors, query_vectors = vectors[: len(texts)], vectors[len(texts) :]
     finally:
         await embedder.aclose()
     rows = [

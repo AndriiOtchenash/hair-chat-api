@@ -698,3 +698,23 @@ async def test_blocked_message_cancels_its_embedding() -> None:
 
     assert embedder.cancelled
     assert world.repo.of(conversation_id) == []
+
+
+async def test_the_dialog_query_is_the_users_last_messages_or_the_summary() -> None:
+    embedder = FakeEmbedder()
+    world = rag_world(embedder)
+    world.providers[0].script(success("Ответ 1."), success("Ответ 2."), success("Ответ 3."))
+    conversation_id = await world.conversation()
+
+    await world.send(conversation_id, "У меня перхоть")
+    await world.send(conversation_id, "А шампунь?")
+    world.repo.conversations[conversation_id].summary = "Перхоть, сухая кожа."
+    await world.send(conversation_id, "А маски?")
+
+    assert embedder.embedded == [
+        "У меня перхоть",  # the first message: nothing before it, one search
+        "А шампунь?",
+        "У меня перхоть\nА шампунь?",
+        "А маски?",
+        "Перхоть, сухая кожа.\nА маски?",
+    ]

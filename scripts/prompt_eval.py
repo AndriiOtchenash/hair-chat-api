@@ -17,7 +17,8 @@ from the docs/kb articles (embedded in memory by the same loader, chunker and Ra
 scripts.rag_eval) followed by the prompt's knowledge reminder, then the case's history and the
 question (a case's `summary` goes into <conversation_summary> like conversations.summary).
 --no-kb skips the embeddings API. --link runs one link of LLM_CHAIN, no fallback.
---query picks the text embedded for the search (QUERIES; `last` is what the chat does today).
+--query picks what is embedded for the search (QUERIES; `chat`, the default, is what the chat
+does: the latest message merged with the dialog query of app.rag.retriever).
 --retrieval-only calls no LLM: it prints kb_context per --query (several may be given) and
 `!!` when a passage of an article in the case's `kb_slugs` is missing.
 No database: llm_calls are not recorded. Exit code 1 only if the chain fails on a case.
@@ -48,7 +49,7 @@ from app.llm.base import (
 )
 from app.llm.registry import build_llm, parse_chain
 from app.llm.resilient import ResilientLLM
-from app.rag.retriever import Knowledge, QueryEmbedding, RagKnowledge
+from app.rag.retriever import Knowledge, QueryEmbedding, RagKnowledge, dialog_query
 from app.services.context_builder import (
     KNOWLEDGE_NOTE,
     SUMMARY_NOTE,
@@ -84,16 +85,18 @@ class Case:
     kb_slugs: tuple[str, ...] = ()
 
 
-def _user_turns(case: Case, n: int) -> str:
-    texts = [t["content"] for t in case.history if t["role"] == "user"] + [case.text]
-    return "\n".join(texts[-n:])
+def _dialog(case: Case, *, summary: bool = True) -> str | None:
+    earlier = [t["content"] for t in case.history if t["role"] == "user"]
+    return dialog_query(case.text, summary=case.summary if summary else None, earlier_user=earlier)
 
 
-# The text embedded for the knowledge search, by --query name.
-QUERIES: dict[str, Callable[[Case], str]] = {
-    "last": lambda c: c.text,  # the chat today: the latest user message only
-    "user3": lambda c: _user_turns(c, 3),  # the last 3 user messages
-    "summary": lambda c: f"{c.summary}\n{c.text}" if c.summary else _user_turns(c, 3),
+# The texts embedded for the knowledge search, by --query name: one = a single search; two = the
+# latest message merged with the dialog query (QueryEmbedding.context_vector, merge_hits).
+QUERIES: dict[str, Callable[[Case], tuple[str, ...]]] = {
+    "last": lambda c: (c.text,),  # the latest user message only (the chat before dialog search)
+    "user3": lambda c: (_dialog(c, summary=False) or c.text,),  # the last 3 user messages
+    "summary": lambda c: (_dialog(c) or c.text,),  # summary + latest, else user3
+    "chat": lambda c: (c.text, d) if (d := _dialog(c)) else (c.text,),  # what the chat does
 }
 
 
@@ -181,7 +184,7 @@ def messages(prompt: SystemPrompt, case: Case, knowledge: Knowledge | None) -> l
 
 
 async def knowledge_for(
-    cases: Sequence[Case], kb_dir: Path, query: str = "last"
+    cases: Sequence[Case], kb_dir: Path, query: str = "chat"
 ) -> list[KbContext]:
     """Never raises for API failures: the cases then run without passages, with the error."""
     return (await knowledge_by_query(cases, kb_dir, [query]))[query]
@@ -191,15 +194,24 @@ async def knowledge_by_query(
     cases: Sequence[Case], kb_dir: Path, queries: Sequence[str]
 ) -> dict[str, list[KbContext]]:
     """kb_context of every case for every QUERIES name; the KB is embedded once."""
-    texts = [QUERIES[q](c) for q in queries for c in cases]
+    texts = {q: [QUERIES[q](c) for c in cases] for q in queries}
+    unique = list(dict.fromkeys(t for per_case in texts.values() for ts in per_case for t in ts))
     try:
-        kb, embeddings = await embed_all(kb_dir, texts)
+        kb, embeddings = await embed_all(kb_dir, unique)
     except Exception as exc:
         failed = [KbContext(error=f"embeddings: {type(exc).__name__}: {exc}")] * len(cases)
         return {q: failed for q in queries}
-    contexts = await retrieve(kb, texts, embeddings)
-    n = len(cases)
-    return {q: contexts[i * n : (i + 1) * n] for i, q in enumerate(queries)}
+    by_text = dict(zip(unique, embeddings, strict=True))
+
+    def query(ts: tuple[str, ...]) -> QueryEmbedding:
+        first = by_text[ts[0]]
+        context = by_text[ts[1]].vector if len(ts) > 1 else None
+        return QueryEmbedding(first.vector, first.model, context)
+
+    return {
+        q: await retrieve(kb, [c.text for c in cases], [query(ts) for ts in texts[q]])
+        for q in queries
+    }
 
 
 async def retrieve(
@@ -340,7 +352,7 @@ async def run(
     prompt_version: str,
     kb_dir: Path | None,
     skip: Sequence[str],
-    query: str = "last",
+    query: str = "chat",
     llm_factory: LLMFactory = _real_llm,
     out: TextIO = sys.stdout,
 ) -> int:
@@ -389,7 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         "--query",
         action="append",
         choices=sorted(QUERIES),
-        help="text embedded for the search (default last); several only with --retrieval-only",
+        help="what is embedded for the search (default chat); several only with --retrieval-only",
     )
     parser.add_argument(
         "--retrieval-only", action="store_true", help="kb_context per --query, no LLM calls"
@@ -400,7 +412,7 @@ def main(argv: list[str] | None = None) -> int:
         "--link", metavar="PROVIDER:MODEL", help="only this link of LLM_CHAIN, no fallback"
     )
     args = parser.parse_args(argv)
-    queries: list[str] = args.query or ["last"]
+    queries: list[str] = args.query or ["chat"]
     if args.retrieval_only and args.no_kb:
         parser.error("--retrieval-only needs the knowledge base, not --no-kb")
     if len(queries) > 1 and not args.retrieval_only:

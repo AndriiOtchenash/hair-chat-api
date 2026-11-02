@@ -7,7 +7,15 @@ import pytest
 
 from app.db.repositories.kb import KBHit
 from app.rag.embeddings import EmbeddingUnavailable
-from app.rag.retriever import QueryEmbedding, RagKnowledge, RagQueryEmbedder, Source
+from app.rag.retriever import (
+    SUMMARY_QUERY_MAX_TOKENS,
+    QueryEmbedding,
+    RagKnowledge,
+    RagQueryEmbedder,
+    Source,
+    dialog_query,
+    merge_hits,
+)
 from app.services.tokens import estimate_tokens
 from tests.llm_fakes import FakeEmbedder
 
@@ -172,3 +180,93 @@ async def test_passages_are_numbered_for_the_kb_used_tag_one_source_each() -> No
     assert "\n\n[2] choosing-shampoo › section\n" in result.text
     assert "\n\n[3] dandruff › other\n" in result.text
     assert [s.slug for s in result.passages] == ["dandruff", "choosing-shampoo", "dandruff"]
+
+
+# --- dialog search: the latest message merged with the dialog query ---
+
+
+class TwoQueryKB:
+    """KBRepository answering the latest message's vector and the dialog vector differently."""
+
+    def __init__(self, latest: list[KBHit], dialog: list[KBHit]) -> None:
+        self.by_vector = {(1.0, 0.0): latest, (0.0, 1.0): dialog}
+        self.searches = 0
+
+    async def search(
+        self, vector: Sequence[float], *, model: str, include_drafts: bool, limit: int
+    ) -> list[KBHit]:
+        self.searches += 1
+        return self.by_vector[tuple(vector)][:limit]
+
+
+DIALOG_QUERY = QueryEmbedding([1.0, 0.0], "fake-embedding", context_vector=[0.0, 1.0])
+
+
+def test_dialog_query_is_the_summary_and_the_latest_message() -> None:
+    query = dialog_query("А феном?", summary="Кудрявые волосы.", earlier_user=["Спасибо"])
+
+    assert query == "Кудрявые волосы.\nА феном?"
+
+
+def test_dialog_query_keeps_the_tail_of_a_long_summary() -> None:
+    summary = " ".join(f"слово{i}" for i in range(2000))
+
+    query = dialog_query("А феном?", summary=summary, earlier_user=())
+
+    assert query is not None and query.endswith("слово1999\nА феном?")
+    head = query.removesuffix("\nА феном?")
+    assert estimate_tokens(head) <= SUMMARY_QUERY_MAX_TOKENS
+    assert head.startswith("слово")  # cut at a word start
+    assert "слово0 " not in head
+
+
+def test_dialog_query_without_a_summary_is_the_last_three_user_messages() -> None:
+    earlier = ["Привет", "У меня перхоть", "  ", "А если кожа сухая?"]
+
+    query = dialog_query("А шампунь?", summary=None, earlier_user=earlier)
+
+    assert query == "У меня перхоть\nА если кожа сухая?\nА шампунь?"
+
+
+def test_no_dialog_query_on_the_first_message() -> None:
+    assert dialog_query("Привет", summary=None, earlier_user=()) is None
+    assert dialog_query("Привет", summary="  ", earlier_user=()) is None
+
+
+def test_merge_keeps_the_two_best_of_the_latest_then_the_dialog_without_duplicates() -> None:
+    latest = [hit("bleach", 0.8), hit("burn", 0.75), hit("bleach-2", 0.7)]
+    dialog = [hit("burn", 0.7), hit("dandruff", 0.69), hit("washing", 0.65), hit("shampoo", 0.6)]
+
+    merged = merge_hits(latest, dialog, 4)
+
+    assert [h.slug for h in merged] == ["bleach", "burn", "dandruff", "washing"]
+
+
+def test_merge_fills_from_the_latest_when_the_dialog_has_few_hits() -> None:
+    latest = [hit("a", 0.9), hit("b", 0.8), hit("c", 0.7)]
+
+    assert [h.slug for h in merge_hits(latest, [hit("d", 0.7)], 4)] == ["a", "b", "d", "c"]
+    assert [h.slug for h in merge_hits([], [hit("d", 0.7)], 4)] == ["d"]
+
+
+async def test_a_dialog_vector_adds_a_second_search_merged_with_the_first() -> None:
+    kb = TwoQueryKB(
+        latest=[hit("choosing-shampoo", 0.8), hit("washing", 0.7), hit("scalp", 0.65)],
+        dialog=[hit("dandruff", 0.85), hit("off-topic", 0.5)],
+    )
+
+    result = await knowledge(kb).knowledge(USER, "А шампунь?", DIALOG_QUERY)
+
+    assert kb.searches == 2
+    assert result is not None
+    # The dialog's hits below the threshold are left out like the latest's.
+    assert [s.slug for s in result.passages] == ["choosing-shampoo", "washing", "dandruff", "scalp"]
+
+
+async def test_query_embedder_embeds_the_dialog_query_in_the_same_call() -> None:
+    embedder = FakeEmbedder(vectors={"А шампунь?": [1.0, 0.0], "Перхоть\nА шампунь?": [0.0, 1.0]})
+
+    query = await RagQueryEmbedder(embedder).embed_query("А шампунь?", "Перхоть\nА шампунь?")
+
+    assert query == DIALOG_QUERY
+    assert embedder.calls == 1
