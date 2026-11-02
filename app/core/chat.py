@@ -22,8 +22,9 @@ from app.db.session import get_session, get_sessionmaker
 from app.llm.moderation import Moderator, NoopModerator, OpenAIModerator
 from app.llm.registry import build_llm, build_providers
 from app.llm.resilient import ResilientLLM
-from app.rag.conversation_index import AnswerIndexer
+from app.rag.conversation_index import ConversationIndexer
 from app.rag.embeddings import Embedder, OpenAICompatibleEmbedder
+from app.rag.ingest import INGEST_TIMEOUT_S
 from app.rag.retriever import NoQueryEmbedder, QueryEmbedder, RagKnowledge, RagQueryEmbedder
 from app.services.chat_service import ChatService, ConversationLocks, ConversationService
 from app.services.context_builder import TokenBudgetContextBuilder
@@ -73,15 +74,16 @@ def get_moderator() -> Moderator:
     return build_moderator(get_settings())
 
 
-def build_embedder(settings: Settings) -> Embedder | None:
-    """None without GEMINI_API_KEY: replies go without the knowledge base."""
+def build_embedder(settings: Settings, timeout: float | None = None) -> Embedder | None:
+    """None without GEMINI_API_KEY: replies go without the knowledge base. `timeout` per
+    request, default EMBEDDING_TIMEOUT_S; never retries."""
     if settings.gemini_api_key is None:
         return None
     return OpenAICompatibleEmbedder(
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
         api_key=settings.gemini_api_key.get_secret_value(),
-        timeout=settings.embedding_timeout_s,
+        timeout=settings.embedding_timeout_s if timeout is None else timeout,
     )
 
 
@@ -120,16 +122,43 @@ def get_query_embedder(
 def get_answer_indexer(
     embedder: Annotated[Embedder | None, Depends(get_embedder)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> AnswerIndexer | None:
-    """None without an embedder (dev): answers are left for app.cli.index_conversations."""
+) -> ConversationIndexer | None:
+    """After a chat answer: the chat's embedder, the whole run within EMBEDDING_TIMEOUT_S.
+    None without an embedder (dev): answers are left for app.cli.index_conversations."""
     if embedder is None:
         return None
     # Its own sessions: it runs as a background job, after the request session is closed.
-    return AnswerIndexer(
-        sql_message_embedding_repositories(get_sessionmaker()),
+    return ConversationIndexer(
+        sql_message_embedding_repositories(
+            get_sessionmaker(), consent_version=settings.consent_version
+        ),
         embedder,
         max_chars=settings.conversation_index_max_chars,
         timeout=settings.embedding_timeout_s,
+    )
+
+
+@lru_cache
+def get_reindex_embedder() -> Embedder | None:
+    """For re-embedding a whole conversation (a rename): up to 100 long pairs per request, so
+    the ingest's per-request timeout instead of the chat's, still without retries."""
+    return build_embedder(get_settings(), timeout=INGEST_TIMEOUT_S)
+
+
+def get_rename_indexer(
+    embedder: Annotated[Embedder | None, Depends(get_reindex_embedder)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> ConversationIndexer | None:
+    """After a rename (the title is in every vector). None without an embedder (dev)."""
+    if embedder is None:
+        return None
+    return ConversationIndexer(
+        sql_message_embedding_repositories(
+            get_sessionmaker(), consent_version=settings.consent_version
+        ),
+        embedder,
+        max_chars=settings.conversation_index_max_chars,
+        timeout=None,
     )
 
 
@@ -142,6 +171,7 @@ def get_conversation_search(
         SqlConversationSearchRepository(session),
         embedder,
         max_distance=settings.conversation_search_max_distance,
+        max_gap=settings.conversation_search_max_gap,
         timeout=settings.embedding_timeout_s,
     )
 

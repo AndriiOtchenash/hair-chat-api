@@ -41,16 +41,13 @@ from app.db.repositories.conversation_search import SqlConversationSearchReposit
 from app.db.repositories.conversations import SqlConversationRepository
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
-from app.db.repositories.message_embeddings import (
-    PendingAnswer,
-    sql_message_embedding_repositories,
-)
+from app.db.repositories.message_embeddings import sql_message_embedding_repositories
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
 from app.main import create_app
 from app.rag.chunker import Chunk
-from app.rag.conversation_index import AnswerIndexer
+from app.rag.conversation_index import ConversationIndexer, index_text, query_text
 from app.rag.documents import parse_article
 from app.rag.retriever import RagQueryEmbedder
 from app.services.chat_service import ConversationLocks
@@ -81,6 +78,8 @@ class Live:
     app: FastAPI
     # Follow-up work (index, summary) after a stream: `await live.jobs.join()` to wait for it.
     jobs: BackgroundJobs
+    # Shared by the conversation index and its search: set `vectors` to make texts close.
+    embedder: FakeEmbedder
     primary: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("gemini", "flash"))
     backup: FakeLLMProvider = field(default_factory=lambda: FakeLLMProvider("groq", "oss"))
 
@@ -102,9 +101,12 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
     app.dependency_overrides[get_query_embedder] = lambda: query_embedder
     jobs = BackgroundJobs()
     app.dependency_overrides[get_background_jobs] = lambda: jobs
-    indexer = AnswerIndexer(
-        sql_message_embedding_repositories(get_sessionmaker()),
-        FakeEmbedder(),
+    embedder = FakeEmbedder()
+    indexer = ConversationIndexer(
+        sql_message_embedding_repositories(
+            get_sessionmaker(), consent_version=get_settings().consent_version
+        ),
+        embedder,
         max_chars=16000,
         timeout=2,
     )
@@ -114,8 +116,9 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         async with get_sessionmaker()() as session:
             yield ConversationSearch(
                 SqlConversationSearchRepository(session),
-                FakeEmbedder(),
+                embedder,
                 max_distance=0.4,
+                max_gap=0.05,
                 timeout=2,
             )
 
@@ -133,7 +136,7 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
         pytest.fail("uvicorn did not start")
     port = server.servers[0].sockets[0].getsockname()[1]
     async with AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10) as client:
-        yield Live(client, locks, moderator, app, jobs, *providers)
+        yield Live(client, locks, moderator, app, jobs, embedder, *providers)
     server.should_exit = True
     await task
     await jobs.aclose()  # before app_settings_env disposes the engine
@@ -577,6 +580,11 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
     live: Live,
 ) -> None:
     question = f"Как часто мыть жирные корни? {uuid.uuid4()}"
+    # The first message titles the conversation; that title is in the indexed text.
+    document = index_text(question[:60], question, "Раз в два дня.", max_chars=16000)
+    live.embedder.vectors[document] = live.embedder.vectors[query_text("жирные корни")] = (
+        text_vector("жирные корни")
+    )
     headers = await consented_user(live)
     conversation_id = await new_conversation(live, headers)
     live.primary.script(success("Раз в два дня."))
@@ -589,8 +597,8 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
         row = await session.get(MessageEmbedding, answer_id)
     assert row is not None and row.embedding_model == "fake-embedding"
 
-    # FakeEmbedder vectors are random per text: the exact pair text is the only close query.
-    pair = f"Вопрос: {question}\nОтвет: Раз в два дня."
+    # FakeEmbedder vectors are random per text: only the scripted query is close to the row.
+    pair = "жирные корни"
     found = await live.client.get("/conversations/search", params={"q": pair}, headers=headers)
     assert found.status_code == 200, found.text
     body = found.json()
@@ -606,17 +614,17 @@ async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only
 
 
 class BlockingIndexer:
-    """Stands in for AnswerIndexer: blocks on `release` until the test sets it."""
+    """Stands in for ConversationIndexer: blocks on `release` until the test sets it."""
 
     def __init__(self) -> None:
         self.release = asyncio.Event()
         self.started = asyncio.Event()
-        self.indexed: list[str] = []
+        self.indexed: list[uuid.UUID] = []
 
-    async def run(self, answer: PendingAnswer) -> None:
+    async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
         self.started.set()
         await self.release.wait()
-        self.indexed.append(answer.answer)
+        self.indexed.append(conversation_id)
 
 
 class BlockingSummarizer:
@@ -646,7 +654,7 @@ async def test_indexing_does_not_hold_the_conversation_for_the_next_message(live
     assert indexer.indexed == []
     indexer.release.set()
     await live.jobs.join()
-    assert indexer.indexed == ["a0", "a1"]
+    assert indexer.indexed == [uuid.UUID(conversation_id)] * 2
 
 
 async def test_summarizing_does_not_hold_the_conversation_for_the_next_message(

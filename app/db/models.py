@@ -213,5 +213,8 @@ class MessageEmbedding(Base):
     )
     embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM))
     embedding_model: Mapped[str] = mapped_column(Text)
-    # When this vector was made (re-embedding with another model resets it).
+    # CONVERSATION_INDEX_FORMAT_VERSION of the embedded text; NULL = stale (made before the
+    # column, or the conversation was renamed since): re-embedded by the next index run.
+    index_format: Mapped[str | None] = mapped_column(Text)
+    # When this vector was made (re-embedding with another model or format resets it).
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())

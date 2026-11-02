@@ -5,14 +5,16 @@
 Compares, in memory, cosine scores of one user's indexed answers (message_embeddings) in three
 modes:
 
-    A  the stored vectors as they are, the query embedded as is (what the search does today);
-    B  the pairs re-embedded in gemini-embedding-2's document format
-       ("title: <conversation title> | text: Вопрос: ...\\nОтвет: ..."), the query in its
-       query format ("task: search result | query: ...");
+    A  the stored vectors as they are, the query in the index's query format: what the search
+       does (rows of an older format, see the version counts printed first, score lower);
+    B  the pairs re-embedded now in the index's document format (app.rag.conversation_index:
+       "title: <conversation title | none> | text: Вопрос: ...\\nОтвет: ..."), the query in
+       the query format ("task: search result | query: ..."); with an up-to-date index B = A;
     C  the user's question only in the document format, the query in the query format.
 
-Hypotheses: the model wants asymmetric prefixes (ai.google.dev/gemini-api/docs/embeddings), and
-a long boilerplate answer blurs the pair's vector. One embeddings call per mode (batches of 100).
+Format 2 of the index came out of this probe (asymmetric prefixes, ai.google.dev/gemini-api/
+docs/embeddings; C, question only, was worse than B on short queries). Three embeddings calls
+in parallel (batches of 100).
 Like the API, the best hit per conversation is shown unless --all-pairs. The output prints
 conversation titles and the queries: a dev tool for the operator's own data, not for logs.
 """
@@ -22,6 +24,7 @@ import asyncio
 import math
 import sys
 import uuid
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -32,23 +35,16 @@ from sqlalchemy.orm import aliased
 from app.core.config import get_settings
 from app.db.models import Conversation, Message, MessageEmbedding, MessageRole
 from app.db.session import get_engine, get_sessionmaker
-from app.rag.conversation_index import pair_text
+from app.rag.conversation_index import (
+    CONVERSATION_INDEX_FORMAT_VERSION,
+    document_text,
+    index_text,
+    query_text,
+)
 from app.rag.embeddings import Embedder, EmbeddingUnavailable, OpenAICompatibleEmbedder
 from app.rag.ingest import INGEST_RETRIES, INGEST_TIMEOUT_S
 
 MODES = ("A", "B", "C")
-NO_TITLE = "none"  # Google's placeholder for a document without a title
-
-
-def query_text(query: str) -> str:
-    """gemini-embedding-2 query format for search (asymmetric retrieval)."""
-    return f"task: search result | query: {query.strip()}"
-
-
-def document_text(title: str | None, content: str) -> str:
-    """gemini-embedding-2 document format; a missing or blank title becomes "none"."""
-    title = (title or "").strip() or NO_TITLE
-    return f"title: {title} | text: {content.strip()}"
 
 
 def cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -65,6 +61,7 @@ class Pair:
     question: str
     answer: str
     vector: list[float]  # stored, mode A
+    index_format: str | None = None  # of the stored vector; None = stale or format 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +121,7 @@ async def load_pairs(session: AsyncSession, user_id: uuid.UUID, model: str) -> l
             previous.c.content,
             Message.content,
             MessageEmbedding.embedding,
+            MessageEmbedding.index_format,
         )
         .join(MessageEmbedding, MessageEmbedding.message_id == Message.id)
         .join(Conversation, Conversation.id == Message.conversation_id)
@@ -136,7 +134,7 @@ async def load_pairs(session: AsyncSession, user_id: uuid.UUID, model: str) -> l
         )
         .order_by(Message.id)
     )
-    return [Pair(mid, cid, title, q, a, list(vec)) for mid, cid, title, q, a, vec in rows]
+    return [Pair(mid, cid, title, q, a, list(vec), fmt) for mid, cid, title, q, a, vec, fmt in rows]
 
 
 async def probe(
@@ -147,16 +145,12 @@ async def probe(
     max_chars: int,
     per_conversation: bool = True,
 ) -> dict[tuple[str, str], list[Hit]]:
-    """(query, mode) -> hits. Four embeddings calls in parallel: raw queries, prefixed queries,
-    B documents, C documents (each split into batches of 100 by the embedder)."""
-    raw_q, pref_q, docs_b, docs_c = await asyncio.gather(
-        embedder.embed(list(queries)),
+    """(query, mode) -> hits. Three embeddings calls in parallel: queries, B documents,
+    C documents (each split into batches of 100 by the embedder)."""
+    query_vectors, docs_b, docs_c = await asyncio.gather(
         embedder.embed([query_text(q) for q in queries]),
         embedder.embed(
-            [
-                document_text(p.title, pair_text(p.question, p.answer, max_chars=max_chars))
-                for p in pairs
-            ]
+            [index_text(p.title, p.question, p.answer, max_chars=max_chars) for p in pairs]
         ),
         embedder.embed([document_text(p.title, p.question) for p in pairs]),
     )
@@ -164,9 +158,9 @@ async def probe(
     results: dict[tuple[str, str], list[Hit]] = {}
     for i, query in enumerate(queries):
         for mode, docs, qv in (
-            ("A", stored, raw_q[i]),
-            ("B", docs_b, pref_q[i]),
-            ("C", docs_c, pref_q[i]),
+            ("A", stored, query_vectors[i]),
+            ("B", docs_b, query_vectors[i]),
+            ("C", docs_c, query_vectors[i]),
         ):
             results[(query, mode)] = rank(pairs, docs, qv, per_conversation=per_conversation)
     return results
@@ -227,7 +221,12 @@ async def run(
         await embedder.aclose()
         await get_engine().dispose()
     unit = "conversation (best pair)" if per_conversation else "pair"
-    print(f"{len(pairs)} pairs, model {settings.embedding_model}, one row per {unit}\n")
+    formats = Counter(p.index_format or "stale/1" for p in pairs)
+    versions = ", ".join(f"{fmt}: {n}" for fmt, n in sorted(formats.items()))
+    print(
+        f"{len(pairs)} pairs, model {settings.embedding_model}, stored formats {versions} "
+        f"(current {CONVERSATION_INDEX_FORMAT_VERSION}), one row per {unit}\n"
+    )
     print(render(results, queries, top=top))
     return 0
 

@@ -67,9 +67,14 @@ class FakeSearchRepository:
 
 
 def service(
-    repo: FakeSearchRepository, embedder: FakeEmbedder | None = None, timeout: float = 1.0
+    repo: FakeSearchRepository,
+    embedder: FakeEmbedder | None = None,
+    timeout: float = 1.0,
+    max_gap: float = 2.0,  # no relative cut unless a test sets one
 ) -> ConversationSearch:
-    return ConversationSearch(repo, embedder or FakeEmbedder(), max_distance=0.4, timeout=timeout)
+    return ConversationSearch(
+        repo, embedder or FakeEmbedder(), max_distance=0.4, max_gap=max_gap, timeout=timeout
+    )
 
 
 async def test_semantic_search_uses_the_threshold_model_and_user_and_scores_by_similarity() -> None:
@@ -78,7 +83,8 @@ async def test_semantic_search_uses_the_threshold_model_and_user_and_scores_by_s
 
     result = await service(repo, embedder).search(USER, "  мытьё головы  ", 5)
 
-    assert embedder.embedded == ["мытьё головы"]  # stripped
+    # stripped, in the index's query format
+    assert embedder.embedded == ["task: search result | query: мытьё головы"]
     assert repo.nearest_calls == [
         {"user_id": USER, "model": "emb-model", "max_distance": 0.4, "limit": 5}
     ]
@@ -88,6 +94,25 @@ async def test_semantic_search_uses_the_threshold_model_and_user_and_scores_by_s
         ("А маски?", 0.69, SearchMode.SEMANTIC),
     ]
     assert repo.containing_calls == []
+
+
+async def test_hits_further_than_the_gap_below_the_best_are_dropped() -> None:
+    # The staging probe's shape: one right answer at 0.70, noise 0.06 below it.
+    repo = FakeSearchRepository(
+        semantic=[row("роды", 0.30), row("почти", 0.35), row("шум", 0.36), row("шум2", 0.39)]
+    )
+
+    result = await service(repo, max_gap=0.05).search(USER, "роды")
+
+    assert [(h.snippet, h.score) for h in result.hits] == [("роды", 0.70), ("почти", 0.65)]
+
+
+async def test_a_lone_hit_is_kept_by_the_gap() -> None:
+    repo = FakeSearchRepository(semantic=[row("ногти", 0.36)])
+
+    result = await service(repo, max_gap=0.05).search(USER, "ногти")
+
+    assert [h.snippet for h in result.hits] == ["ногти"]
 
 
 async def test_nothing_within_the_threshold_is_an_empty_semantic_result() -> None:
@@ -109,7 +134,7 @@ async def test_without_embeddings_the_search_falls_back_to_text(
     embedder: FakeEmbedder | None,
 ) -> None:
     repo = FakeSearchRepository(text=[row("Про перхоть и шампунь", None)])
-    search = ConversationSearch(repo, embedder, max_distance=0.4, timeout=0.05)
+    search = ConversationSearch(repo, embedder, max_distance=0.4, max_gap=0.05, timeout=0.05)
 
     result = await search.search(USER, " перхоть ", 10)
 

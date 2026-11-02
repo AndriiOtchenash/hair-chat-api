@@ -326,7 +326,7 @@ async def test_no_summary_is_due_when_the_reply_failed() -> None:
     assert not reply.summary_due
 
 
-async def test_the_saved_answer_and_its_question_are_handed_to_the_index() -> None:
+async def test_the_saved_answer_is_handed_to_the_index() -> None:
     world = World(FakeLLMProvider("gemini", "flash").script(success("Twice ", "a week")))
     conversation_id = await world.conversation()
 
@@ -335,15 +335,8 @@ async def test_the_saved_answer_and_its_question_are_handed_to_the_index() -> No
 
     done = events[-1]
     assert isinstance(done, ChatDone)
-    saved = reply.saved_answer
-    assert saved is not None
-    assert (saved.message_id, saved.user_id, saved.conversation_id) == (
-        done.message_id,
-        USER,
-        conversation_id,
-    )
-    assert (saved.question, saved.answer) == ("How often?", "Twice a week")
-    assert saved.question_moderation == world.repo.of(conversation_id)[0].moderation
+    assert reply.saved_answer_id == done.message_id
+    assert (reply.user_id, reply.conversation_id) == (USER, conversation_id)
 
 
 async def test_nothing_is_handed_to_the_index_when_the_reply_failed() -> None:
@@ -358,7 +351,7 @@ async def test_nothing_is_handed_to_the_index_when_the_reply_failed() -> None:
         events = [event async for event in reply.events()]
 
     assert isinstance(events[-1], ChatError)
-    assert reply.saved_answer is None
+    assert reply.saved_answer_id is None
 
 
 # --- moderation (ADR 0004) ---
