@@ -194,9 +194,10 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   score = 1 - distance, best first. Embeddings down / too slow / no key -> `text`: ILIKE over
   the user's own role=user messages (% _ \ escaped), newest first, score null. Logs mode,
   count, ms; never q.
-- `uv run python -m app.cli.search_probe USER_ID "q" ... [--top N] [--all-pairs]`: read-only
-  experiment, modes A (stored vectors), B (pairs re-embedded now), C (question only), with the
-  top1-top2 gap; prints titles and queries, operator's own data only.
+- `uv run python -m app.cli.search_probe USER_ID "q" ... [--top N] [--all-pairs | --pairs]`: read-only
+  experiment, modes A (stored vectors), B (pairs re-embedded now), C (question only), D (like B,
+  title always "none"), with the top1-top2 gap; `--pairs`: each conversation's best 3 pairs
+  (question[:40] | score); prints titles and queries, operator's own data only.
 
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
