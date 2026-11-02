@@ -15,6 +15,7 @@ import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from app.db.repositories.kb import KBHit, KBRepository
@@ -39,6 +40,35 @@ class QueryEmbedding:
     model: str  # searched against kb_chunks.embedding_model (rule 4)
     # The dialog query (`dialog_query`), same model; None on the first message of a conversation.
     context_vector: Sequence[float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QueryFailed:
+    """The embeddings call failed: no knowledge base for this reply, and the model is told so.
+
+    `code` is EmbeddingUnavailable.code or "timeout": safe to log and store (no message text).
+    """
+
+    code: str
+
+
+# None = no embedder configured (dev without a key): no knowledge base, nothing failed.
+QueryResult = QueryEmbedding | QueryFailed | None
+
+
+class RetrievalStatus(StrEnum):
+    """How the knowledge-base search for a reply went; stored in messages.retrieval."""
+
+    OK = "ok"  # passages found (they may still be dropped by the token budget)
+    EMPTY = "empty"  # searched, nothing above KB_MIN_SIMILARITY
+    ERROR = "error"  # embeddings down or too slow (QueryFailed)
+    DISABLED = "disabled"  # no embedder (dev only: deployed envs require the key)
+
+
+@dataclass(frozen=True, slots=True)
+class Retrieval:
+    status: RetrievalStatus
+    error: str | None = None  # QueryFailed.code, only with ERROR
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +129,9 @@ def merge_hits(latest: Sequence[KBHit], dialog: Sequence[KBHit], limit: int) -> 
 
 
 class QueryEmbedder(Protocol):
-    async def embed_query(self, text: str, context: str | None = None) -> QueryEmbedding | None:
+    async def embed_query(self, text: str, context: str | None = None) -> QueryResult:
         """`text` is the latest message, `context` the dialog query (`dialog_query`), both in one
-        call. Never raises: None means no knowledge base for this reply."""
+        call. Never raises: QueryFailed or None means no knowledge base for this reply."""
         ...
 
 
@@ -111,8 +141,8 @@ class RagQueryEmbedder:
         # Whole call, on top of the HTTP client's per-phase timeouts: the answer waits for it.
         self._timeout = timeout
 
-    async def embed_query(self, text: str, context: str | None = None) -> QueryEmbedding | None:
-        """None when embeddings are down: the answer goes without the knowledge base (no
+    async def embed_query(self, text: str, context: str | None = None) -> QueryResult:
+        """QueryFailed when embeddings are down: the answer goes without the knowledge base (no
         fallback model, its vectors would not match the index)."""
         texts = [text] if context is None else [text, context]
         try:
@@ -121,10 +151,10 @@ class RagQueryEmbedder:
         except EmbeddingUnavailable as exc:
             log = logger.error if exc.misconfigured else logger.warning
             log("embeddings unavailable, answering without knowledge: code=%s", exc.code)
-            return None
+            return QueryFailed(exc.code)
         except TimeoutError:
             logger.warning("embeddings unavailable, answering without knowledge: code=timeout")
-            return None
+            return QueryFailed("timeout")
         context_vector = vectors[1] if context is not None else None
         return QueryEmbedding(vectors[0], self._embedder.model, context_vector)
 
@@ -132,7 +162,7 @@ class RagQueryEmbedder:
 class NoQueryEmbedder:
     """No embedding key (dev): no knowledge base."""
 
-    async def embed_query(self, text: str, context: str | None = None) -> QueryEmbedding | None:
+    async def embed_query(self, text: str, context: str | None = None) -> QueryResult:
         return None
 
 

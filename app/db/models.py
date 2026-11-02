@@ -130,6 +130,9 @@ class Message(UUIDPkMixin, TimestampMixin, Base):
     tokens_in: Mapped[int | None]
     tokens_out: Mapped[int | None]
     moderation: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Answers only: how the knowledge-base search went, see app.services.chat_service
+    # (retrieval_record). No message text in it; null for user messages and older answers.
+    retrieval: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
 
 class LLMCall(UUIDPkMixin, TimestampMixin, Base):

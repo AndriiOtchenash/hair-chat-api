@@ -110,7 +110,14 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   along markdown headings, ~50 overlap, each starts with "Title › Section".
 - Embeddings: EMBEDDING_MODEL (gemini-embedding-2, 768 = vector(768)), one model for the index;
   the search filters on `embedding_model`. No fallback: embeddings down (or > EMBEDDING_TIMEOUT_S)
-  -> answer without `<knowledge>` + warning. The query is embedded in parallel with moderation.
+  -> `QueryFailed(code)`, answer without `<knowledge>` + warning, and a `<knowledge_status>` note
+  (KB_UNAVAILABLE_SIGNAL, never cut, in DATA_TAGS) tells the model to be more cautious and
+  suggest a trichologist. The query is embedded in parallel with moderation.
+- Every saved answer stores `messages.retrieval` JSONB `{status: ok|empty|error|disabled,
+  passages, kb_used: [valid ids], error?}` (`chat_service.retrieval_record`; error = safe code
+  only, never text; null = before the column / user messages). The answering link is
+  messages.provider/model. Not in the export (operational, like tokens_in / llm_calls).
+  `uv run python -m scripts.rag_report [--days 7]`: shares per status, kb_used, per link.
 - Search: top KB_TOP_K (4) by cosine distance, then KB_MIN_SIMILARITY (0.60), packed into
   KB_MAX_TOKENS (1500). Two searches from the second message on (one embeddings call): the
   latest message, and `dialog_query` = summary tail (<= 500 tokens) + latest message, else the
@@ -201,6 +208,7 @@ uv run python -m scripts.moderation_eval            # moderation eval set, real 
 uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge base, real embeddings
 uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI
 uv run python -m scripts.prompt_eval                # prompt eval, real LLM chain, prints answers
+uv run python -m scripts.rag_report [--days 7]      # KB use of recent answers (DATABASE_URL)
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.

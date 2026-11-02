@@ -97,6 +97,7 @@ class ConversationRepository(Protocol):
         tokens_in: int | None,
         tokens_out: int | None,
         llm_call_ids: Sequence[uuid.UUID],
+        retrieval: dict[str, Any] | None = None,
     ) -> Message:
         """Saves the answer and links the llm_calls of its generation to it."""
         ...
@@ -275,6 +276,7 @@ class SqlConversationRepository:
         tokens_in: int | None,
         tokens_out: int | None,
         llm_call_ids: Sequence[uuid.UUID],
+        retrieval: dict[str, Any] | None = None,
     ) -> Message:
         message = await self._insert_message(
             user_id,
@@ -285,6 +287,7 @@ class SqlConversationRepository:
             model=model,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
+            retrieval=retrieval,
         )
         if llm_call_ids:
             # llm_calls has no user_id: the ids come from this very generation, never from input.
