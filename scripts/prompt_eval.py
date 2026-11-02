@@ -17,7 +17,10 @@ app.services.reply_language: the case's text, the last assistant turn of its his
 `locale`, default `lang` if we support it, else en, like users.locale). Every answer prints the
 detected language of the whole text and of its first sentence alone; each is flagged `!!` when it
 differs from the case's `answer_lang` (default: its `lang`), as is any text in a script none of
-our languages uses (CJK, Arabic...).
+our languages uses (CJK, Arabic...). A Polish or English answer is flagged `!!` for any Cyrillic
+letter (a Russian word picked up from the articles); a Ukrainian or Russian one gets `?? latin
+word` for a word of 3+ Latin letters outside quotes, code and parentheses (ingredient names) that
+is not in LATIN_OK: often a brand or a term, so a warning only.
 The system message is built like the chat builds it: the prompt file, then the <knowledge> block
 from the docs/kb articles (embedded in memory by the same loader, chunker and RagKnowledge as
 scripts.rag_eval) followed by the prompt's knowledge reminder, then the case's history and the
@@ -71,6 +74,7 @@ from app.services.reply_language import (
     ReplyLanguage,
     reply_lang_of,
     resolve_reply_lang,
+    strip_quoted,
     top_language,
 )
 from scripts.rag_eval import DEFAULT_KB, embed_all
@@ -118,6 +122,28 @@ class Case:
 _FOREIGN_SCRIPT = re.compile(
     "[\u0590-\u08ff\u0e00-\u0e7f\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]+"
 )
+_CYRILLIC = re.compile("[\u0400-\u04ff]+")
+_LATIN_WORD = re.compile(r"(?<![^\W\d_])[A-Za-z]{3,}(?![^\W\d_])")
+_PARENTHESES = re.compile(r"\([^()]*\)")
+# Latin words a Cyrillic answer may contain without a warning (compared in lower case).
+LATIN_OK = frozenset({"ok", "ph", "spf"})
+LATIN_SCRIPT = frozenset({"pl", "en"})
+CYRILLIC_SCRIPT = frozenset({"uk", "ru"})
+
+
+def script_checks(text: str, expected_lang: str) -> tuple[list[str], list[str]]:
+    """(!! flags, ?? notes) for letters of the other alphabet in an answer."""
+    if expected_lang in LATIN_SCRIPT:
+        if found := _CYRILLIC.findall(text):
+            return [f"cyrillic in latin-script answer: {' '.join(found)[:40]}"], []
+    elif expected_lang in CYRILLIC_SCRIPT:
+        plain = _PARENTHESES.sub(" ", strip_quoted(text))
+        words = [w for w in _LATIN_WORD.findall(plain) if w.lower() not in LATIN_OK]
+        if words:
+            return [], [f"latin word: {' '.join(dict.fromkeys(words))[:40]}"]
+    return [], []
+
+
 _SENTENCE_END = re.compile(r"[.!?…](?=\s|$)|\n")
 _MARKDOWN = re.compile(r"[*_#>`~|-]+")
 
@@ -335,6 +361,9 @@ async def answer(
             result.flagged.append(f"answer in {result.lang}, expected {case.expected_lang}")
         if foreign := _FOREIGN_SCRIPT.findall(result.text):
             result.flagged.append(f"text in another script: {' '.join(foreign)[:40]}")
+        flags, notes = script_checks(result.text, case.expected_lang)
+        result.flagged += flags
+        result.unsure += notes
         if result.first_lang != case.expected_lang:
             result.flagged.append(
                 f"first sentence in {result.first_lang}, expected {case.expected_lang}"

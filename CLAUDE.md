@@ -106,10 +106,15 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `locale` sets the interface language (default `lang`), `answer_lang` the expected reply
   language (default `lang`); each answer prints `reply_lang` (the backend's pick) and the
   detected language of the whole answer and of its first sentence, `!!` on a mismatch.
+  Script check: a pl/en answer with any Cyrillic letter -> `!! cyrillic in latin-script answer`;
+  a uk/ru answer with a 3+ letter Latin word outside quotes/code/parentheses and not in
+  `LATIN_OK` (ok, pH, SPF) -> `?? latin word` (warning only).
   `--retrieval-only --query last|user3|summary|chat ...` = embeddings only, no LLM: kb_context
   per search-query variant (`chat`, the default = what the chat does). Eval vectors are cached
   in .cache/embeddings.json (git-ignored, key = sha256 of model+dimensions+text).
 - The answer never mentions articles / the knowledge base: the client shows `done.sources`.
+- No gendered forms about the assistant or the user in uk/ru/pl, one polite register (ru/uk
+  «вы»/«ви», pl impersonal: no «ty», no Pan/Pani), system_v8+; eval group `gender`.
 
 ## Knowledge base / RAG (ADR 0005)
 - Articles: docs/kb/<slug>.md, Russian, YAML frontmatter (title, language, status draft|reviewed,
@@ -224,6 +229,8 @@ uv run python -m app.cli.rag_report [--days 7]      # KB use of recent answers (
   - Work branches → PR into `develop`, **squash** merge.
   - Release: PR `develop` → `main`, **merge commit** (never squash), so main keeps develop's history.
   - `main` deploys to prod; `develop` will deploy to staging (later).
+  - Before every commit run `git branch --show-current`; if it is not the current task's branch,
+    do not commit: stop and report (a human shares the working folder and may switch branches).
 - One checklist item per branch/PR (items 1.1–1.12 in the plan doc).
 - Before coding: restate the item, list files to touch, list tests to add. Wait for "go" if the
   change touches DB schema, auth or the LLM layer.
