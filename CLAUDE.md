@@ -106,6 +106,9 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `locale` sets the interface language (default `lang`), `answer_lang` the expected reply
   language (default `lang`); each answer prints `reply_lang` (the backend's pick) and the
   detected language of the whole answer and of its first sentence, `!!` on a mismatch.
+  Script check: a pl/en answer with any Cyrillic letter -> `!! cyrillic in latin-script answer`;
+  a uk/ru answer with a 3+ letter Latin word outside quotes/code/parentheses and not in
+  `LATIN_OK` (ok, pH, SPF) -> `?? latin word` (warning only).
   `--retrieval-only --query last|user3|summary|chat ...` = embeddings only, no LLM: kb_context
   per search-query variant (`chat`, the default = what the chat does). Eval vectors are cached
   in .cache/embeddings.json (git-ignored, key = sha256 of model+dimensions+text).

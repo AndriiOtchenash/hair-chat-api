@@ -339,3 +339,66 @@ def test_several_queries_need_retrieval_only() -> None:
         prompt_eval.main(["--query", "last", "--query", "user3"])
     with pytest.raises(SystemExit):
         prompt_eval.main(["--retrieval-only", "--no-kb"])
+
+
+POLISH_WITH_RUSSIAN = (
+    "Większe, żółtawe, tłuste płatki to typowy obraz samej перхоти (łupieżu). "
+    "Warto sięgnąć po łagodny szampon i dokładnie go spłukiwać."
+)
+
+
+async def test_cyrillic_in_a_polish_answer_is_flagged() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(success(POLISH_WITH_RUSSIAN))
+
+    _, out = await run(provider, case(lang="pl", text="Mam łupież, co robić?"))
+
+    assert "!! cyrillic in latin-script answer: перхоти\n" in out
+    assert "1 answers, 1 with !! flags" in out
+
+
+@pytest.mark.parametrize(
+    ("text", "lang", "flags"),
+    [
+        (POLISH_WITH_RUSSIAN, "pl", ["cyrillic in latin-script answer: перхоти"]),
+        (
+            "Use a mild shampoo, не горячую воду.",
+            "en",
+            ["cyrillic in latin-script answer: не горячую воду"],
+        ),
+        ("Warto sięgnąć po łagodny szampon.", "pl", []),
+        ("Use a mild shampoo.", "en", []),
+    ],
+)
+def test_latin_script_answers_allow_no_cyrillic(text: str, lang: str, flags: list[str]) -> None:
+    assert prompt_eval.script_checks(text, lang) == (flags, [])
+
+
+async def test_a_latin_word_in_a_russian_answer_is_a_warning_not_a_flag() -> None:
+    provider = FakeLLMProvider("gemini", "flash").script(
+        success("Попробуйте маску Olaplex после мытья, без горячей воды.")
+    )
+
+    code, out = await run(provider, case())
+
+    assert code == 0
+    assert "?? latin word: Olaplex\n" in out
+    assert "\n!! " not in out
+
+
+@pytest.mark.parametrize(
+    ("text", "lang", "notes"),
+    [
+        ("Нанесите маску Olaplex, затем Olaplex ещё раз.", "ru", ["latin word: Olaplex"]),
+        ("Спробуйте шампунь Head and Shoulders.", "uk", ["latin word: Head and Shoulders"]),
+        # allowed: the list, quotes, code and ingredient names in parentheses
+        ("Хорошо, ok: шампунь с нейтральным pH и крем с SPF 30.", "ru", []),
+        ("Ищите в составе пироктон оламин (piroctone olamine).", "ru", []),
+        ('Слово «hallo» или "Schuppen" и `code` не в счёт.', "ru", []),
+        ("Используйте мягкий шампунь.", "uk", []),
+        ("Cyrillic in an answer in German: перхоть.", "de", []),
+    ],
+)
+def test_cyrillic_script_answers_warn_about_latin_words(
+    text: str, lang: str, notes: list[str]
+) -> None:
+    assert prompt_eval.script_checks(text, lang) == ([], notes)
