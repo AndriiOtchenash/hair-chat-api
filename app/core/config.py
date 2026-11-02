@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 768
     # Query embedding in a chat reply; on timeout the answer goes without the knowledge base.
     embedding_timeout_s: float = 3.0
+    # Characters of one "question + answer" text in the conversation search index
+    # (app.rag.conversation_index). gemini-embedding-2 takes 8192 input tokens and silently
+    # cuts the rest (ai.google.dev/gemini-api/docs/embeddings, checked 2026-11-02); 16000
+    # chars stay under it even at 2 chars/token (Cyrillic), app.services.tokens says ~5300.
+    conversation_index_max_chars: int = Field(default=16000, ge=200)
     kb_top_k: int = 4
     # Cosine similarity a chunk needs to reach the context. scripts/rag_eval.py (2026-10-21,
     # gemini-embedding-2/768): off-topic best 0.53, weakest right hit 0.64 -> 0.60.

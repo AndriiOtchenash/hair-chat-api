@@ -153,6 +153,18 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
   threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
 
+## Conversation search index (iteration 1 of 3: storage + backfill, no API, no chat hook)
+- `message_embeddings`: one row per answer (PK message_id, FK CASCADE to messages, plus
+  denormalized user_id / conversation_id, both CASCADE and indexed), vector(768) +
+  embedding_model. No HNSW: search will be exact within one user_id (rule 5).
+- Text = "Вопрос: <latest user message before the answer>\nОтвет: <answer>", cut to
+  CONVERSATION_INDEX_MAX_CHARS (16000; gemini-embedding-2 takes 8192 tokens and silently cuts
+  the rest), the answer keeps at least half. Skipped: no question before the answer, question
+  moderation `action == "block"` (never saved today, a guard only). Soft questions are indexed.
+- `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row or a
+  row of another model, keyset batches of 100 (one embeddings call + one transaction each),
+  ingest's timeout/retries; counts only in the output. Not in the export (derived, like retrieval).
+
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,
   3 s timeout, no retries) in `ChatService.reply` after the 404/409 checks, before it is saved.
@@ -227,6 +239,7 @@ uv run python -m app.rag.ingest docs/kb             # (re)index the knowledge ba
 uv run python -m scripts.rag_eval                   # RAG eval set, real embeddings API, not in CI
 uv run python -m scripts.prompt_eval                # prompt eval, real LLM chain, prints answers
 uv run python -m app.cli.rag_report [--days 7]      # KB use of recent answers (DATABASE_URL)
+uv run python -m app.cli.index_conversations [--dry-run] [--limit N]  # backfill conversation index
 
 ## Workflow for the agent
 - Branching: GitFlow. Branch names: `feature/*`, `fix/*`, `chore/*`, always cut from `develop`.
