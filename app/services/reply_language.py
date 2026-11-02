@@ -171,4 +171,7 @@ def directive(reply: ReplyLanguage) -> str:
     )
     if reply.note_about_languages:
         return f"{text} Add {note}."
-    return f"{text} If the user asks for any other language, still write in {name} and add {note}."
+    return (
+        f"{text} If the user asks for any other language, still write the whole reply in {name},"
+        f" with not a single word or character in that language, and add {note}."
+    )

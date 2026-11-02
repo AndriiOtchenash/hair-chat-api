@@ -54,6 +54,38 @@ we build the detector with are loaded into memory, lazily. Fly's image limit and
 time can take it; if image size ever matters more, fastText's full lid.176.bin (126 MB, would
 have to be baked into the image) is the next candidate. No network at run time.
 
+### Re-check on what reaches the detector
+The first comparison counted two-word phrases that the pipeline never classifies. Re-run on the
+inputs the detector actually gets: quotes cut out, >= 3 words left. Of the 34 short phrases 9
+qualify; plus 25 new ones of 3-15 words (5 each uk/pl/en/ru, some with a greeting, "Спасибо" or a
+quote inside, and 5 in German, Spanish, French, Italian, Czech). 34 inputs:
+
+| | wrong language | unsure (-> fallback) |
+|---|---|---|
+| lingua, our pipeline (segments, MIN_SHARE 0.6, MIN_LEAD 0.1) | **0** | 1 ("How to stop frizz") |
+| fastText lite, no threshold | 2 | 0 |
+| fastText lite, score >= 0.4 | 1 | 2 |
+| fastText lite, score >= 0.5 / 0.6 | 1 | 3 |
+| fastText lite, score >= 0.7 | 1 | 4 |
+| fastText lite, score >= 0.9 | 1 | 9 |
+
+No threshold gets fastText to zero: "Haarausfall, was tun?" comes out as English with 0.98, so a
+German message would get an English answer and no note. lingua stays.
+
+### Cold start
+Measured in the codespace on the prod virtualenvs (`uv sync --no-dev`), median of 7 runs; the
+branch is not deployed, so no Fly machine start times yet (check `fly logs` after the first
+staging deploy).
+
+| | develop | this branch |
+|---|---|---|
+| prod venv on disk | 105 MB | 397 MB |
+| venv as tar.gz (≈ image layer pulled by a new machine) | 30 MB | 193 MB |
+| `import app.main` | 1.59 s, 94 MB RSS | 1.55 s, 95 MB RSS (the .so is mmapped, not read) |
+| first detection (loads the 15 models) | — | +12 ms, +37 MB RSS |
+
+The cost is the image pull on a fresh machine (+163 MB compressed), not process start.
+
 lingua only answers with a language it was given, so "other" needs other languages to win:
 with uk/pl/en/ru/de alone, Czech came out as English (0.96). The detector knows German, French,
 Spanish, Italian, Portuguese, Dutch, Czech, Slovak, Belarusian, Bulgarian and Turkish besides

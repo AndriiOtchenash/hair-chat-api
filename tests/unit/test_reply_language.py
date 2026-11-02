@@ -130,8 +130,9 @@ def test_the_directive_lets_the_user_pick_another_of_ours_only() -> None:
     assert directive(ReplyLanguage(Locale.UK)) == (
         "Write the entire reply in Ukrainian unless the user explicitly asks for another of:"
         " Ukrainian, Polish, English, Russian. If the user asks for any other language, still"
-        " write in Ukrainian and add one short, polite sentence, in Ukrainian, saying that you"
-        " answer in Ukrainian, Polish, English and Russian."
+        " write the whole reply in Ukrainian, with not a single word or character in that"
+        " language, and add one short, polite sentence, in Ukrainian, saying that you answer in"
+        " Ukrainian, Polish, English and Russian."
     )
 
 
