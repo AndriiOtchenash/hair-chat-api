@@ -1,6 +1,6 @@
 """Knowledge-base use of the answers of the last N days, from messages.retrieval:
 
-    uv run python -m scripts.rag_report [--days 7]
+    uv run python -m app.cli.rag_report [--days 7]
 
 Shares of retrieval ok / empty / error (disabled = dev without an embeddings key; unknown =
 answers saved before messages.retrieval existed), the share of answers whose <kb_used> tag named
@@ -134,7 +134,7 @@ def _positive(value: str) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python -m scripts.rag_report", description=__doc__)
+    parser = argparse.ArgumentParser(prog="python -m app.cli.rag_report", description=__doc__)
     parser.add_argument("--days", type=_positive, default=7, help="look back N days (7)")
     args = parser.parse_args(argv)
     return asyncio.run(run(args.days))

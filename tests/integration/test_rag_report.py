@@ -4,9 +4,9 @@ from typing import Any
 import pytest
 from sqlalchemy import delete
 
+from app.cli.rag_report import Group, fetch
 from app.db.models import Conversation, Message, MessageRole, User
 from app.db.session import get_sessionmaker
-from scripts.rag_report import Group, fetch
 
 NOW = datetime.now(UTC)
 

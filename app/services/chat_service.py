@@ -107,7 +107,7 @@ ChatEvent = SafetyNotice | Token | Restart | ChatDone | ChatError
 
 
 def retrieval_record(retrieval: Retrieval, passages: int, kb_used: set[int]) -> dict[str, Any]:
-    """messages.retrieval of an answer (scripts.rag_report reads it): the search status, the
+    """messages.retrieval of an answer (app.cli.rag_report reads it): the search status, the
     number of passages in its <knowledge> block, the passage numbers its <kb_used> tag named
     (out-of-range ones dropped) and the error code. Never message text (rule 6, GDPR)."""
     record: dict[str, Any] = {
