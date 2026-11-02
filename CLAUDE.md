@@ -25,6 +25,10 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
   pool_recycle DB_POOL_RECYCLE_S (240), own ping on checkout instead of pool_pre_ping (that one
   lets a ping timeout reach the request): a dead or hung pooled connection invalidates the pool
   and the request runs on a fresh one (tests/integration/test_db_pool_recovery.py).
+- Logging: `create_app()` calls `app.core.logging.configure_logging(LOG_LEVEL)` (default INFO):
+  one stdout handler on the `app` logger, "%(levelname)s %(name)s: %(message)s",
+  propagate=False, idempotent; uvicorn's loggers untouched. CLIs keep their own basicConfig.
+  Tests check log output via capsys (pytest 9 caplog still sees non-propagating loggers).
 - Dev environment: GitHub Codespaces via .devcontainer/ (Python 3.12, uv, Node LTS for Claude Code,
   docker-in-docker for testcontainers). The owner's local PC cannot run Docker — never assume it.
   The frontend lives next to this repo in /workspaces/hair-chat-web (cloned by postCreateCommand,
