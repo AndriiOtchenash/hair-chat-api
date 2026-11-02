@@ -89,6 +89,24 @@ class Settings(BaseSettings):
     # cuts the rest (ai.google.dev/gemini-api/docs/embeddings, checked 2026-11-02); 16000
     # chars stay under it even at 2 chars/token (Cyrillic), app.services.tokens says ~5300.
     conversation_index_max_chars: int = Field(default=16000, ge=200)
+    # Small talk is not indexed: an answer shorter than this (stripped) to a question of at
+    # most CONVERSATION_INDEX_MAX_SMALL_TALK_QUESTION_CHARS (app.db.repositories.
+    # message_embeddings.SmallTalk). Answer lengths of the real chain, system_v8, our prompt
+    # eval (2026-11-02, 40 cases): greetings and acknowledgements 71 ("hallo"), 116 ("ok"),
+    # 118, 172 ("thanks"); then a gap up to 318 (small talk turned to hair care); off-topic
+    # 335..470; real questions 391 and up (most 650..1700). 200 drops every short
+    # acknowledgement seen, with room for longer ones. 0 = index everything.
+    conversation_index_min_answer_chars: int = Field(default=200, ge=0)
+    # ... and the question as long as this at most (stripped). The question decides when the
+    # answer is short: the prompt asks for clarifying questions, and a short "Прядями? Есть
+    # зуд?" may answer the most telling question of the conversation. Question lengths of the
+    # same eval: small talk 2 ("ok"), 5 ("hallo"), 6 ("thanks"); the next is 16, a follow-up
+    # ("А шампунь какой?"); self-contained topic questions from 17 ("Ich habe Schuppen"),
+    # 21 ("Mam łupież, co robić?"). "Привет! Как у тебя дела?" (24) got a 318-char answer,
+    # so the answer threshold keeps it anyway. 16 covers greetings and thanks ("Здравствуйте!"
+    # 13, "Спасибо большое!" 16) and keeps every topic question of the eval; 40 would drop
+    # 17..21-char ones when they get a short clarifying answer.
+    conversation_index_max_small_talk_question_chars: int = Field(default=16, ge=0)
     # GET /conversations/search keeps index rows within this cosine distance of the query
     # (score = 1 - distance >= 0.60). Provisional. search_probe on staging (2026-11-02, 6 pairs,
     # format 2 = asymmetric prefixes): right top1 0.657..0.781, noise (top2+ where one answer

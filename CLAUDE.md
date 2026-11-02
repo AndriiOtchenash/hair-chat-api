@@ -156,33 +156,41 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
   threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
 
-## Conversation search (iteration 2 of 3: index + backfill + chat hook + API, format 2)
+## Conversation search (iteration 2 of 3: index + backfill + chat hook + API, format 3)
 - `message_embeddings`: one row per answer (PK message_id, FK CASCADE to messages, plus
   denormalized user_id / conversation_id, both CASCADE and indexed), vector(768) +
   embedding_model + index_format. No HNSW: search is exact within one user_id (rule 5).
-- Text (format 2, `CONVERSATION_INDEX_FORMAT_VERSION`) = gemini-embedding-2's asymmetric
-  document format: "title: <conversation title | none> | text: Вопрос: <latest user message
-  before the answer>\nОтвет: <answer>" (`index_text`), cut to CONVERSATION_INDEX_MAX_CHARS
-  (16000; gemini-embedding-2 takes 8192 tokens and silently cuts the rest): title and question
-  kept, the answer cut. The search embeds `query_text(q)` = "task: search result | query: q".
-  Both live in app/rag/conversation_index.py (search_probe uses them too). Format change = new
-  version: every row of another version, or stale (index_format NULL: before the column or
-  renamed since), is re-embedded by the next index run; the search does not filter on it.
-- Skipped: no question before the answer, question moderation `action == "block"` (never saved
-  today, a guard only), users without every valid consent (version == CONSENT_VERSION, like
-  require_consents; `skipped_no_consent`): nothing of theirs goes to the embeddings API. Soft
-  questions are indexed.
+- Text (format 3, `CONVERSATION_INDEX_FORMAT_VERSION`) = gemini-embedding-2's asymmetric
+  document format without a title: "title: none | text: Вопрос: <latest user message before
+  the answer>\nОтвет: <answer>" (`index_text`), cut to CONVERSATION_INDEX_MAX_CHARS (16000;
+  gemini-embedding-2 takes 8192 tokens and silently cuts the rest): question kept, the answer
+  cut. No conversation title: in format 2 it filled short pairs, so "hallo" beat the real
+  question in its conversation (search_probe --pairs, staging). The search embeds
+  `query_text(q)` = "task: search result | query: q". Both live in
+  app/rag/conversation_index.py (search_probe uses them too). Format change = new version:
+  every row of another version (or NULL: before the column) is re-embedded by the next index
+  run; the search does not filter on it.
+- Small talk is not indexed (`SmallTalk` in app/db/repositories/message_embeddings.py, one rule
+  as `matches` and `sql`): answer shorter than CONVERSATION_INDEX_MIN_ANSWER_CHARS (200) to a
+  question of at most CONVERSATION_INDEX_MAX_SMALL_TALK_QUESTION_CHARS (16), both stripped;
+  measured lengths in config.py. A short clarifying answer to a real question is kept.
+  `pending` never returns small talk unless it still has a row (older format, or thresholds
+  changed since): the run deletes that row (`drop`, which checks the rule again in SQL) and
+  counts `skipped_small_talk`. So skipped small talk is not read again by every backfill, and
+  a threshold change heals the index both ways.
+- Skipped too (read again by every run): no question before the answer, question moderation
+  `action == "block"` (never saved today, a guard only), users without every valid consent
+  (version == CONSENT_VERSION, like require_consents; `skipped_no_consent`): nothing of theirs
+  goes to the embeddings API. Soft questions are indexed.
 - `ConversationIndexer.run(user_id, conversation_id)` (background, `BackgroundJobs.spawn`)
-  indexes what one conversation lacks, title read from the DB. After `done` in `send_message`:
-  chat embedder, whole run within EMBEDDING_TIMEOUT_S. After `PATCH /conversations/{id}` (the
-  rename marks the conversation's rows stale in its transaction): own embedder with
-  INGEST_TIMEOUT_S per request, no retries. Own session via `sql_message_embedding_repositories`.
+  indexes what one conversation lacks, after `done` in `send_message`: chat embedder, whole
+  run within EMBEDDING_TIMEOUT_S. Own session via `sql_message_embedding_repositories`.
   Failure = WARNING with conversation id + code, never raised; no embedder (dev) or a client
-  disconnect = not indexed. The backfill picks those up.
-- Known limit (MVP, accepted): a rename while an answer of that conversation is being indexed
-  may leave that one pair with the old title in its vector (no lock between them).
+  disconnect = not indexed. The backfill picks those up. A rename (`PATCH
+  /conversations/{id}`) does not touch the index.
 - `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row,
-  a row of another model or format, or a stale one; keyset batches of 100 (one embeddings call
+  a row of another model or format, or a stale one, plus small talk's leftover rows (deleted);
+  keyset batches of 100 (one embeddings call
   + one transaction each), ingest's timeout/retries; counts only in the output. Run it after
   every deploy that bumps the format. Not in the export (derived, like retrieval).
 - `GET /conversations/search?q=&limit=` (CONSENTED; q 2..500 chars after strip, limit 1..20,
@@ -194,10 +202,11 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   score = 1 - distance, best first. Embeddings down / too slow / no key -> `text`: ILIKE over
   the user's own role=user messages (% _ \ escaped), newest first, score null. Logs mode,
   count, ms; never q.
-- `uv run python -m app.cli.search_probe USER_ID "q" ... [--top N] [--all-pairs | --pairs]`: read-only
-  experiment, modes A (stored vectors), B (pairs re-embedded now), C (question only), D (like B,
-  title always "none"), with the top1-top2 gap; `--pairs`: each conversation's best 3 pairs
-  (question[:40] | score); prints titles and queries, operator's own data only.
+- `uv run python -m app.cli.search_probe USER_ID "q" ... [--top N] [--all-pairs | --pairs]`:
+  read-only experiment, modes A (stored vectors) and B (pairs re-embedded now in the current
+  format, without small talk), with the top1-top2 gap; `--pairs`: each conversation's best 3
+  pairs (question[:40] | score); prints titles, questions and queries, operator's own data
+  only.
 
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,

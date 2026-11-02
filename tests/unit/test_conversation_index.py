@@ -11,11 +11,10 @@ import pytest
 from app.cli import index_conversations as cli
 from app.core.config import Settings
 from app.db.base import new_id
-from app.db.repositories.message_embeddings import PendingAnswer
+from app.db.repositories.message_embeddings import NO_SMALL_TALK, PendingAnswer, SmallTalk
 from app.rag.conversation_index import (
     CONVERSATION_INDEX_FORMAT_VERSION,
     ConversationIndexer,
-    document_text,
     index_conversations,
     index_text,
     pair_text,
@@ -24,6 +23,8 @@ from app.rag.conversation_index import (
 from app.rag.embeddings import EmbeddingUnavailable
 from tests.llm_fakes import FakeEmbedder
 
+SMALL_TALK = SmallTalk(min_answer_chars=200, max_question_chars=16)
+POSTPARTUM = "Волосы выпадают три месяца после родов, что делать?"
 ALLOWED = {"provider": "openai", "model": "m", "flagged": False, "action": "allow"}
 BLOCKED = {"provider": "openai", "model": "m", "flagged": True, "action": "block"}
 SOFT = {"provider": "openai", "model": "m", "flagged": True, "action": "soft"}
@@ -34,7 +35,6 @@ def answer(
     question: str | None = "Как часто мыть голову?",
     moderation: dict[str, object] | None = ALLOWED,
     *,
-    title: str | None = "Мытьё головы",
     consented: bool = True,
     user_id: uuid.UUID | None = None,
     conversation_id: uuid.UUID | None = None,
@@ -46,14 +46,14 @@ def answer(
         text,
         question,
         moderation,
-        title,
         consented,
     )
 
 
 class MemoryRepo:
     """pending() = answers without a vector of `model` and `index_format` (None = stale), by id
-    after `after`, of one conversation if given, like the SQL."""
+    after `after`, of one conversation if given, like the SQL; small talk (shorter than
+    SmallTalk.matches) only while it has a row, marked `small_talk`; drop() re-checks it."""
 
     def __init__(self, answers: Sequence[PendingAnswer]) -> None:
         self.answers = sorted(answers, key=lambda a: a.message_id)
@@ -71,15 +71,25 @@ class MemoryRepo:
         limit: int,
         user_id: uuid.UUID | None = None,
         conversation_id: uuid.UUID | None = None,
+        small_talk: SmallTalk = NO_SMALL_TALK,
     ) -> list[PendingAnswer]:
-        return [
-            a
-            for a in self.answers
-            if self.rows.get(a.message_id) != (model, index_format)
-            and (after is None or a.message_id > after)
-            and (user_id is None or (a.user_id, a.conversation_id) == (user_id, conversation_id))
-            and a.message_id not in self.deleted
-        ][:limit]
+        found = []
+        scope = (user_id, conversation_id)
+        for a in self.answers:
+            small = small_talk.matches(a.answer, a.question)
+            wanted = (
+                a.message_id in self.rows
+                if small
+                else self.rows.get(a.message_id) != (model, index_format)
+            )
+            if (
+                wanted
+                and (after is None or a.message_id > after)
+                and (user_id is None or (a.user_id, a.conversation_id) == scope)
+                and a.message_id not in self.deleted
+            ):
+                found.append(replace(a, small_talk=small))
+        return found[:limit]
 
     async def save(
         self,
@@ -94,18 +104,15 @@ class MemoryRepo:
         self.saves.append(len(alive))
         return len(alive)
 
+    async def drop(self, message_ids: Sequence[uuid.UUID], small_talk: SmallTalk) -> int:
+        chatter = {a.message_id for a in self.answers if small_talk.matches(a.answer, a.question)}
+        there = [m for m in message_ids if m in self.rows and m in chatter]
+        for m in there:
+            del self.rows[m]
+        return len(there)
+
     def models(self) -> set[str]:
         return {model for model, _ in self.rows.values()}
-
-    def rename(self, conversation_id: uuid.UUID, title: str) -> None:
-        """Like SqlConversationRepository.rename: new title, its rows marked stale."""
-        self.answers = [
-            replace(a, title=title) if a.conversation_id == conversation_id else a
-            for a in self.answers
-        ]
-        for a in self.answers:
-            if a.conversation_id == conversation_id and a.message_id in self.rows:
-                self.rows[a.message_id] = (self.rows[a.message_id][0], None)
 
 
 def test_pair_text_is_question_then_answer() -> None:
@@ -136,33 +143,50 @@ def test_query_format() -> None:
     assert query_text("  перхоть ") == "task: search result | query: перхоть"
 
 
-def test_document_format() -> None:
-    assert document_text("Сухие кончики", " Вопрос: что делать? ") == (
-        "title: Сухие кончики | text: Вопрос: что делать?"
+def test_format_3_is_the_untitled_pair() -> None:
+    assert CONVERSATION_INDEX_FORMAT_VERSION == "3"
+    assert index_text(" Как часто? ", "Раз в два дня.\n", max_chars=1000) == (
+        "title: none | text: Вопрос: Как часто?\nОтвет: Раз в два дня."
     )
 
 
-@pytest.mark.parametrize("title", [None, "", "  \n "])
-def test_document_without_a_title_says_none(title: str | None) -> None:
-    assert document_text(title, "x") == "title: none | text: x"
-
-
-def test_a_title_is_kept_on_one_line() -> None:
-    assert document_text(" Сухие\n кончики ", "x") == "title: Сухие кончики | text: x"
-
-
-def test_index_text_is_the_titled_pair() -> None:
-    assert index_text("Мытьё", "Как часто?", "Раз в два дня.", max_chars=1000) == (
-        "title: Мытьё | text: Вопрос: Как часто?\nОтвет: Раз в два дня."
-    )
-
-
-def test_index_text_keeps_the_title_and_cuts_the_answer_to_the_limit() -> None:
-    title = "т" * 120  # MAX_TITLE_CHARS of a rename
-    text = index_text(title, "щ" * 4000, "ж" * 20000, max_chars=16000)
+def test_index_text_cuts_the_answer_to_the_limit() -> None:
+    text = index_text("щ" * 4000, "ж" * 20000, max_chars=16000)
 
     assert len(text) == 16000
-    assert text.startswith(f"title: {title} | text: Вопрос: {'щ' * 4000}\nОтвет: ж")
+    assert text.startswith(f"title: none | text: Вопрос: {'щ' * 4000}\nОтвет: ж")
+
+
+@pytest.mark.parametrize(
+    ("text", "question", "small"),
+    [
+        ("ж" * 199, "hallo", True),
+        ("ж" * 200, "hallo", False),
+        (f"  {'ж' * 199}\n ", "hallo", True),
+        ("", "ok", True),
+        ("ж" * 199, "щ" * 16, True),
+        ("ж" * 199, "щ" * 17, False),
+        ("ж" * 199, f" {'щ' * 16}\n", True),
+        ("ж" * 199, None, True),
+        ("Прядями? Есть зуд?", POSTPARTUM, False),
+    ],
+    ids=[
+        "answer-one-below",
+        "answer-at-threshold",
+        "answer-whitespace-not-counted",
+        "empty-answer",
+        "question-at-threshold",
+        "question-one-above",
+        "question-whitespace-not-counted",
+        "no-question",
+        "clarifying-answer-to-a-real-question",
+    ],
+)
+def test_small_talk_is_a_short_answer_to_a_short_question(
+    text: str, question: str | None, small: bool
+) -> None:
+    assert SMALL_TALK.matches(text, question) is small
+    assert NO_SMALL_TALK.matches(text, question) is False
 
 
 async def test_indexes_pairs_and_skips_blocked_and_questionless_answers() -> None:
@@ -186,7 +210,7 @@ async def test_indexes_pairs_and_skips_blocked_and_questionless_answers() -> Non
     )
     assert set(repo.rows) == {ok.message_id, soft.message_id, unmoderated.message_id}
     assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
-    assert index_text(ok.title, ok.question or "", ok.answer, max_chars=1000) in embedder.embedded
+    assert index_text(ok.question or "", ok.answer, max_chars=1000) in embedder.embedded
     assert not any("запрещённое" in t for t in embedder.embedded)
 
 
@@ -204,20 +228,86 @@ async def test_rerun_embeds_nothing_and_a_model_change_rebuilds_everything() -> 
 
 
 async def test_rows_of_another_format_version_or_stale_are_rebuilt() -> None:
-    old, stale, current = answer(), answer(), answer()
-    repo = MemoryRepo([old, stale, current])
+    v1, v2, stale, current = answer(), answer(), answer(), answer()
+    repo = MemoryRepo([v1, v2, stale, current])
     repo.rows = {
-        old.message_id: ("fake-embedding", "1"),
-        stale.message_id: ("fake-embedding", None),  # before the column, or renamed since
+        v1.message_id: ("fake-embedding", "1"),
+        v2.message_id: ("fake-embedding", "2"),  # titled
+        stale.message_id: ("fake-embedding", None),  # before the column, or renamed in v2
         current.message_id: ("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION),
     }
     embedder = FakeEmbedder()
 
     report = await index_conversations(repo, embedder, max_chars=1000)
 
-    assert report.indexed == 2
-    assert len(embedder.embedded) == 2
+    assert report.indexed == 3
+    assert len(embedder.embedded) == 3
+    assert all(t.startswith("title: none | text: Вопрос: ") for t in embedder.embedded)
     assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
+
+
+async def test_small_talk_is_not_indexed_and_its_old_rows_are_dropped() -> None:
+    long_enough, below = answer("ж" * 200), answer("ж" * 199, question="hallo")
+    v2_greeting = answer("Здравствуйте! Чем помочь?", question="hallo")
+    repo = MemoryRepo([long_enough, below, v2_greeting])
+    repo.rows = {v2_greeting.message_id: ("fake-embedding", "2")}
+    embedder = FakeEmbedder()
+
+    dry = await index_conversations(
+        repo, embedder, max_chars=1000, small_talk=SMALL_TALK, dry_run=True
+    )
+    assert (dry.indexed, dry.skipped_small_talk) == (1, 1)
+    assert v2_greeting.message_id in repo.rows and embedder.calls == 0
+
+    report = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
+
+    assert (report.seen, report.indexed, report.skipped_small_talk) == (2, 1, 1)
+    assert set(repo.rows) == {long_enough.message_id}
+    assert not any("hallo" in t for t in embedder.embedded)
+    assert "skipped small talk 1" in report.summary()
+
+    # Not pending any more: the next run reads nothing.
+    again = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
+    assert (again.seen, again.skipped_small_talk) == (0, 0)
+
+
+async def test_a_clarifying_answer_to_a_real_question_is_indexed_and_kept() -> None:
+    clarifying = answer("Прядями? Есть зуд?", question=POSTPARTUM)
+    greeting = answer("Здравствуйте!", question="hallo")
+    repo = MemoryRepo([clarifying, greeting])
+    repo.rows = {m.message_id: ("fake-embedding", "2") for m in (clarifying, greeting)}
+    embedder = FakeEmbedder()
+
+    report = await index_conversations(repo, embedder, max_chars=1000, small_talk=SMALL_TALK)
+
+    assert (report.indexed, report.skipped_small_talk) == (1, 1)
+    assert repo.rows == {
+        clarifying.message_id: ("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)
+    }
+    assert embedder.embedded == [index_text(POSTPARTUM, "Прядями? Есть зуд?", max_chars=1000)]
+    # drop() checks the rule again: a real pair is never deleted by a wrong id.
+    assert await repo.drop([clarifying.message_id], SMALL_TALK) == 0
+
+
+async def test_a_threshold_change_heals_the_index_both_ways() -> None:
+    short = answer("ж" * 50, question="hallo")
+    medium = answer("ж" * 150, question="спасибо")
+    repo = MemoryRepo([short, medium])
+
+    await index_conversations(repo, FakeEmbedder(), max_chars=1000, small_talk=SmallTalk(100, 16))
+    assert set(repo.rows) == {medium.message_id}
+
+    raised = await index_conversations(repo, FakeEmbedder(), max_chars=1000, small_talk=SMALL_TALK)
+    assert (raised.skipped_small_talk, set(repo.rows)) == (1, set())
+
+    shorter_questions = SmallTalk(200, 5)  # "спасибо" (7) is no longer small talk
+    again = await index_conversations(
+        repo, FakeEmbedder(), max_chars=1000, small_talk=shorter_questions
+    )
+    assert (again.indexed, set(repo.rows)) == (1, {medium.message_id})
+
+    lowered = await index_conversations(repo, FakeEmbedder(), max_chars=1000)
+    assert (lowered.indexed, set(repo.rows)) == (1, {short.message_id, medium.message_id})
 
 
 async def test_users_without_consents_are_skipped_and_counted() -> None:
@@ -301,7 +391,7 @@ def test_a_whole_question_is_kept_at_the_real_limit() -> None:
     assert text.startswith(f"Вопрос: {question}\nОтвет: ж")
 
 
-# --- ConversationIndexer: one conversation, after a chat answer or a rename ---
+# --- ConversationIndexer: one conversation, after a chat answer ---
 
 
 class BrokenRepo(MemoryRepo):
@@ -322,7 +412,9 @@ def indexer(
     async def repositories() -> AsyncIterator[MemoryRepo]:
         yield repo
 
-    return ConversationIndexer(repositories, embedder, max_chars=1000, timeout=timeout)
+    return ConversationIndexer(
+        repositories, embedder, max_chars=1000, small_talk=SmallTalk(10, 16), timeout=timeout
+    )
 
 
 async def test_conversation_indexer_writes_what_that_conversation_lacks_only() -> None:
@@ -338,39 +430,8 @@ async def test_conversation_indexer_writes_what_that_conversation_lacks_only() -
 
     assert set(repo.rows) == {earlier.message_id, saved.message_id}
     assert embedder.embedded == [
-        index_text(a.title, a.question or "", a.answer, max_chars=1000) for a in (earlier, saved)
+        index_text(a.question or "", a.answer, max_chars=1000) for a in (earlier, saved)
     ]
-
-
-async def test_a_rename_re_embeds_the_conversation_with_its_new_title() -> None:
-    user, conv = uuid.uuid4(), uuid.uuid4()
-    pairs = [answer(user_id=user, conversation_id=conv, title="Старое") for _ in range(2)]
-    other = answer(title="Другая")
-    repo = MemoryRepo([*pairs, other])
-    await index_conversations(repo, FakeEmbedder(), max_chars=1000)
-
-    repo.rename(conv, "Новое название")
-    embedder = FakeEmbedder()
-    await indexer(repo, embedder, timeout=None).run(user, conv)
-
-    assert len(embedder.embedded) == 2
-    assert all(t.startswith("title: Новое название | text: ") for t in embedder.embedded)
-    assert set(repo.rows.values()) == {("fake-embedding", CONVERSATION_INDEX_FORMAT_VERSION)}
-
-
-async def test_a_rename_without_consents_embeds_nothing() -> None:
-    user, conv = uuid.uuid4(), uuid.uuid4()
-    pair = answer(user_id=user, conversation_id=conv)
-    repo = MemoryRepo([pair])
-    await index_conversations(repo, FakeEmbedder(), max_chars=1000)
-    repo.rename(conv, "Новое")
-    repo.answers = [replace(a, consented=False) for a in repo.answers]  # consents revoked
-    embedder = FakeEmbedder()
-
-    await indexer(repo, embedder).run(user, conv)
-
-    assert embedder.calls == 0
-    assert repo.rows[pair.message_id] == ("fake-embedding", None)  # stale, still searchable
 
 
 @pytest.mark.parametrize(
@@ -388,7 +449,7 @@ async def test_conversation_indexer_failure_is_a_warning_without_text_and_never_
     code: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    saved = answer(text="Секретный ответ", question="Секретный вопрос", title="Секретная")
+    saved = answer(text="Секретный ответ", question="Секретный вопрос")
     repo = repo_class([saved])
 
     with caplog.at_level(logging.INFO, logger="app"):
@@ -403,8 +464,8 @@ async def test_conversation_indexer_failure_is_a_warning_without_text_and_never_
 
 @pytest.mark.parametrize(
     "saved",
-    [answer(question=None), answer(moderation=BLOCKED)],
-    ids=["no-question", "blocked-question"],
+    [answer(question=None), answer(moderation=BLOCKED), answer("Привет!", question="hallo")],
+    ids=["no-question", "blocked-question", "small-talk"],
 )
 async def test_conversation_indexer_skips_what_the_backfill_skips(saved: PendingAnswer) -> None:
     repo, embedder = MemoryRepo([saved]), FakeEmbedder()

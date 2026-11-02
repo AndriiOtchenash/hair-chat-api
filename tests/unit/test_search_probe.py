@@ -1,12 +1,13 @@
-"""search_probe experiment CLI: the four modes over the index's shared formats.
+"""search_probe experiment CLI: stored vectors (A) vs the current format re-embedded (B).
 
 The formats themselves are tested in test_conversation_index.py.
 """
 
 import uuid
 
-from app.cli.search_probe import Pair, gap, probe, render, untitled_text
-from app.rag.conversation_index import document_text, index_text, query_text
+from app.cli.search_probe import Pair, gap, probe, render
+from app.db.repositories.message_embeddings import SmallTalk
+from app.rag.conversation_index import index_text, query_text
 from tests.llm_fakes import FakeEmbedder
 
 
@@ -20,81 +21,50 @@ def pair(
     return Pair(uuid.uuid4(), conversation_id or uuid.uuid4(), title, question, answer, vector)
 
 
-async def test_modes_embed_the_index_formats_and_rank() -> None:
+def b(p: Pair) -> str:
+    return index_text(p.question, p.answer, max_chars=1000)
+
+
+async def test_a_ranks_stored_vectors_and_b_the_current_format() -> None:
     near, far = [1.0, 0.0], [0.0, 1.0]
     p1 = pair("Перхоть", "Что с перхотью?", "Длинный ответ.", far)
     p2 = pair(None, "Как сушить?", "Феном.", near)
-    b1 = index_text("Перхоть", p1.question, p1.answer, max_chars=1000)
-    c1 = document_text("Перхоть", p1.question)
-    embedder = FakeEmbedder(
-        vectors={
-            query_text("перхоть"): near,  # A: stored vectors -> p2 wins
-            b1: near,  # B: p1 wins
-            c1: [0.6, 0.8],  # C: p2's question doc is closer
-            index_text(None, p2.question, p2.answer, max_chars=1000): far,
-            document_text(None, p2.question): near,
-            untitled_text(p1, max_chars=1000): far,  # p2 has no title: its D text = its B text
-        }
-    )
+    embedder = FakeEmbedder(vectors={query_text("перхоть"): near, b(p1): near, b(p2): far})
+
     results = await probe([p1, p2], ["перхоть"], embedder, max_chars=1000)
 
     assert results[("перхоть", "A")][0].pair is p2
     assert results[("перхоть", "B")][0].pair is p1
-    assert results[("перхоть", "C")][0].pair is p2
     assert gap(results[("перхоть", "B")]) == 1.0
-    assert "перхоть" not in embedder.embedded  # every mode queries in the index's format
-    assert set(embedder.embedded) >= {query_text("перхоть"), b1, c1}
+    assert sorted(embedder.embedded) == sorted([query_text("перхоть"), b(p1), b(p2)])
+    assert not any("Перхоть" in t for t in embedder.embedded)  # no title in format 3
 
     table = render(results, ["перхоть"], top=5)
     assert "перхоть | B    | Перхоть" in table
+    assert "| C    |" not in table and "| D    |" not in table
     assert "gap top1-top2" in table
 
 
-def test_mode_d_is_the_index_format_without_the_title() -> None:
-    p = pair("Перхоть", " hallo ", "Здравствуйте!", [1.0])
-
-    assert (
-        untitled_text(p, max_chars=1000)
-        == "title: none | text: Вопрос: hallo\nОтвет: Здравствуйте!"
-    )
-    assert untitled_text(p, max_chars=1000) == index_text(
-        None, "hallo", "Здравствуйте!", max_chars=1000
-    )
-    assert len(untitled_text(pair("T", "q", "a" * 500, [1.0]), max_chars=100)) == 100
-
-
-async def test_mode_d_and_pairs_show_which_pair_wins_inside_a_conversation() -> None:
-    """In B the title lifts the greeting above the real question; D drops the title."""
+async def test_b_leaves_out_small_talk_and_pairs_show_the_winner_inside() -> None:
     conv = uuid.uuid4()
     hallo = pair("Перхоть", "hallo", "Здравствуйте!", [1.0, 0.0], conv)
-    real = pair("Перхоть", "Что делать с перхотью на коже головы?", "Шампунь.", [1.0, 0.0], conv)
+    real = pair("Перхоть", "Что делать с перхотью на коже головы?", "ж" * 50, [0.6, 0.8], conv)
+    other = pair("Сушка", "Как сушить волосы феном?", "ж" * 10, [0.0, 1.0])  # long question
     embedder = FakeEmbedder(
-        vectors={
-            query_text("перхоть"): [1.0, 0.0],
-            index_text("Перхоть", "hallo", "Здравствуйте!", max_chars=1000): [0.9, 0.1],
-            index_text("Перхоть", real.question, real.answer, max_chars=1000): [0.5, 0.5],
-            untitled_text(hallo, max_chars=1000): [0.1, 0.9],
-            untitled_text(real, max_chars=1000): [0.8, 0.2],
-            document_text("Перхоть", "hallo"): [0.0, 1.0],
-            document_text("Перхоть", real.question): [0.0, 1.0],
-        }
+        vectors={query_text("перхоть"): [1.0, 0.0], b(real): [0.9, 0.1], b(other): [0.1, 0.9]}
     )
-    results = await probe([hallo, real], ["перхоть"], embedder, max_chars=1000)
 
-    assert [h.pair for h in results[("перхоть", "B")]] == [hallo, real]  # every pair, best first
-    assert [h.pair for h in results[("перхоть", "D")]] == [real, hallo]
+    results = await probe(
+        [hallo, real, other], ["перхоть"], embedder, max_chars=1000, small_talk=SmallTalk(20, 16)
+    )
+
+    assert [h.pair for h in results[("перхоть", "A")]] == [hallo, real, other]  # as stored
+    assert [h.pair for h in results[("перхоть", "B")]] == [real, other]
+    assert b(hallo) not in embedder.embedded
 
     table = render(results, ["перхоть"], top=5, pairs=True).splitlines()
-    rows_b = table[table.index(next(r for r in table if "| B    |" in r)) :][:3]
-    assert "| B    | Перхоть" in rows_b[0]
-    assert rows_b[1].split("|")[2].strip() == "hallo"
-    assert rows_b[2].split("|")[2].strip() == "Что делать с перхотью на коже головы?"[:40]
-    rows_d = table[table.index(next(r for r in table if "| D    |" in r)) :][:3]
-    assert rows_d[1].split("|")[2].strip().startswith("Что делать с перхотью")
-    assert rows_d[2].split("|")[2].strip() == "hallo"
-    # one conversation -> one row per mode, no gap
-    assert sum("| D    | Перхоть" in r for r in table) == 1
-    assert "перхоть | D    | n/a" in table
-
-    plain = render(results, ["перхоть"], top=5)
-    assert "hallo" not in plain
+    a_rows = table[table.index(next(r for r in table if "| A    |" in r)) :][:3]
+    assert [r.split("|")[2].strip() for r in a_rows[1:]] == ["hallo", real.question[:40]]
+    b_rows = table[table.index(next(r for r in table if "| B    |" in r)) :][:2]
+    assert b_rows[1].split("|")[2].strip() == real.question[:40]
+    assert "hallo" not in render(results, ["перхоть"], top=5)

@@ -6,8 +6,7 @@ from dataclasses import dataclass
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.core.background import BackgroundJobs, get_background_jobs
-from app.core.chat import get_conversation_locks, get_conversation_repository, get_rename_indexer
+from app.core.chat import get_conversation_locks, get_conversation_repository
 from app.core.consents import get_consent_repository
 from app.core.security import get_token_verifier, get_user_repository
 from app.main import create_app
@@ -21,24 +20,12 @@ BOB = bearer(mint(KEY, sub="auth0|bob"))
 MISSING = "01890000-0000-7000-8000-00000000dead"
 
 
-class RecordingIndexer:
-    """Stands in for the rename's ConversationIndexer (its work: test_conversation_index)."""
-
-    def __init__(self) -> None:
-        self.runs: list[tuple[uuid.UUID, uuid.UUID]] = []
-
-    async def run(self, user_id: uuid.UUID, conversation_id: uuid.UUID) -> None:
-        self.runs.append((user_id, conversation_id))
-
-
 @dataclass
 class World:
     client: AsyncClient
     users: FakeUserRepository
     conversations: FakeConversationRepository
     locks: ConversationLocks
-    indexer: RecordingIndexer
-    jobs: BackgroundJobs
 
     async def user_id(self, auth: dict[str, str]) -> uuid.UUID:
         """Creates the user (no consents) through GET /me."""
@@ -67,11 +54,8 @@ async def world() -> AsyncIterator[World]:
     app.dependency_overrides[get_consent_repository] = FakeConsentRepository
     app.dependency_overrides[get_conversation_repository] = lambda: conversations
     app.dependency_overrides[get_conversation_locks] = lambda: locks
-    indexer, jobs = RecordingIndexer(), BackgroundJobs()
-    app.dependency_overrides[get_rename_indexer] = lambda: indexer
-    app.dependency_overrides[get_background_jobs] = lambda: jobs
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield World(c, users, conversations, locks, indexer, jobs)
+        yield World(c, users, conversations, locks)
     await verifier.aclose()
 
 
@@ -88,21 +72,6 @@ async def test_rename_strips_the_title_and_returns_the_conversation(world: World
     assert response.status_code == 200
     body = response.json()
     assert (body["id"], body["title"]) == (conversation_id, "Сухие кончики")
-
-
-async def test_rename_re_indexes_the_conversation_in_the_background(world: World) -> None:
-    # The title is in every vector of the conversation; without consents the indexer itself
-    # embeds nothing (test_conversation_index), so the job is spawned either way.
-    alice = await world.user_id(ALICE)
-    conversation_id = await world.conversation(ALICE)
-
-    response = await world.client.patch(
-        f"/conversations/{conversation_id}", json={"title": "Окрашивание"}, headers=ALICE
-    )
-    await world.jobs.join()
-
-    assert response.status_code == 200
-    assert world.indexer.runs == [(alice, uuid.UUID(conversation_id))]
 
 
 async def test_rename_accepts_120_chars(world: World) -> None:
@@ -142,8 +111,6 @@ async def test_rename_of_someone_elses_or_missing_conversation_is_404(
     assert response.status_code == 404
     assert response.json()["code"] == "not_found"
     assert world.conversations.conversations[uuid.UUID(bobs)].title == "bob's question"
-    await world.jobs.join()
-    assert world.indexer.runs == []
 
 
 async def test_first_message_does_not_replace_a_title_set_by_the_user(world: World) -> None:
