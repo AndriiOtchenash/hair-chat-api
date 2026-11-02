@@ -1,6 +1,9 @@
 from datetime import UTC, datetime
 
-from scripts.rag_report import Group, format_report
+import pytest
+
+from app.cli import rag_report
+from app.cli.rag_report import Group, format_report
 
 SINCE = datetime(2026, 10, 26, 12, 0, tzinfo=UTC)
 FLASH = "gemini:gemini-3.8-flash"
@@ -36,3 +39,22 @@ def test_no_answers_is_one_line() -> None:
     assert format_report([], 1, SINCE) == (
         "RAG report: last 1 days (since 2026-10-26 12:00 UTC), 0 answers"
     )
+
+
+@pytest.mark.parametrize("days", ["0", "-1"])
+def test_cli_refuses_non_positive_days(days: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        rag_report.main(["--days", days])
+    assert exc.value.code == 2
+
+
+def test_cli_reports_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def broken() -> None:
+        raise ValueError("DATABASE_URL is required")
+
+    monkeypatch.setattr(rag_report, "get_settings", broken)
+
+    assert rag_report.main(["--days", "3"]) == 2
+    assert "config error: DATABASE_URL is required" in capsys.readouterr().err
