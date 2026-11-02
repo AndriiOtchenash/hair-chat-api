@@ -145,16 +145,33 @@ class RagQueryEmbedder:
         """QueryFailed when embeddings are down: the answer goes without the knowledge base (no
         fallback model, its vectors would not match the index)."""
         texts = [text] if context is None else [text, context]
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        outcome = "ok"
         try:
             async with asyncio.timeout(self._timeout):
                 vectors = await self._embedder.embed(texts)
         except EmbeddingUnavailable as exc:
+            outcome = exc.code
             log = logger.error if exc.misconfigured else logger.warning
             log("embeddings unavailable, answering without knowledge: code=%s", exc.code)
             return QueryFailed(exc.code)
         except TimeoutError:
+            outcome = "timeout"
             logger.warning("embeddings unavailable, answering without knowledge: code=timeout")
             return QueryFailed("timeout")
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            # Timing diagnostics (staging timeouts): lengths only, never the text (rule 6).
+            logger.info(
+                "embed_query: outcome=%s elapsed_ms=%d n_texts=%d chars=%s",
+                outcome,
+                (loop.time() - t0) * 1000,
+                len(texts),
+                ",".join(str(len(t)) for t in texts),
+            )
         context_vector = vectors[1] if context is not None else None
         return QueryEmbedding(vectors[0], self._embedder.model, context_vector)
 

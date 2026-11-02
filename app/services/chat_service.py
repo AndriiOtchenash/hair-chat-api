@@ -371,14 +371,26 @@ class ChatService:
         """
         conversation = await self.conversations.require(user_id, conversation_id)
         with self.locks.hold(conversation_id):
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
             dialog = await self._dialog_query(user_id, conversation, content)
+            t1 = loop.time()
             embedding = asyncio.create_task(self.query_embedder.embed_query(content, dialog))
             try:
                 moderation = await self._moderate(content)
             except BaseException:
                 embedding.cancel()  # blocked (or cancelled): its vector is not needed
                 raise
+            t2 = loop.time()
             query = await embedding
+            t3 = loop.time()
+            # Timing diagnostics (staging embedding timeouts): durations only, no text (rule 6).
+            logger.info(
+                "reply timings: dialog_query_ms=%d moderation_ms=%d embedding_wait_ms=%d",
+                (t1 - t0) * 1000,
+                (t2 - t1) * 1000,
+                (t3 - t2) * 1000,
+            )
             message = await self.repo.add_user_message(
                 user_id, conversation_id, content, moderation=moderation
             )
