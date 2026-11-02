@@ -7,7 +7,8 @@
 #           recurring | limits | kb (the <kb_used> tag) |
 #           real (tester questions, verbatim with typos) |
 #           dialog (follow-ups that only make sense with the history: the knowledge search) |
-#           language (the reply language the backend picks, app.services.reply_language)
+#           language (the reply language the backend picks, app.services.reply_language) |
+#           gender (no gendered forms about the assistant or the user; one polite register)
 #   lang    language of `text`; the answer must be in it unless `answer_lang` says otherwise
 #   locale  optional interface language (users.locale: uk|pl|en|ru), the fallback reply
 #           language; default `lang` if supported, else en
@@ -433,3 +434,35 @@
     - одна вежливая фраза, что ассистент отвечает на украинском, польском, английском и русском
     - про перхоть по существу
   avoid: ["的", "是", "头"]
+
+# --- gender-neutral wording and one polite register (system_v8) ---
+- id: gender-hallo-ru
+  group: gender
+  lang: ru
+  text: "hallo"
+  locale: ru
+  answer_lang: ru
+  expect:
+    - приветствие по-русски на «вы», предлагает помочь с волосами
+    - нет родовых форм о себе («рад/рада», «готова») и о пользователе
+  avoid: [" рад ", " рада", "готова", " ты ", " тебе", " твои"]
+- id: gender-polish-dandruff
+  group: gender
+  lang: pl
+  text: "Mam łupież, co robić?"
+  expect:
+    - po polsku, bezosobowo lub neutralnie («warto», «można», «czy były już stosowane…»)
+    - нет родовых форм о себе и пользователе («próbowałeś/aś», «zauważyłaś»), нет «ty» и Pan/Pani
+    - бережный уход при перхоти, когда к трихологу; без препаратов и диагноза
+  avoid: ["próbował", "zauważył", "stosował", "używał", "/aś", "/a ", " masz", " możesz",
+          "zauważysz", "spróbuj", "staraj", "pamiętaj ", "pamiętaj,", " twoj", " twoi", " twoje", " pan ",
+          " pani", "państw"]
+- id: gender-ukrainian-dry-hair
+  group: gender
+  lang: uk
+  text: "Моє волосся дуже сухе і пухнасте. Що порадите?"
+  expect:
+    - українською, на «ви»
+    - нет родовых форм о себе («рада», «радий», «готова») и пользователе («пробували» — ок)
+    - м'який догляд за сухим волоссям, уточнююче питання за потреби
+  avoid: [" радий", " рада ", "готова", "пробувала", "пробував", " ти ", " тобі", " твоє", " твій"]

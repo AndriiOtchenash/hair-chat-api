@@ -14,8 +14,8 @@ PROMPTS_DIR = Path(prompts.__file__).parent
 async def test_file_provider_serves_the_versioned_file() -> None:
     prompt = await FilePromptProvider().get_active()
 
-    assert prompt.version == PROMPT_VERSION == "system_v7"
-    shipped = (PROMPTS_DIR / "system_v7.md").read_text(encoding="utf-8")
+    assert prompt.version == PROMPT_VERSION == "system_v8"
+    shipped = (PROMPTS_DIR / "system_v8.md").read_text(encoding="utf-8")
     text, marker, reminder = shipped.partition(KNOWLEDGE_REMINDER_MARKER)
     assert marker
     assert prompt.text == text.strip()
@@ -23,7 +23,7 @@ async def test_file_provider_serves_the_versioned_file() -> None:
 
 
 async def test_shipped_versions_stay_loadable() -> None:
-    for version in ("system_v1", "system_v2", "system_v3", "system_v4", "system_v5", "system_v6"):
+    for version in (f"system_v{n}" for n in range(1, 8)):
         assert (await FilePromptProvider(version).get_active()).version == version
 
 
@@ -107,6 +107,16 @@ async def test_tone_is_warm_without_an_ai_disclaimer_up_front() -> None:
     assert "warm, calm and human" in text
     assert "do not open your answers with it" in text
     assert "clearly expects a diagnosis or a treatment" in text
+
+
+async def test_no_gendered_forms_and_one_polite_register() -> None:
+    text = " ".join((await FilePromptProvider().get_active()).text.lower().split())
+
+    assert "never use gendered forms, neither about yourself nor about the user" in text
+    assert "no slash forms" in text
+    assert 'russian: always "вы", never "ты"' in text
+    assert 'ukrainian: always "ви", never "ти"' in text
+    assert 'never "pan", "pani" or "państwo"' in text
 
 
 async def test_off_topic_gets_sympathy_a_salon_tip_and_a_way_back() -> None:

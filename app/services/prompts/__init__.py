@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from typing import Protocol
 
-PROMPT_VERSION = "system_v7"
+PROMPT_VERSION = "system_v8"
 SUMMARY_PROMPT_VERSION = "summary_v1"
 KNOWLEDGE_REMINDER_MARKER = "<!-- after knowledge -->"
 

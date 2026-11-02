@@ -110,6 +110,8 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   per search-query variant (`chat`, the default = what the chat does). Eval vectors are cached
   in .cache/embeddings.json (git-ignored, key = sha256 of model+dimensions+text).
 - The answer never mentions articles / the knowledge base: the client shows `done.sources`.
+- No gendered forms about the assistant or the user in uk/ru/pl, one polite register (ru/uk
+  «вы»/«ви», pl impersonal: no «ty», no Pan/Pani), system_v8+; eval group `gender`.
 
 ## Knowledge base / RAG (ADR 0005)
 - Articles: docs/kb/<slug>.md, Russian, YAML frontmatter (title, language, status draft|reviewed,

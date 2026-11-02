@@ -24,6 +24,7 @@ GROUPS = {
     "real",
     "dialog",
     "language",
+    "gender",
 }
 
 
