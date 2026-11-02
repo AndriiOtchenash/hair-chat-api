@@ -43,7 +43,7 @@ idioms briefly in PR descriptions when they differ from Spring conventions.
 app/core      config, logging, security (JWT/JWKS, current_user, require_role), auth0_mgmt
 app/api       routers only: request/response models, no business logic
 app/services  chat_service, context_builder, summarizer, tokens, prompts/, profile_extractor,
-              account (export/delete), retention
+              account (export/delete), retention, conversation_search
 app/cli       chat (dev), retention (scheduled cleanup)
 app/llm       LLMProvider protocol, gemini.py, mistral.py, resilient.py, moderation.py (Moderator)
 app/rag       embeddings, chunker, documents (docs/kb frontmatter), retriever, ingest CLI
@@ -153,17 +153,30 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   `uv run python -m scripts.rag_eval` over tests/rag_eval/queries.yaml (hit@4, false finds,
   threshold sweep; `known_gap` like moderation). Tests use FakeEmbedder (tests/llm_fakes.py).
 
-## Conversation search index (iteration 1 of 3: storage + backfill, no API, no chat hook)
+## Conversation search (iteration 2 of 3: index + backfill + chat hook + API)
 - `message_embeddings`: one row per answer (PK message_id, FK CASCADE to messages, plus
   denormalized user_id / conversation_id, both CASCADE and indexed), vector(768) +
-  embedding_model. No HNSW: search will be exact within one user_id (rule 5).
+  embedding_model. No HNSW: search is exact within one user_id (rule 5).
 - Text = "Вопрос: <latest user message before the answer>\nОтвет: <answer>", cut to
   CONVERSATION_INDEX_MAX_CHARS (16000; gemini-embedding-2 takes 8192 tokens and silently cuts
-  the rest), the answer keeps at least half. Skipped: no question before the answer, question
-  moderation `action == "block"` (never saved today, a guard only). Soft questions are indexed.
+  the rest): the question is kept, the answer is cut. Skipped: no question before the answer,
+  question moderation `action == "block"` (never saved today, a guard only). Soft questions are
+  indexed.
+- Chat hook: after `done`, `send_message` adds `AnswerIndexer.run(reply.saved_answer)` as a
+  BackgroundTask (after the stream, own session via `sql_message_embedding_repositories`, chat
+  embedder: EMBEDDING_TIMEOUT_S, no retries). Failure = WARNING with message id + code, never
+  raised; no embedder (dev) or a client disconnect = not indexed. The backfill picks those up.
 - `uv run python -m app.cli.index_conversations [--dry-run] [--limit N]`: answers with no row or a
   row of another model, keyset batches of 100 (one embeddings call + one transaction each),
   ingest's timeout/retries; counts only in the output. Not in the export (derived, like retrieval).
+- `GET /conversations/search?q=&limit=` (CONSENTED; q 2..500 chars after strip, limit 1..20,
+  default 10, else 422 validation_error): `{mode, items: [{conversation_id, title, message_id,
+  snippet, created_at, score, mode}]}`, best hit per conversation. message_id / snippet /
+  created_at are the user's question (snippet <= 200 chars). `semantic`: cosine distance <=
+  CONVERSATION_SEARCH_MAX_DISTANCE (0.40, provisional), user_id + embedding_model filtered,
+  score = 1 - distance, best first. Embeddings down / too slow / no key -> `text`: ILIKE over the
+  user's own role=user messages (% _ \ escaped), newest first, score null. Logs mode, count, ms;
+  never q.
 
 ## Moderation (ADR 0004)
 - Every user message is checked by `Moderator` (OpenAI omni-moderation-latest, OPENAI_API_KEY,

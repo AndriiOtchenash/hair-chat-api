@@ -16,21 +16,39 @@ import uvicorn
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.core.chat import get_conversation_locks, get_llm, get_moderator, get_query_embedder
+from app.core.chat import (
+    get_answer_indexer,
+    get_conversation_locks,
+    get_conversation_search,
+    get_llm,
+    get_moderator,
+    get_query_embedder,
+)
 from app.core.config import get_settings
 from app.core.security import get_token_verifier
-from app.db.models import ConsentType, Conversation, LLMCall, Message, MessageRole
+from app.db.models import (
+    ConsentType,
+    Conversation,
+    LLMCall,
+    Message,
+    MessageEmbedding,
+    MessageRole,
+)
+from app.db.repositories.conversation_search import SqlConversationSearchRepository
 from app.db.repositories.conversations import SqlConversationRepository
 from app.db.repositories.kb import SqlKBRepository
 from app.db.repositories.llm_calls import SqlLLMCallRecorder
+from app.db.repositories.message_embeddings import sql_message_embedding_repositories
 from app.db.session import get_sessionmaker
 from app.llm.base import ProviderHTTPError, ProviderTimeout, StreamBroken
 from app.llm.resilient import ResilientLLM
 from app.main import create_app
 from app.rag.chunker import Chunk
+from app.rag.conversation_index import AnswerIndexer
 from app.rag.documents import parse_article
 from app.rag.retriever import RagQueryEmbedder
 from app.services.chat_service import ConversationLocks
+from app.services.conversation_search import ConversationSearch
 from app.services.tokens import message_tokens
 from tests.auth_fakes import FakeAuth0, SigningKey, bearer, mint
 from tests.llm_fakes import (
@@ -73,6 +91,24 @@ async def live(app_settings_env: None) -> AsyncIterator[Live]:
     # Never the real embeddings API (rule 1), even with GEMINI_API_KEY in the environment.
     query_embedder = RagQueryEmbedder(FakeEmbedder())
     app.dependency_overrides[get_query_embedder] = lambda: query_embedder
+    indexer = AnswerIndexer(
+        sql_message_embedding_repositories(get_sessionmaker()),
+        FakeEmbedder(),
+        max_chars=16000,
+        timeout=2,
+    )
+    app.dependency_overrides[get_answer_indexer] = lambda: indexer
+
+    async def search() -> AsyncIterator[ConversationSearch]:
+        async with get_sessionmaker()() as session:
+            yield ConversationSearch(
+                SqlConversationSearchRepository(session),
+                FakeEmbedder(),
+                max_distance=0.4,
+                timeout=2,
+            )
+
+    app.dependency_overrides[get_conversation_search] = search
 
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning", lifespan="off")
@@ -521,3 +557,38 @@ async def test_done_lists_the_knowledge_base_articles_used_for_the_answer(live: 
     assert "Мягкий шампунь." in system
     tokens = [e.data["text"] for e in events if e.event == "token"]
     assert "".join(tokens) == "Мийте м'яким шампунем"
+
+
+async def test_an_answer_is_indexed_after_the_stream_and_found_by_its_owner_only(
+    live: Live,
+) -> None:
+    question = f"Как часто мыть жирные корни? {uuid.uuid4()}"
+    headers = await consented_user(live)
+    conversation_id = await new_conversation(live, headers)
+    live.primary.script(success("Раз в два дня."))
+
+    events = await send(live, headers, conversation_id, question)
+    assert events[-1].event == "done"
+    answer_id = uuid.UUID(str(events[-1].data["message_id"]))
+    for _ in range(200):  # the background task runs after the stream has ended
+        async with get_sessionmaker()() as session:
+            row = await session.get(MessageEmbedding, answer_id)
+        if row is not None:
+            break
+        await asyncio.sleep(0.02)
+    assert row is not None and row.embedding_model == "fake-embedding"
+
+    # FakeEmbedder vectors are random per text: the exact pair text is the only close query.
+    pair = f"Вопрос: {question}\nОтвет: Раз в два дня."
+    found = await live.client.get("/conversations/search", params={"q": pair}, headers=headers)
+    assert found.status_code == 200, found.text
+    body = found.json()
+    assert body["mode"] == "semantic"
+    assert [(i["conversation_id"], i["snippet"]) for i in body["items"]] == [
+        (conversation_id, question)
+    ]
+    assert body["items"][0]["score"] == pytest.approx(1.0)
+
+    stranger = await consented_user(live)
+    other = await live.client.get("/conversations/search", params={"q": pair}, headers=stranger)
+    assert other.json()["items"] == []

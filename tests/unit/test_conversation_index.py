@@ -1,7 +1,9 @@
 """Conversation index over an in-memory repository; the SQL side is in tests/integration."""
 
+import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -9,7 +11,7 @@ from app.cli import index_conversations as cli
 from app.core.config import Settings
 from app.db.base import new_id
 from app.db.repositories.message_embeddings import PendingAnswer
-from app.rag.conversation_index import index_conversations, pair_text
+from app.rag.conversation_index import AnswerIndexer, index_conversations, pair_text
 from app.rag.embeddings import EmbeddingUnavailable
 from tests.llm_fakes import FakeEmbedder
 
@@ -66,10 +68,10 @@ def test_pair_text_is_question_then_answer() -> None:
     ("question", "answer", "kept_question", "kept_answer"),
     [
         ("щ" * 10, "ж" * 500, 10, 82),
-        ("щ" * 500, "ж" * 10, 82, 10),
-        ("щ" * 500, "ж" * 500, 46, 46),
+        ("щ" * 60, "ж" * 500, 60, 32),
+        ("щ" * 500, "ж" * 10, 92, 0),
     ],
-    ids=["long-answer-cut", "long-question-cut", "both-long-answer-keeps-half"],
+    ids=["long-answer-cut", "long-question-kept-answer-cut", "question-alone-too-long"],
 )
 def test_pair_text_is_cut_to_the_limit(
     question: str, answer: str, kept_question: int, kept_answer: int
@@ -172,6 +174,83 @@ async def test_embedding_failure_keeps_written_batches() -> None:
     with pytest.raises(EmbeddingUnavailable):
         await index_conversations(repo, FakeEmbedder(fail=True), max_chars=1000)
     assert len(repo.rows) == 1
+
+
+def test_a_whole_question_is_kept_at_the_real_limit() -> None:
+    question = "щ" * 4000  # MAX_CONTENT_CHARS of a user message
+    text = pair_text(question, "ж" * 20000, max_chars=16000)
+
+    assert len(text) == 16000
+    assert text.startswith(f"Вопрос: {question}\nОтвет: ж")
+
+
+# --- AnswerIndexer: one answer right after the chat saved it ---
+
+
+class BrokenRepo(MemoryRepo):
+    async def save(
+        self, rows: Sequence[tuple[PendingAnswer, Sequence[float]]], *, model: str
+    ) -> int:
+        raise ConnectionResetError("secret vector 0.1, 0.2 and text")
+
+
+def indexer(repo: MemoryRepo, embedder: FakeEmbedder, timeout: float = 1.0) -> AnswerIndexer:
+    @asynccontextmanager
+    async def repositories() -> AsyncIterator[MemoryRepo]:
+        yield repo
+
+    return AnswerIndexer(repositories, embedder, max_chars=1000, timeout=timeout)
+
+
+async def test_answer_indexer_writes_the_pair() -> None:
+    saved = answer()
+    repo, embedder = MemoryRepo([saved]), FakeEmbedder()
+
+    await indexer(repo, embedder).run(saved)
+
+    assert repo.rows == {saved.message_id: "fake-embedding"}
+    assert embedder.embedded == [pair_text(saved.question or "", saved.answer, max_chars=1000)]
+
+
+@pytest.mark.parametrize(
+    ("embedder", "repo_class", "code"),
+    [
+        (FakeEmbedder(error=EmbeddingUnavailable("RateLimitError:429")), MemoryRepo, "429"),
+        (FakeEmbedder(hang=True), MemoryRepo, "code=timeout"),
+        (FakeEmbedder(), BrokenRepo, "code=ConnectionResetError"),
+    ],
+    ids=["embeddings-down", "embeddings-too-slow", "db-error"],
+)
+async def test_answer_indexer_failure_is_a_warning_without_text_and_never_raises(
+    embedder: FakeEmbedder,
+    repo_class: type[MemoryRepo],
+    code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    saved = answer(text="Секретный ответ", question="Секретный вопрос")
+    repo = repo_class([saved])
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        await indexer(repo, embedder, timeout=0.05).run(saved)
+
+    assert repo.rows == {}  # left for the backfill CLI
+    [record] = [r for r in caplog.records if r.name == "app.rag.conversation_index"]
+    assert record.levelno == logging.WARNING
+    assert code in record.getMessage() and str(saved.message_id) in record.getMessage()
+    assert "Секрет" not in caplog.text and "secret" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "saved",
+    [answer(question=None), answer(moderation=BLOCKED)],
+    ids=["no-question", "blocked-question"],
+)
+async def test_answer_indexer_skips_what_the_backfill_skips(saved: PendingAnswer) -> None:
+    repo, embedder = MemoryRepo([saved]), FakeEmbedder()
+
+    await indexer(repo, embedder).run(saved)
+
+    assert embedder.calls == 0 and repo.rows == {}
 
 
 def test_cli_needs_the_gemini_key(
