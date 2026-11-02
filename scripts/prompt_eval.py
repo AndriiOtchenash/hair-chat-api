@@ -2,7 +2,8 @@
 
     uv run python -m scripts.prompt_eval [--prompt system_v5] [--only ID ...] [--no-kb]
                                          [--skip PROVIDER:MODEL ... | --link PROVIDER:MODEL]
-                                         [--file PATH]
+                                         [--file PATH] [--query last|user3|summary ...]
+                                         [--retrieval-only]
 
 Sends only our own questions from the YAML file, never user data. Not run in CI (real APIs, and
 the verdict is a human one): each answer is printed with the case's `expect` list, the passages
@@ -14,7 +15,11 @@ is marked `??` instead: its answer says nothing about the prompt.
 The system message is built like the chat builds it: the prompt file, then the <knowledge> block
 from the docs/kb articles (embedded in memory by the same loader, chunker and RagKnowledge as
 scripts.rag_eval) followed by the prompt's knowledge reminder, then the case's history and the
-question. --no-kb skips the embeddings API. --link runs one link of LLM_CHAIN, no fallback.
+question (a case's `summary` goes into <conversation_summary> like conversations.summary).
+--no-kb skips the embeddings API. --link runs one link of LLM_CHAIN, no fallback.
+--query picks the text embedded for the search (QUERIES; `last` is what the chat does today).
+--retrieval-only calls no LLM: it prints kb_context per --query (several may be given) and
+`!!` when a passage of an article in the case's `kb_slugs` is missing.
 No database: llm_calls are not recorded. Exit code 1 only if the chain fails on a case.
 """
 
@@ -30,6 +35,7 @@ from typing import Any, Literal, TextIO
 import yaml
 
 from app.core.config import Settings, get_settings
+from app.db.repositories.kb import KBRepository
 from app.db.repositories.llm_calls import LLMCallRecord
 from app.llm.base import (
     AllProvidersDown,
@@ -42,8 +48,14 @@ from app.llm.base import (
 )
 from app.llm.registry import build_llm, parse_chain
 from app.llm.resilient import ResilientLLM
-from app.rag.retriever import Knowledge, RagKnowledge
-from app.services.context_builder import KNOWLEDGE_NOTE, DataBlock, defuse_tags, system_message
+from app.rag.retriever import Knowledge, QueryEmbedding, RagKnowledge
+from app.services.context_builder import (
+    KNOWLEDGE_NOTE,
+    SUMMARY_NOTE,
+    DataBlock,
+    defuse_tags,
+    system_message,
+)
 from app.services.kb_used import KbUsedFilter, used_sources
 from app.services.prompts import PROMPT_VERSION, FilePromptProvider, SystemPrompt
 from scripts.rag_eval import DEFAULT_KB, embed_all
@@ -66,6 +78,23 @@ class Case:
     history: tuple[ChatMessage, ...] = ()
     # Whether the answer should end with a <kb_used> tag; None = not checked.
     kb_used: bool | None = None
+    # Rolling summary of the earlier part of the conversation (conversations.summary).
+    summary: str | None = None
+    # Articles whose passages the search must find for `text`; !! when one is missing.
+    kb_slugs: tuple[str, ...] = ()
+
+
+def _user_turns(case: Case, n: int) -> str:
+    texts = [t["content"] for t in case.history if t["role"] == "user"] + [case.text]
+    return "\n".join(texts[-n:])
+
+
+# The text embedded for the knowledge search, by --query name.
+QUERIES: dict[str, Callable[[Case], str]] = {
+    "last": lambda c: c.text,  # the chat today: the latest user message only
+    "user3": lambda c: _user_turns(c, 3),  # the last 3 user messages
+    "summary": lambda c: f"{c.summary}\n{c.text}" if c.summary else _user_turns(c, 3),
+}
 
 
 @dataclass(frozen=True)
@@ -131,6 +160,8 @@ def load(path: Path) -> list[Case]:
             avoid=tuple(r.get("avoid") or ()),
             history=tuple(_turn(t) for t in r.get("history") or ()),
             kb_used=r.get("kb_used"),
+            summary=r.get("summary"),
+            kb_slugs=tuple(r.get("kb_slugs") or ()),
         )
         for r in rows
     ]
@@ -139,6 +170,8 @@ def load(path: Path) -> list[Case]:
 def messages(prompt: SystemPrompt, case: Case, knowledge: Knowledge | None) -> list[ChatMessage]:
     """Same shape as TokenBudgetContextBuilder: one system message, history, the question."""
     blocks = [DataBlock("knowledge", knowledge.text, KNOWLEDGE_NOTE)] if knowledge else []
+    if case.summary:
+        blocks.append(DataBlock("conversation_summary", case.summary, SUMMARY_NOTE))
     system = system_message(prompt, blocks)
     question: ChatMessage = {"role": "user", "content": case.text}
     turns: list[ChatMessage] = [
@@ -147,13 +180,32 @@ def messages(prompt: SystemPrompt, case: Case, knowledge: Knowledge | None) -> l
     return [{"role": "system", "content": system}, *turns]
 
 
-async def knowledge_for(cases: Sequence[Case], kb_dir: Path) -> list[KbContext]:
+async def knowledge_for(
+    cases: Sequence[Case], kb_dir: Path, query: str = "last"
+) -> list[KbContext]:
     """Never raises for API failures: the cases then run without passages, with the error."""
-    settings = get_settings()
+    return (await knowledge_by_query(cases, kb_dir, [query]))[query]
+
+
+async def knowledge_by_query(
+    cases: Sequence[Case], kb_dir: Path, queries: Sequence[str]
+) -> dict[str, list[KbContext]]:
+    """kb_context of every case for every QUERIES name; the KB is embedded once."""
+    texts = [QUERIES[q](c) for q in queries for c in cases]
     try:
-        kb, embeddings = await embed_all(kb_dir, [c.text for c in cases])
+        kb, embeddings = await embed_all(kb_dir, texts)
     except Exception as exc:
-        return [KbContext(error=f"embeddings: {type(exc).__name__}: {exc}")] * len(cases)
+        failed = [KbContext(error=f"embeddings: {type(exc).__name__}: {exc}")] * len(cases)
+        return {q: failed for q in queries}
+    contexts = await retrieve(kb, texts, embeddings)
+    n = len(cases)
+    return {q: contexts[i * n : (i + 1) * n] for i, q in enumerate(queries)}
+
+
+async def retrieve(
+    kb: KBRepository, texts: Sequence[str], embeddings: Sequence[QueryEmbedding]
+) -> list[KbContext]:
+    settings = get_settings()
     rag = RagKnowledge(
         kb,
         top_k=settings.kb_top_k,
@@ -162,9 +214,9 @@ async def knowledge_for(cases: Sequence[Case], kb_dir: Path) -> list[KbContext]:
         include_drafts=True,
     )
     contexts: list[KbContext] = []
-    for case, embedding in zip(cases, embeddings, strict=True):
+    for text, embedding in zip(texts, embeddings, strict=True):
         try:
-            contexts.append(KbContext(await rag.knowledge(EVAL_USER, case.text, embedding)))
+            contexts.append(KbContext(await rag.knowledge(EVAL_USER, text, embedding)))
         except Exception as exc:
             contexts.append(KbContext(error=f"retrieval: {type(exc).__name__}: {exc}"))
     return contexts
@@ -237,18 +289,64 @@ def report(case: Case, kb: KbContext, result: Answer, out: TextIO) -> None:
         print(f"?? {note}", file=out)
 
 
+def missing_slugs(case: Case, kb: KbContext) -> list[str]:
+    found = {s.slug for s in kb.knowledge.passages} if kb.knowledge else set()
+    return [slug for slug in case.kb_slugs if slug not in found]
+
+
+def report_retrieval(case: Case, contexts: dict[str, KbContext], out: TextIO) -> bool:
+    """kb_context per query; True when a `kb_slugs` article is missing from one of them."""
+    print(RULE, file=out)
+    print(f"[{case.group}] {case.id} ({case.lang})", file=out)
+    if case.summary:
+        print(f"  summary: {case.summary}", file=out)
+    for turn in case.history:
+        print(f"  {turn['role']}: {turn['content']}", file=out)
+    print(f"Q: {case.text}", file=out)
+    if case.kb_slugs:
+        print(f"kb_slugs: {', '.join(case.kb_slugs)}", file=out)
+    flagged = False
+    for query, kb in contexts.items():
+        print(f"kb_context[{query}]: {kb.describe()}", file=out)
+        missing = missing_slugs(case, kb)
+        if missing and not kb.error:
+            print(f"!! [{query}] missing {', '.join(missing)}", file=out)
+            flagged = True
+    return flagged
+
+
+async def run_retrieval(
+    cases: Sequence[Case],
+    *,
+    kb_dir: Path,
+    queries: Sequence[str],
+    out: TextIO = sys.stdout,
+) -> int:
+    """--retrieval-only: the embeddings API only, no LLM. Exit code 1 if embeddings failed."""
+    by_query = await knowledge_by_query(cases, kb_dir, queries)
+    print(f"retrieval only, queries {', '.join(queries)}, {len(cases)} cases", file=out)
+    flagged = 0
+    for i, case in enumerate(cases):
+        flagged += report_retrieval(case, {q: by_query[q][i] for q in queries}, out)
+    errors = any(kb.error for contexts in by_query.values() for kb in contexts)
+    print(RULE, file=out)
+    print(f"{len(cases)} cases, {flagged} with !! flags", file=out)
+    return 1 if errors else 0
+
+
 async def run(
     cases: Sequence[Case],
     *,
     prompt_version: str,
     kb_dir: Path | None,
     skip: Sequence[str],
+    query: str = "last",
     llm_factory: LLMFactory = _real_llm,
     out: TextIO = sys.stdout,
 ) -> int:
     settings = get_settings()
     prompt = await FilePromptProvider(prompt_version).get_active()
-    contexts = await knowledge_for(cases, kb_dir) if kb_dir else [NO_KB] * len(cases)
+    contexts = await knowledge_for(cases, kb_dir, query) if kb_dir else [NO_KB] * len(cases)
     llm = llm_factory(settings, skip)
     chain = ", ".join(f"{p.name}:{p.model}" for p in llm.providers)
     print(f"prompt {prompt.version}, chain {chain}, {len(cases)} cases", file=out)
@@ -287,12 +385,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", action="append", default=[], metavar="ID")
     parser.add_argument("--kb", type=Path, default=DEFAULT_KB)
     parser.add_argument("--no-kb", action="store_true", help="no <knowledge>, no embeddings API")
+    parser.add_argument(
+        "--query",
+        action="append",
+        choices=sorted(QUERIES),
+        help="text embedded for the search (default last); several only with --retrieval-only",
+    )
+    parser.add_argument(
+        "--retrieval-only", action="store_true", help="kb_context per --query, no LLM calls"
+    )
     links = parser.add_mutually_exclusive_group()
     links.add_argument("--skip", action="append", default=[], metavar="PROVIDER:MODEL")
     links.add_argument(
         "--link", metavar="PROVIDER:MODEL", help="only this link of LLM_CHAIN, no fallback"
     )
     args = parser.parse_args(argv)
+    queries: list[str] = args.query or ["last"]
+    if args.retrieval_only and args.no_kb:
+        parser.error("--retrieval-only needs the knowledge base, not --no-kb")
+    if len(queries) > 1 and not args.retrieval_only:
+        parser.error("several --query only with --retrieval-only")
     skip: list[str] = args.skip
     if args.link:
         try:
@@ -305,12 +417,15 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             parser.error(f"unknown case ids: {', '.join(sorted(unknown))}")
         cases = [c for c in cases if c.id in args.only]
+    if args.retrieval_only:
+        return asyncio.run(run_retrieval(cases, kb_dir=args.kb, queries=queries))
     return asyncio.run(
         run(
             cases,
             prompt_version=args.prompt,
             kb_dir=None if args.no_kb else args.kb,
             skip=skip,
+            query=queries[0],
         )
     )
 

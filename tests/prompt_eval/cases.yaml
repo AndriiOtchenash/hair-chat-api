@@ -5,13 +5,17 @@
 #   id      unique, for --only
 #   group   manual (found in manual testing) | off_topic | educational | professional |
 #           recurring | limits | kb (the <kb_used> tag) |
-#           real (tester questions, verbatim with typos)
+#           real (tester questions, verbatim with typos) |
+#           dialog (follow-ups that only make sense with the history: the knowledge search)
 #   lang    language of `text`; the answer must be in it
 #   text    the user's latest message
 #   history optional earlier turns: [{role: user|assistant, content: "..."}]
 #   expect  what a good answer does (read by a human)
 #   avoid   optional substrings (case-insensitive) flagged with !! when they appear in the answer
 #   kb_used optional true|false: the answer must (not) end with a <kb_used> tag; !! otherwise
+#   summary  optional rolling summary of earlier turns (conversations.summary), before history
+#   kb_slugs optional docs/kb slugs the search for `text` must find; !! when one is missing
+#            (both modes; --retrieval-only prints kb_context per --query, see QUERIES)
 
 # --- found in manual testing (system_v4: refusals and a dry tone) ---
 - id: manual-off-topic-salon
@@ -237,3 +241,63 @@
     - подчёркивает, что диагноз ставится очно (осмотр, трихоскопия и т.п.)
     - без препаратов, доз и схем лечения
   avoid: ["ваши волосы", "миноксидил", "финастерид"]
+
+# --- dialog: the last message alone says little; the knowledge search needs the history ---
+- id: dialog-dandruff-shampoo
+  group: dialog
+  lang: ru
+  history:
+    - role: user
+      content: "У меня перхоть, как часто мыть голову?"
+    - role: assistant
+      content: "При перхоти обычно помогает мыть голову чаще, по мере загрязнения, мягким шампунем."
+    - role: user
+      content: "А если кожа при этом сухая?"
+    - role: assistant
+      content: "Тогда важно не пересушивать кожу: тёплая, не горячая вода и мягкие средства."
+  text: "А шампунь какой?"
+  kb_slugs: [dandruff]
+  kb_used: true
+  expect:
+    - советует шампунь при перхоти с учётом сухой кожи головы (из истории), без брендов-обещаний
+    - без препаратов и схем лечения; при стойкой перхоти — к трихологу/дерматологу
+  avoid: ["статье", "базе знаний"]
+- id: dialog-shedding-after-flu
+  group: dialog
+  lang: ru
+  history:
+    - role: user
+      content: "Последний месяц на расчёске остаётся очень много волос."
+    - role: assistant
+      content: "Понимаю, это пугает. Подскажите, не было ли за последние месяцы болезни или стресса?"
+    - role: user
+      content: "Два месяца назад сильно болела гриппом с высокой температурой."
+    - role: assistant
+      content: "Такое выпадение часто связано с перенесённой болезнью."
+  text: "Это пройдёт само?"
+  kb_slugs: [hair-loss]
+  kb_used: true
+  expect:
+    - объясняет, что выпадение после болезни с температурой часто временное и проходит за месяцы
+    - когда идти к трихологу/врачу (не проходит, очаги, другие симптомы)
+    - без диагнозов, препаратов и доз
+  avoid: ["статье", "базе знаний"]
+- id: dialog-curly-dryer-summary
+  group: dialog
+  lang: ru
+  # A long conversation: its beginning is folded into the summary, the recent turns say little.
+  summary: >-
+    Пользовательница с кудрявыми волосами 3A, кудри пушатся и теряют форму. Обсудили мягкое
+    мытьё, кондиционер и несмываемый крем по мокрым волосам, отжим футболкой вместо полотенца.
+  history:
+    - role: user
+      content: "Спасибо, попробую с футболкой."
+    - role: assistant
+      content: "Пожалуйста! Расскажите потом, как получилось."
+  text: "А феном сушить можно?"
+  kb_slugs: [curly-hair]
+  kb_used: true
+  expect:
+    - про сушку кудрявых волос — диффузор, тёплый/холодный режим, термозащита
+    - опирается на то, что волосы кудрявые (из summary), без повторного вопроса о типе волос
+  avoid: ["статье", "базе знаний"]

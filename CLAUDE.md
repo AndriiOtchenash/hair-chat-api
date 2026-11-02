@@ -95,7 +95,10 @@ tests/integration  only what Postgres decides: pgvector/tsvector queries, cascad
   [--link provider:model]` (one chain link, no fallback) over
   tests/prompt_eval/cases.yaml (`expect` for the reader, `avoid` substrings flagged `!!`,
   `kb_used: true|false` flags a tag that is missing / unexpected; `??` when a kb case got no
-  passages, `kb_context:` shows them or the embeddings error).
+  passages, `kb_context:` shows them or the embeddings error). Cases may carry `history`,
+  `summary` (conversations.summary) and `kb_slugs` (articles the search must find, `!!` if not).
+  `--retrieval-only --query last|user3|summary ...` = embeddings only, no LLM: kb_context per
+  search-query variant (`last` = the chat today).
 - The answer never mentions articles / the knowledge base: the client shows `done.sources`.
 
 ## Knowledge base / RAG (ADR 0005)
